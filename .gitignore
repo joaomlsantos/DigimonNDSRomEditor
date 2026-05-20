@@ -1,0 +1,4 @@
+*.nds
+venv/
+*/__pycache__/*
+*.pyc
