@@ -6,7 +6,6 @@ from typing import List
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
-    QGroupBox,
     QLabel,
     QScrollArea,
     QSplitter,
@@ -16,7 +15,14 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
-from .form_helpers import BoundHexLineEdit, BoundSpinBox, make_form
+from .form_helpers import (
+    BoldGroupBox as QGroupBox,
+    BoundHexLineEdit,
+    BoundSpinBox,
+    add_unknown_form_row,
+    make_form,
+    register_unknown_container,
+)
 from .record_list_panel import RecordListPanel
 
 
@@ -41,7 +47,7 @@ class ConsumableEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
-        self._list_panel = RecordListPanel(records, _record_label)
+        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -58,7 +64,14 @@ class ConsumableEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
+
+    def select_by_id(self, item_id: int) -> bool:
+        for ix, rec in enumerate(self._records):
+            if rec.id == item_id:
+                return self._list_panel.select_index(ix)
+        return False
 
     def _add_field(self, form, label: str, widget) -> None:
         form.addRow(label, widget)
@@ -77,7 +90,7 @@ class ConsumableEditor(QWidget):
         identity_form = make_form(identity)
         self._add_field(identity_form, "Item id",           BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True))
         self._add_field(identity_form, "Consumable marker", BoundSpinBox(first, "consumable_marker", 2, self._undo_stack))
-        self._add_field(identity_form, "Bit cost",          BoundSpinBox(first, "bit_cost", 4, self._undo_stack))
+        self._add_field(identity_form, "Bit cost",          BoundSpinBox(first, "bit_cost", 2, self._undo_stack))
 
         effect = QGroupBox("Effect")
         effect_form = make_form(effect)
@@ -86,6 +99,15 @@ class ConsumableEditor(QWidget):
         self._add_field(effect_form, "Effect value",        BoundSpinBox(first, "effect_value", 4, self._undo_stack))
         self._add_field(effect_form, "Flags (hex)",         BoundHexLineEdit(first, "flags", 4, self._undo_stack))
 
+        # Single-field unknown group rather than misc — keeps the door open for
+        # adding the rest of the per-byte slots once their meaning is sorted.
+        unknowns = QGroupBox("Unknown / Unmapped (raw 2-byte fields)")
+        register_unknown_container(unknowns)
+        unknowns_form = make_form(unknowns)
+        unk_0x06 = BoundSpinBox(first, "unknown_0x06", 2, self._undo_stack, hex_display=True)
+        self._all_widgets.append(unk_0x06)
+        add_unknown_form_row(unknowns_form, "Unknown 0x06", unk_0x06)
+
         content = QWidget()
         cl = QVBoxLayout(content)
         cl.setContentsMargins(6, 6, 6, 6)
@@ -93,6 +115,7 @@ class ConsumableEditor(QWidget):
         cl.addWidget(self._title)
         cl.addWidget(identity)
         cl.addWidget(effect)
+        cl.addWidget(unknowns)
         cl.addStretch(1)
 
         scroll = QScrollArea()

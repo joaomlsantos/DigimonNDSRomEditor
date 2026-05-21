@@ -10,7 +10,6 @@ from typing import List, Tuple
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -23,14 +22,17 @@ from PySide6.QtWidgets import (
 from digimon_core import constants, model
 
 from .form_helpers import (
+    BoldGroupBox as QGroupBox,
     make_form,
     DIGIVOLUTION_CONDITION_CHOICES,
     BoundIdCombo,
+    BoundIdComboRow,
     BoundIntChoiceCombo,
     BoundSpinBox,
     digimon_choices,
     digimon_name,
     item_choices,
+    with_open_button,
 )
 from .record_list_panel import RecordListPanel
 
@@ -59,7 +61,10 @@ class _ConditionRow(QWidget):
         self._id_attr = id_attr
         self._id_combo = BoundIntChoiceCombo(target, id_attr, DIGIVOLUTION_CONDITION_CHOICES, undo_stack)
         self._value_spin = BoundSpinBox(target, value_attr, 4, undo_stack)
-        self._value_digi = BoundIdCombo(target, value_attr, digimon_choices(), undo_stack)
+        self._value_digi = BoundIdComboRow(
+            target, value_attr, digimon_choices(), undo_stack,
+            nav_kind="standard_digivolution",
+        )
         self._value_stack = QStackedWidget()
         self._value_stack.addWidget(self._value_spin)
         self._value_stack.addWidget(self._value_digi)
@@ -100,7 +105,7 @@ class ArmorDigivolutionEditor(QWidget):
         self._undo_stack = undo_stack
         self._current_ix: int = -1
 
-        self._list_panel = RecordListPanel(records, _record_label)
+        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -117,6 +122,7 @@ class ArmorDigivolutionEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
 
     def _build_detail_container(self) -> QWidget:
@@ -130,11 +136,19 @@ class ArmorDigivolutionEditor(QWidget):
 
         identity = QGroupBox("Identity")
         identity_form = make_form(identity)
-        self._digimon_row = BoundIdCombo(first, "digimon_id", digimon_choices(), self._undo_stack)
-        self._item_row = BoundIdCombo(first, "item_id", item_choices(), self._undo_stack)
-        self._evo_row = BoundIdCombo(first, "evolution_id", digimon_choices(), self._undo_stack)
+        self._digimon_row = BoundIdComboRow(
+            first, "digimon_id", digimon_choices(), self._undo_stack,
+            nav_kind="standard_digivolution",
+        )
+        self._item_row = BoundIdCombo(
+            first, "item_id", item_choices(), self._undo_stack, details_kind="item"
+        )
+        self._evo_row = BoundIdComboRow(
+            first, "evolution_id", digimon_choices(), self._undo_stack,
+            nav_kind="standard_digivolution",
+        )
         identity_form.addRow("Digimon", self._digimon_row)
-        identity_form.addRow("Item", self._item_row)
+        identity_form.addRow("Item", with_open_button(self._item_row))
         identity_form.addRow("Evolves into", self._evo_row)
 
         conditions = QGroupBox("Armor Conditions")
@@ -174,9 +188,9 @@ class ArmorDigivolutionEditor(QWidget):
         scroll.setWidget(content)
 
         # update list label when identity ids change so the left pane stays in sync
-        self._digimon_row.currentIndexChanged.connect(lambda _i: self._refresh_list_label())
+        self._digimon_row.combo.currentIndexChanged.connect(lambda _i: self._refresh_list_label())
         self._item_row.currentIndexChanged.connect(lambda _i: self._refresh_list_label())
-        self._evo_row.currentIndexChanged.connect(lambda _i: self._refresh_list_label())
+        self._evo_row.combo.currentIndexChanged.connect(lambda _i: self._refresh_list_label())
 
         return scroll
 
@@ -208,9 +222,78 @@ class ArmorDigivolutionEditor(QWidget):
         target = self._records[self._current_ix]
         self._list_panel.refresh_label(self._current_ix, _record_label(self._current_ix, target))
 
+    def select_by_id(self, ix: int) -> bool:
+        """Footer click-to-navigate hook — record id is the list index."""
+        return self._list_panel.select_index(ix)
+
     @staticmethod
     def _title_for(ix: int, target: model.ArmorDigivolution) -> str:
         return (
             f"#{ix:03d}  {digimon_name(target.digimon_id)} + {_item_name(target.item_id)} "
             f"→ {digimon_name(target.evolution_id)}    (offset 0x{target.offset:08x})"
         )
+
+
+# ---- aggregated validation collector -------------------------------------
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+from .standard_digivolution_editor import level_range_issues  # noqa: E402
+
+
+_ARMOR_CONDITION_GROUPS = [
+    ("evolution", [(f"condition_id_{i}", f"condition_value_{i}") for i in (1, 2, 3)]),
+    ("degeneration", [("degen_condition_id", "degen_condition_value")]),
+]
+
+
+def armor_digivolution_issues(
+    records: List[model.ArmorDigivolution],
+    base_digimon,
+) -> List[ValidationIssue]:
+    """Flag armor-digivolution records that don't satisfy the basic invariants:
+    parent/result must exist as base digimon, the trigger item must be a
+    DigiEgg, and LEVEL conditions must lie in [1, 99].
+
+    `base_digimon` is the session's `Dict[int, BaseDataDigimon]` — anything not
+    in it counts as "no record" since the game can't resolve the slot."""
+    issues: List[ValidationIssue] = []
+    egg_lo, egg_hi = constants.ITEM_TYPE_IDS["DIGIEGG"]
+    for ix, rec in enumerate(records):
+        # Label is the same as the left-pane list so the user can jump to the
+        # right record from the popup.
+        label = _record_label(ix, rec)
+        if rec.digimon_id not in base_digimon:
+            issues.append(ValidationIssue(
+                section="Armor Digivolutions",
+                category="Missing Record",
+                message=f"#{ix:03d}: parent 0x{rec.digimon_id:x} has no base digimon record.",
+                editor_key="armor_digivolutions",
+                record_id=ix,
+            ))
+        if rec.evolution_id not in base_digimon:
+            issues.append(ValidationIssue(
+                section="Armor Digivolutions",
+                category="Missing Record",
+                message=f"#{ix:03d}: result 0x{rec.evolution_id:x} has no base digimon record.",
+                editor_key="armor_digivolutions",
+                record_id=ix,
+            ))
+        if not (egg_lo <= rec.item_id <= egg_hi):
+            issues.append(ValidationIssue(
+                section="Armor Digivolutions",
+                category="Non-DigiEgg Item",
+                message=(
+                    f"{label} — item 0x{rec.item_id:x} ({_item_name(rec.item_id)}) "
+                    f"is not in the DigiEgg range (0x{egg_lo:x}..0x{egg_hi:x})."
+                ),
+                editor_key="armor_digivolutions",
+                record_id=ix,
+            ))
+        issues.extend(level_range_issues(
+            rec_section="Armor Digivolutions",
+            editor_key="armor_digivolutions",
+            record_id=ix,
+            record_label=label,
+            groups=_ARMOR_CONDITION_GROUPS,
+            rec=rec,
+        ))
+    return issues

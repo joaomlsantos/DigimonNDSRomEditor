@@ -18,7 +18,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QGridLayout,
-    QGroupBox,
     QLabel,
     QScrollArea,
     QVBoxLayout,
@@ -27,7 +26,23 @@ from PySide6.QtWidgets import (
 
 from digimon_core import model
 
-from .form_helpers import BoundIdCombo, BoundSpinBox, digimon_choices
+from .form_helpers import (
+    BoldGroupBox as QGroupBox,
+    BoundIdComboRow,
+    BoundSpinBox,
+    digimon_choices,
+    get_base_digimon,
+)
+
+
+# Game softlocks if starter level exceeds the chosen digimon's aptitude
+# (per `research_docs/starter packs research.txt`). Surface this as a warning
+# tooltip + red border on the level field — the threshold updates whenever the
+# user picks a different digimon for the slot.
+_LEVEL_CAP_FALLBACK = 99
+_LEVEL_CAP_MESSAGE_TEMPLATE = (
+    "Starter level above the digimon's aptitude ({cap}) softlocks the game."
+)
 
 
 # Standard structure: 4 packs × 3 digimon. If a future ROM ever ships a
@@ -40,8 +55,9 @@ class _StarterRow:
 
     def __init__(self, target: model.StarterEntry, undo_stack: QUndoStack):
         self._target = target
-        self.id_combo = BoundIdCombo(target, "digimon_id", digimon_choices(), undo_stack)
-        self.id_combo.setToolTip("Digimon for this starter slot.")
+        self.id_combo = BoundIdComboRow(
+            target, "digimon_id", digimon_choices(), undo_stack
+        )
         self.level_spin = BoundSpinBox(target, "level", 2, undo_stack)
         self.level_spin.setToolTip(
             "Starter level. Game softlocks if level exceeds the digimon's base aptitude."
@@ -49,10 +65,21 @@ class _StarterRow:
         self.x_spin = BoundSpinBox(target, "screen_x", 2, undo_stack)
         self.y_spin = BoundSpinBox(target, "screen_y", 2, undo_stack)
         self._all = [self.id_combo, self.level_spin, self.x_spin, self.y_spin]
+        # Recompute the level cap whenever the picker changes the digimon.
+        self.id_combo.combo.currentIndexChanged.connect(lambda _i: self._sync_level_cap())
+        self._sync_level_cap()
+
+    def _sync_level_cap(self) -> None:
+        record = get_base_digimon(self._target.digimon_id)
+        cap = record.aptitude if record is not None else _LEVEL_CAP_FALLBACK
+        self.level_spin.set_warn_threshold(
+            cap, _LEVEL_CAP_MESSAGE_TEMPLATE.format(cap=cap),
+        )
 
     def refresh(self) -> None:
         for w in self._all:
             w.refresh()
+        self._sync_level_cap()
 
 
 class StartersEditor(QWidget):
@@ -113,3 +140,33 @@ class StartersEditor(QWidget):
     def _refresh_all(self, _index: int) -> None:
         for row in self._rows:
             row.refresh()
+
+
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+
+
+def starter_issues(
+    starters: List[model.StarterEntry],
+    base_digimon,
+) -> List[ValidationIssue]:
+    """Footer-level issues for starter packs.
+
+    Mirrors the per-widget cap: starter level above the chosen digimon's
+    aptitude softlocks the game.
+    """
+    issues: List[ValidationIssue] = []
+    for ix, starter in enumerate(starters):
+        rec = base_digimon.get(starter.digimon_id)
+        cap = rec.aptitude if rec is not None else _LEVEL_CAP_FALLBACK
+        if starter.level > cap:
+            issues.append(ValidationIssue(
+                section="Starters",
+                category="Level vs Aptitude",
+                message=(
+                    f"Slot #{ix + 1:02d} — level {starter.level} exceeds the "
+                    f"digimon's aptitude ({cap}); this softlocks the game."
+                ),
+                editor_key="starters",
+                record_id=ix,
+            ))
+    return issues

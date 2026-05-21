@@ -10,9 +10,10 @@ from typing import Dict, List, Tuple
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QStandardItem, QStandardItemModel, QUndoStack
+
+from ..commands import SetAttrCommand
 from PySide6.QtWidgets import (
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -25,7 +26,39 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
-from .form_helpers import BoundCheckBox, BoundEnumCombo, BoundIntChoiceCombo, BoundSpinBox, make_form
+from .form_helpers import (
+    BoldGroupBox as QGroupBox,
+    BoundCheckBox,
+    BoundEnumCombo,
+    BoundIntChoiceCombo,
+    BoundSpinBox,
+    NoWheelSpinBox,
+    add_unknown_form_row,
+    is_record_dirty,
+    make_form,
+    register_unknown_container,
+    silenced,
+)
+
+
+_DIRTY_PREFIX = "● "
+_CLEAN_PREFIX = "  "
+
+
+# Soft caps that surface as red-border warnings. MP cost above the digimon MP
+# cap (9999) is unusable in practice — the move can never be cast — and
+# level_learned matches the in-game level cap (99); higher values mean the
+# move is never naturally learned.
+_MP_COST_CAP = 9999
+_LEVEL_LEARNED_CAP = 99
+_MP_COST_MESSAGE = (
+    f"MP cost above {_MP_COST_CAP} exceeds the digimon MP cap — the move can "
+    "never be cast in-game."
+)
+_LEVEL_LEARNED_MESSAGE = (
+    f"Level learned above {_LEVEL_LEARNED_CAP} means the move is never "
+    "naturally learned (level cap)."
+)
 
 
 # id 0 is unused; MOVE_ARRAY_STR[0] is "Charge" but in-game move ids start at 1
@@ -63,40 +96,122 @@ _PRIMARY_EFFECT_CHOICES: List[Tuple[str, int]] = [
     ("Revive Ally", 0x12),
     ("Restore HP + Cure Poison", 0x13),
     ("Restore HP + Cure status", 0x14),
-    ("Raise Light Res", 0x15),
-    ("Raise Fire Res", 0x16),
-    ("Raise Water Res", 0x17),
-    ("Raise Wind Res", 0x18),
-    ("Raise Dark Res", 0x19),
-    ("Raise Earth Res", 0x1A),
-    ("Raise Steel Res", 0x1B),
-    ("Raise Thunder Res", 0x1C),
+    ("Raise/Reduce Light Res", 0x15),
+    ("Raise/Reduce Fire Res", 0x16),
+    ("Raise/Reduce Water Res", 0x17),
+    ("Raise/Reduce Wind Res", 0x18),
+    ("Raise/Reduce Dark Res", 0x19),
+    ("Raise/Reduce Earth Res", 0x1A),
+    ("Raise/Reduce Steel Res", 0x1B),
+    ("Raise/Reduce Thunder Res", 0x1C),
     ("Attack + reduce Def (Acid Rain)", 0x101),
 ]
 
 _SECONDARY_EFFECT_CHOICES: List[Tuple[str, int]] = [
     ("None", 0x00),
-    ("Reduce Attack", 0x05),
-    ("Reduce Defense", 0x06),
-    ("Reduce Spirit", 0x07),
-    ("Reduce Speed", 0x08),
+    ("Raise/Reduce Attack", 0x05),
+    ("Raise/Reduce Defense", 0x06),
+    ("Raise/Reduce Spirit", 0x07),
+    ("Raise/Reduce Speed", 0x08),
     ("Doom", 0x0A),
     ("Confusion", 0x0B),
     ("Poison", 0x0C),
     ("Paralyze", 0x0D),
     ("Sleep", 0x0E),
-    ("Reduce Resistance", 0x0F),
+    ("Raise/Reduce Resistance", 0x0F),
     ("Status restore", 0x10),
     ("Revive Ally", 0x110),
-    ("Reduce Light Res", 0x15),
-    ("Reduce Fire Res", 0x16),
-    ("Reduce Water Res", 0x17),
-    ("Reduce Wind Res", 0x18),
-    ("Reduce Dark Res", 0x19),
-    ("Reduce Earth Res", 0x1A),
-    ("Reduce Steel Res", 0x1B),
-    ("Reduce Thunder Res", 0x1C),
+    ("Raise/Reduce Light Res", 0x15),
+    ("Raise/Reduce Fire Res", 0x16),
+    ("Raise/Reduce Water Res", 0x17),
+    ("Raise/Reduce Wind Res", 0x18),
+    ("Raise/Reduce Dark Res", 0x19),
+    ("Raise/Reduce Earth Res", 0x1A),
+    ("Raise/Reduce Steel Res", 0x1B),
+    ("Raise/Reduce Thunder Res", 0x1C),
 ]
+
+# Effect ids whose primary/secondary value is a signed two's-complement u16
+# delta (raise = positive, reduce = 0x10000 - X). Stat modifiers (atk/def/spi/
+# spd, generic resistance, elemental res) all share this encoding — the engine
+# routes Reduce-Spirit and Raise-Spirit through the same opcode, distinguishing
+# them by sign. Damage / status / heal effects keep unsigned semantics.
+_SIGNED_VALUE_EFFECT_IDS = {
+    0x05, 0x06, 0x07, 0x08,        # Atk/Def/Spi/Spd modifier
+    0x0F,                          # Resistance modifier
+    0x15, 0x16, 0x17, 0x18,        # Element res: Light/Fire/Water/Wind
+    0x19, 0x1A, 0x1B, 0x1C,        # Element res: Dark/Earth/Steel/Thunder
+}
+
+
+class _MoveValueSpinBox(NoWheelSpinBox):
+    """Spinbox for move primary/secondary value with effect-driven signed mode.
+
+    The underlying u16 attribute is stored raw; the widget toggles between
+    unsigned (0..65535) and signed (-32768..32767) display based on the
+    sibling effect attribute. Reduce-style effects encode the magnitude as
+    `0x10000 - X`, so showing -28 instead of 65508 keeps the UI legible.
+    """
+
+    def __init__(
+        self,
+        target,
+        attr: str,
+        effect_attr: str,
+        undo_stack: QUndoStack,
+    ):
+        super().__init__()
+        self._target = target
+        self._attr = attr
+        self._effect_attr = effect_attr
+        self._undo_stack = undo_stack
+        self._signed = False
+        self.setMinimumWidth(90)
+        self.setMaximumWidth(100)
+        self._sync_mode_silent()
+        with silenced(self):
+            self.setValue(self._to_display(getattr(target, attr)))
+        self.valueChanged.connect(self._on_value_changed)
+
+    def _is_signed(self) -> bool:
+        return getattr(self._target, self._effect_attr) in _SIGNED_VALUE_EFFECT_IDS
+
+    def _sync_mode_silent(self) -> None:
+        signed = self._is_signed()
+        if signed == self._signed and self.minimum() != self.maximum():
+            return
+        self._signed = signed
+        with silenced(self):
+            if signed:
+                self.setRange(-32768, 32767)
+            else:
+                self.setRange(0, 65535)
+
+    def _to_display(self, raw: int) -> int:
+        if self._signed and raw >= 0x8000:
+            return raw - 0x10000
+        return raw
+
+    def _to_storage(self, display: int) -> int:
+        return display & 0xFFFF
+
+    def rebind(self, new_target) -> None:
+        self._target = new_target
+        self._sync_mode_silent()
+        with silenced(self):
+            self.setValue(self._to_display(getattr(new_target, self._attr)))
+
+    def refresh(self) -> None:
+        self._sync_mode_silent()
+        with silenced(self):
+            self.setValue(self._to_display(getattr(self._target, self._attr)))
+
+    def _on_value_changed(self, new_value: int) -> None:
+        storage = self._to_storage(new_value)
+        if getattr(self._target, self._attr) == storage:
+            return
+        self._undo_stack.push(SetAttrCommand(self._target, self._attr, storage))
+
 
 # move_range encoding (see moves_research.txt § 20th byte)
 _MOVE_RANGE_CHOICES: List[Tuple[str, int]] = [
@@ -121,20 +236,29 @@ _MOVE_RANGE_CHOICES: List[Tuple[str, int]] = [
 
 
 class MoveListPanel(QWidget):
-    """Filterable list of moves by id + name."""
+    """Filterable list of moves by id + name.
+
+    `dirty_aware=True` prepends "● " to rows whose move record bytes differ
+    from the original ROM snapshot; clean rows get matching whitespace so the
+    text column stays aligned. Editors wire `undo_stack.indexChanged` to
+    `refresh_dirty_state` to keep the markers fresh.
+    """
 
     moveIndexSelected = Signal(int)  # emits index into the moves list
 
-    def __init__(self, moves: List[model.MoveData], parent=None):
+    def __init__(self, moves: List[model.MoveData], parent=None, dirty_aware: bool = False):
         super().__init__(parent)
+        self._moves = moves
+        self._dirty_aware = dirty_aware
 
         self._source_model = QStandardItemModel(self)
+        self._row_by_id: Dict[int, int] = {}
         for ix, move in enumerate(moves):
-            name = _move_name(move.id)
-            item = QStandardItem(f"0x{move.id:03x} — {name}")
+            item = QStandardItem(self._decorated_label(ix))
             item.setEditable(False)
             item.setData(ix, Qt.UserRole)
             self._source_model.appendRow(item)
+            self._row_by_id[move.id] = ix
 
         self._proxy = QSortFilterProxyModel(self)
         self._proxy.setSourceModel(self._source_model)
@@ -155,10 +279,42 @@ class MoveListPanel(QWidget):
         layout.addWidget(self._filter_box)
         layout.addWidget(self._view)
 
+    def _decorated_label(self, index: int) -> str:
+        move = self._moves[index]
+        base = f"0x{move.id:03x} — {_move_name(move.id)}"
+        if not self._dirty_aware:
+            return base
+        return (_DIRTY_PREFIX if is_record_dirty(move) else _CLEAN_PREFIX) + base
+
+    def refresh_dirty_state(self) -> None:
+        """Re-render every row label so dirty markers track the current state."""
+        if not self._dirty_aware:
+            return
+        for ix in range(self._source_model.rowCount()):
+            item = self._source_model.item(ix)
+            if item is not None:
+                item.setText(self._decorated_label(ix))
+
     def select_first(self) -> None:
         if self._proxy.rowCount() == 0:
             return
         self._view.setCurrentIndex(self._proxy.index(0, 0))
+
+    def select_by_id(self, move_id: int) -> bool:
+        """Select the row whose move record has the given id. Clears the filter
+        so the row is guaranteed visible. Returns False if the id is unknown.
+        """
+        row = self._row_by_id.get(move_id)
+        if row is None:
+            return False
+        self._filter_box.clear()
+        src_index = self._source_model.index(row, 0)
+        proxy_index = self._proxy.mapFromSource(src_index)
+        if not proxy_index.isValid():
+            return False
+        self._view.setCurrentIndex(proxy_index)
+        self._view.scrollTo(proxy_index)
+        return True
 
     def _on_current_changed(self, current, _previous):
         if not current.isValid():
@@ -175,7 +331,7 @@ class MoveEditor(QWidget):
         self._undo_stack = undo_stack
         self._current_ix: int = -1
 
-        self._list_panel = MoveListPanel(moves)
+        self._list_panel = MoveListPanel(moves, dirty_aware=True)
         self._list_panel.moveIndexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -192,7 +348,11 @@ class MoveEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
+
+    def select_by_id(self, move_id: int) -> bool:
+        return self._list_panel.select_by_id(move_id)
 
     # ---- detail form -----------------------------------------------------
 
@@ -206,12 +366,18 @@ class MoveEditor(QWidget):
         self._title.setFont(font)
 
         self._id_spin = BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True)
-        self._mp_spin = BoundSpinBox(first, "mp_cost", 2, self._undo_stack)
+        self._mp_spin = BoundSpinBox(
+            first, "mp_cost", 2, self._undo_stack,
+            warn_above=_MP_COST_CAP, warn_message=_MP_COST_MESSAGE,
+        )
         self._element_combo = BoundEnumCombo(first, "element", model.Element, self._undo_stack)
         self._special_combo = BoundIntChoiceCombo(
             first, "special_identifier", _SPECIAL_IDENTIFIER_CHOICES, self._undo_stack
         )
-        self._level_spin = BoundSpinBox(first, "level_learned", 2, self._undo_stack)
+        self._level_spin = BoundSpinBox(
+            first, "level_learned", 2, self._undo_stack,
+            warn_above=_LEVEL_LEARNED_CAP, warn_message=_LEVEL_LEARNED_MESSAGE,
+        )
 
         identity_box = QGroupBox("Identity")
         identity_form = make_form(identity_box)
@@ -224,11 +390,15 @@ class MoveEditor(QWidget):
         self._primary_combo = BoundIntChoiceCombo(
             first, "primary_effect", _PRIMARY_EFFECT_CHOICES, self._undo_stack
         )
-        self._primary_value_spin = BoundSpinBox(first, "primary_value", 2, self._undo_stack)
+        self._primary_value_spin = _MoveValueSpinBox(
+            first, "primary_value", "primary_effect", self._undo_stack,
+        )
         self._secondary_combo = BoundIntChoiceCombo(
             first, "secondary_effect", _SECONDARY_EFFECT_CHOICES, self._undo_stack
         )
-        self._secondary_value_spin = BoundSpinBox(first, "secondary_value", 2, self._undo_stack)
+        self._secondary_value_spin = _MoveValueSpinBox(
+            first, "secondary_value", "secondary_effect", self._undo_stack,
+        )
 
         effects_box = QGroupBox("Effects")
         effects_form = make_form(effects_box)
@@ -254,10 +424,11 @@ class MoveEditor(QWidget):
         self._unk_0x16_spin = BoundSpinBox(first, "unknown_0x16", 2, self._undo_stack, hex_display=True)
 
         misc_box = QGroupBox("Misc / Unknown")
+        register_unknown_container(misc_box)
         misc_form = make_form(misc_box)
-        misc_form.addRow("Unknown 0x0e", self._unk_0xe_spin)
-        misc_form.addRow("Unknown 0x14", self._unk_0x14_spin)
-        misc_form.addRow("Unknown 0x16", self._unk_0x16_spin)
+        add_unknown_form_row(misc_form, "Unknown 0x0e", self._unk_0xe_spin)
+        add_unknown_form_row(misc_form, "Unknown 0x14", self._unk_0x14_spin)
+        add_unknown_form_row(misc_form, "Unknown 0x16", self._unk_0x16_spin)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -307,3 +478,35 @@ class MoveEditor(QWidget):
     @staticmethod
     def _title_for(target: model.MoveData) -> str:
         return f"0x{target.id:03x}  —  {_move_name(target.id)}    (offset 0x{target.offset:08x})"
+
+
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+
+
+def move_issues(moves: List[model.MoveData]) -> List[ValidationIssue]:
+    """Footer-level issues for moves.
+
+    Mirrors the per-widget warn caps (mp_cost, level_learned). Power cap and
+    duplicate-move checks are intentionally absent — vanilla legitimately
+    breaches them on hundreds of records.
+    """
+    issues: List[ValidationIssue] = []
+    for move in moves:
+        name = _move_name(move.id)
+        if move.mp_cost > _MP_COST_CAP:
+            issues.append(ValidationIssue(
+                section="Moves",
+                category="MP Cost",
+                message=f"{name} — MP cost {move.mp_cost} exceeds the cap of {_MP_COST_CAP}.",
+                editor_key="moves",
+                record_id=move.id,
+            ))
+        if move.level_learned > _LEVEL_LEARNED_CAP:
+            issues.append(ValidationIssue(
+                section="Moves",
+                category="Level Learned",
+                message=f"{name} — level learned {move.level_learned} exceeds the cap of {_LEVEL_LEARNED_CAP}.",
+                editor_key="moves",
+                record_id=move.id,
+            ))
+    return issues

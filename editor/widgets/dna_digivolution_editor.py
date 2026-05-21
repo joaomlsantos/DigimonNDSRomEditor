@@ -10,7 +10,6 @@ from typing import List
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -23,9 +22,10 @@ from PySide6.QtWidgets import (
 from digimon_core import model
 
 from .form_helpers import (
+    BoldGroupBox as QGroupBox,
     make_form,
     DIGIVOLUTION_CONDITION_CHOICES,
-    BoundIdCombo,
+    BoundIdComboRow,
     BoundIntChoiceCombo,
     BoundSpinBox,
     digimon_choices,
@@ -51,7 +51,10 @@ class _ConditionRow(QWidget):
         self._id_attr = id_attr
         self._id_combo = BoundIntChoiceCombo(target, id_attr, DIGIVOLUTION_CONDITION_CHOICES, undo_stack)
         self._value_spin = BoundSpinBox(target, value_attr, 4, undo_stack)
-        self._value_digi = BoundIdCombo(target, value_attr, digimon_choices(), undo_stack)
+        self._value_digi = BoundIdComboRow(
+            target, value_attr, digimon_choices(), undo_stack,
+            nav_kind="standard_digivolution",
+        )
         self._value_stack = QStackedWidget()
         self._value_stack.addWidget(self._value_spin)
         self._value_stack.addWidget(self._value_digi)
@@ -92,7 +95,7 @@ class DNADigivolutionEditor(QWidget):
         self._undo_stack = undo_stack
         self._current_ix: int = -1
 
-        self._list_panel = RecordListPanel(records, _record_label)
+        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -109,6 +112,7 @@ class DNADigivolutionEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
 
     def _build_detail_container(self) -> QWidget:
@@ -122,9 +126,18 @@ class DNADigivolutionEditor(QWidget):
 
         identity = QGroupBox("Identity")
         identity_form = make_form(identity)
-        self._d1_row = BoundIdCombo(first, "digimon_1_id", digimon_choices(), self._undo_stack)
-        self._d2_row = BoundIdCombo(first, "digimon_2_id", digimon_choices(), self._undo_stack)
-        self._evo_row = BoundIdCombo(first, "dna_evolution_id", digimon_choices(), self._undo_stack)
+        self._d1_row = BoundIdComboRow(
+            first, "digimon_1_id", digimon_choices(), self._undo_stack,
+            nav_kind="standard_digivolution",
+        )
+        self._d2_row = BoundIdComboRow(
+            first, "digimon_2_id", digimon_choices(), self._undo_stack,
+            nav_kind="standard_digivolution",
+        )
+        self._evo_row = BoundIdComboRow(
+            first, "dna_evolution_id", digimon_choices(), self._undo_stack,
+            nav_kind="standard_digivolution",
+        )
         identity_form.addRow("Digimon 1", self._d1_row)
         identity_form.addRow("Digimon 2", self._d2_row)
         identity_form.addRow("DNA evolution", self._evo_row)
@@ -160,7 +173,7 @@ class DNADigivolutionEditor(QWidget):
         scroll.setWidget(content)
 
         for row in (self._d1_row, self._d2_row, self._evo_row):
-            row.currentIndexChanged.connect(lambda _i: self._refresh_list_label())
+            row.combo.currentIndexChanged.connect(lambda _i: self._refresh_list_label())
 
         return scroll
 
@@ -192,9 +205,58 @@ class DNADigivolutionEditor(QWidget):
         target = self._records[self._current_ix]
         self._list_panel.refresh_label(self._current_ix, _record_label(self._current_ix, target))
 
+    def select_by_id(self, ix: int) -> bool:
+        """Footer click-to-navigate hook — record id is the list index."""
+        return self._list_panel.select_index(ix)
+
     @staticmethod
     def _title_for(ix: int, target: model.DNADigivolution) -> str:
         return (
             f"#{ix:03d}  {digimon_name(target.digimon_1_id)} + {digimon_name(target.digimon_2_id)} "
             f"→ {digimon_name(target.dna_evolution_id)}    (offset 0x{target.offset:08x})"
         )
+
+
+# ---- aggregated validation collector -------------------------------------
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+from .standard_digivolution_editor import level_range_issues  # noqa: E402
+
+
+_DNA_CONDITION_GROUPS = [
+    ("evolution", [(f"condition_id_{i}", f"condition_value_{i}") for i in (1, 2, 3)]),
+]
+
+
+def dna_digivolution_issues(
+    records: List[model.DNADigivolution],
+    base_digimon,
+) -> List[ValidationIssue]:
+    """Flag DNA-digivolution records with basic invariant violations: each
+    parent and the result must be a real base digimon, and LEVEL conditions
+    must lie in [1, 99]."""
+    issues: List[ValidationIssue] = []
+    for ix, rec in enumerate(records):
+        label = _record_label(ix, rec)
+        for attr, role in (
+            ("digimon_1_id", "parent 1"),
+            ("digimon_2_id", "parent 2"),
+            ("dna_evolution_id", "result"),
+        ):
+            value = getattr(rec, attr)
+            if value not in base_digimon:
+                issues.append(ValidationIssue(
+                    section="DNA Digivolutions",
+                    category="Missing Record",
+                    message=f"#{ix:03d}: {role} 0x{value:x} has no base digimon record.",
+                    editor_key="dna_digivolutions",
+                    record_id=ix,
+                ))
+        issues.extend(level_range_issues(
+            rec_section="DNA Digivolutions",
+            editor_key="dna_digivolutions",
+            record_id=ix,
+            record_label=label,
+            groups=_DNA_CONDITION_GROUPS,
+            rec=rec,
+        ))
+    return issues

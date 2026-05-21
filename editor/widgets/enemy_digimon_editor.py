@@ -13,7 +13,6 @@ from typing import Dict, List, Tuple
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -27,11 +26,14 @@ from digimon_core import constants, model
 from ..commands import ReskinFixedEnemyCommand
 from .digimon_list_panel import DigimonListPanel
 from .form_helpers import (
+    BoldGroupBox as QGroupBox,
     BoundEnumCombo,
     BoundIdCombo,
+    BoundIdComboRow,
     BoundSpinBox,
     NoWheelComboBox,
     _make_compact_grid,
+    add_unknown_grid_field,
     make_form,
     move_choices,
     silenced,
@@ -45,6 +47,9 @@ from .form_helpers import (
 FIXED_ENEMY_MIN_ID = 0x1F5
 
 
+# Enemy stats often legitimately exceed the engine caps that the base
+# (player-side) digimon are clamped to — bosses ship with HP > 9999, etc. So
+# no warn_above thresholds here; the cap warnings live only on base digimon.
 _STAT_FIELDS: List[Tuple[str, str]] = [
     ("hp", "HP"),
     ("mp", "MP"),
@@ -81,6 +86,17 @@ _MOVE_FIELDS: List[Tuple[str, str]] = [
     ("move_4", "Move 4"),
 ]
 
+# Per-move usage probability weights (1 byte each at 0x38..0x3B). The engine
+# normalises across the four entries, so any combination of values is valid —
+# observed totals vary by stage (e.g. 115 for in-training, 220 for some
+# rookies). No validation required. Move 4 has no corresponding weight slot.
+_USAGE_WEIGHT_FIELDS: List[Tuple[str, str]] = [
+    ("usage_weight_signature", "Signature"),
+    ("usage_weight_move1", "Move 1"),
+    ("usage_weight_move2", "Move 2"),
+    ("usage_weight_move3", "Move 3"),
+]
+
 _EXP_FIELDS: List[Tuple[str, str]] = [
     ("holy_exp", "Holy"),
     ("dark_exp", "Dark"),
@@ -96,10 +112,6 @@ _EXP_FIELDS: List[Tuple[str, str]] = [
 _MISC_FIELDS: List[Tuple[str, str, int, bool]] = [
     ("level", "Level", 1, False),
     ("unknown_0x24", "Unknown 0x24", 2, True),
-    ("unknown_0x38", "Unknown 0x38", 1, True),
-    ("unknown_0x39", "Unknown 0x39", 1, True),
-    ("unknown_0x3A", "Unknown 0x3A", 1, True),
-    ("unknown_0x3B", "Unknown 0x3B", 1, True),
     ("unknown_0x5C", "Unknown 0x5C", 4, True),
     ("unknown_0x60", "Unknown 0x60", 4, True),
     ("unknown_0x64", "Unknown 0x64", 4, True),
@@ -259,7 +271,9 @@ class EnemyDigimonEditor(QWidget):
         self._battle_strings = battle_strings
         self._current_id: int = -1
 
-        self._list_panel = DigimonListPanel(entries, label_for=self._list_label_for)
+        self._list_panel = DigimonListPanel(
+            entries, label_for=self._list_label_for, dirty_aware=True,
+        )
         self._list_panel.digimonSelected.connect(self._on_selection)
 
         # _build_detail_container() creates _reskin_row, which the label
@@ -284,7 +298,11 @@ class EnemyDigimonEditor(QWidget):
         # list label has to be re-rendered explicitly whenever the undo state
         # advances — _refresh_form only updates the right-hand form.
         undo_stack.indexChanged.connect(self._refresh_list_label_for_current)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
+
+    def select_by_id(self, digimon_id: int) -> bool:
+        return self._list_panel.select_by_id(digimon_id)
 
     def _build_detail_container(self) -> QWidget:
         first = next(iter(self._entries.values()))
@@ -330,21 +348,30 @@ class EnemyDigimonEditor(QWidget):
         for attr, label in _TRAIT_FIELDS:
             combo = BoundIdCombo(
                 first, attr, trait_choices(), self._undo_stack,
-                none_value=0xFFFF, none_label="(undefined)",
+                none_value=0xFFFF, none_label="(none)",
             )
             self._trait_rows[attr] = combo
             traits_form.addRow(label, combo)
 
-        self._move_rows: Dict[str, BoundIdCombo] = {}
+        self._move_rows: Dict[str, BoundIdComboRow] = {}
         moves_box = QGroupBox("Moves")
         moves_form = make_form(moves_box)
         for attr, label in _MOVE_FIELDS:
-            combo = BoundIdCombo(
+            row = BoundIdComboRow(
                 first, attr, move_choices(), self._undo_stack,
-                none_value=0xFFFF, none_label="(undefined)",
+                details_kind="move",
+                none_value=0xFFFF, none_label="(none)",
             )
-            self._move_rows[attr] = combo
-            moves_form.addRow(label, combo)
+            self._move_rows[attr] = row
+            moves_form.addRow(label, row)
+
+        self._usage_weight_widgets: Dict[str, BoundSpinBox] = {}
+        weights_box = QGroupBox("Move Usage Probabilities")
+        weights_form = make_form(weights_box)
+        for attr, label in _USAGE_WEIGHT_FIELDS:
+            spin = BoundSpinBox(first, attr, 1, self._undo_stack)
+            self._usage_weight_widgets[attr] = spin
+            weights_form.addRow(label, spin)
 
         # 4-byte spinboxes are wide; a 4-col grid overruns the panel. 2 cols
         # keeps the form within the windowed width at the cost of 4 rows.
@@ -361,31 +388,39 @@ class EnemyDigimonEditor(QWidget):
         # spans across the 4 columns (2 label+value pairs) of the compact grid
         exp_grid.addWidget(self._exp_total, (len(_EXP_FIELDS) + 1) // 2, 0, 1, 4)
 
-        # Split Misc into a 2-column grid: the 1/2-byte fields (level + the
-        # 0x24/0x38–0x3B unknowns) stay on the left; the 4-byte 0x5C onward
-        # tail unknowns sit on the right so the section doesn't run tall.
+        # Split Misc into a 2-column grid: the 1/2-byte fields (level +
+        # 0x24 unknown) stay on the left; the 4-byte 0x5C onward tail unknowns
+        # sit on the right so the section doesn't run tall.
         self._misc_widgets: Dict[str, BoundSpinBox] = {}
         misc_box = QGroupBox("Misc")
         misc_grid = _make_compact_grid(misc_box, cols=2)
-        split = next(i for i, f in enumerate(_MISC_FIELDS) if f[0] == "unknown_0x3B")
+        split = next(i for i, f in enumerate(_MISC_FIELDS) if f[0] == "unknown_0x5C")
         for row, (attr, label, width, hex_disp) in enumerate(_MISC_FIELDS[:split]):
             spin = BoundSpinBox(first, attr, width, self._undo_stack, hex_display=hex_disp)
             self._misc_widgets[attr] = spin
-            misc_grid.addWidget(QLabel(label), row, 0)
-            misc_grid.addWidget(spin, row, 1)
+            if attr.startswith("unknown_"):
+                add_unknown_grid_field(misc_grid, row, 0, label, spin)
+            else:
+                misc_grid.addWidget(QLabel(label), row, 0)
+                misc_grid.addWidget(spin, row, 1)
         for row, (attr, label, width, hex_disp) in enumerate(_MISC_FIELDS[split:]):
             spin = BoundSpinBox(first, attr, width, self._undo_stack, hex_display=hex_disp)
             self._misc_widgets[attr] = spin
-            misc_grid.addWidget(QLabel(label), row, 2)
-            misc_grid.addWidget(spin, row, 3)
+            if attr.startswith("unknown_"):
+                add_unknown_grid_field(misc_grid, row, 1, label, spin)
+            else:
+                misc_grid.addWidget(QLabel(label), row, 2)
+                misc_grid.addWidget(spin, row, 3)
 
         # Traits and Moves are short forms; pair them in a horizontal row so
-        # they share the available width instead of stacking.
+        # they share the available width instead of stacking. Move Usage
+        # Probabilities sit alongside Moves since they're a per-move companion.
         trait_move_row = QHBoxLayout()
         trait_move_row.setContentsMargins(0, 0, 0, 0)
         trait_move_row.setSpacing(4)
         trait_move_row.addWidget(traits_box, 1)
         trait_move_row.addWidget(moves_box, 1)
+        trait_move_row.addWidget(weights_box, 1)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -430,6 +465,8 @@ class EnemyDigimonEditor(QWidget):
             row.rebind(target)
         for row in self._move_rows.values():
             row.rebind(target)
+        for spin in self._usage_weight_widgets.values():
+            spin.rebind(target)
         for spin in self._exp_widgets.values():
             spin.rebind(target)
         for spin in self._misc_widgets.values():
@@ -452,6 +489,8 @@ class EnemyDigimonEditor(QWidget):
             row.refresh()
         for row in self._move_rows.values():
             row.refresh()
+        for spin in self._usage_weight_widgets.values():
+            spin.refresh()
         for spin in self._exp_widgets.values():
             spin.refresh()
         for spin in self._misc_widgets.values():

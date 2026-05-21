@@ -24,7 +24,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QGridLayout,
-    QGroupBox,
     QLabel,
     QScrollArea,
     QSplitter,
@@ -37,12 +36,15 @@ from digimon_core import model
 
 from ..commands import SetAttrCommand
 from .form_helpers import (
+    BoldGroupBox as QGroupBox,
     BoundIdCombo,
     BoundSpinBox,
     NoWheelComboBox,
     NoWheelSpinBox,
     item_choices,
     silenced,
+    with_open_button,
+    with_open_button_placeholder,
 )
 from .record_list_panel import RecordListPanel
 
@@ -139,7 +141,9 @@ class _SlotRow:
 
         self._empty_filler = QLabel("—")
         self._empty_filler.setStyleSheet("color: palette(mid);")
-        self.item_combo = BoundIdCombo(proxy, "reward", _reward_item_choices(), undo_stack)
+        self.item_combo = BoundIdCombo(
+            proxy, "reward", _reward_item_choices(), undo_stack, details_kind="item"
+        )
         self.money_spin = NoWheelSpinBox()
         self.money_spin.setRange(1, MAX_MONEY_AMOUNT)
         self.money_spin.setSuffix(" bit")
@@ -147,10 +151,13 @@ class _SlotRow:
         # whole reward column.
         self.money_spin.setMaximumWidth(280)
 
+        # All three pages get the same right-side footprint (button or
+        # button-width spacer) so the input's right edge aligns across rows
+        # regardless of the actual reward-column width.
         self.value_stack = QStackedWidget()
-        self.value_stack.addWidget(self._empty_filler)   # index = TYPE_EMPTY
-        self.value_stack.addWidget(self.item_combo)      # index = TYPE_ITEM
-        self.value_stack.addWidget(self.money_spin)      # index = TYPE_MONEY
+        self.value_stack.addWidget(with_open_button_placeholder(self._empty_filler))  # TYPE_EMPTY
+        self.value_stack.addWidget(with_open_button(self.item_combo))                 # TYPE_ITEM
+        self.value_stack.addWidget(with_open_button_placeholder(self.money_spin))     # TYPE_MONEY
 
         self._sync_from_model()
 
@@ -227,7 +234,7 @@ class EncounterRewardsEditor(QWidget):
         self._undo_stack = undo_stack
         self._current_ix: int = -1
 
-        self._list_panel = RecordListPanel(records, _record_label)
+        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -244,6 +251,7 @@ class EncounterRewardsEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
 
     def _build_detail_container(self) -> QWidget:
@@ -319,6 +327,12 @@ class EncounterRewardsEditor(QWidget):
         for row in self._rows:
             row.refresh()
         self._refresh_prob_sum()
+
+    def select_by_id(self, table_index: int) -> bool:
+        """Nav hook — table index is also the slot index used by wild
+        encounters' `reward_slot`. Out-of-range indices silently no-op so
+        callers can pass through user-edited values without pre-validating."""
+        return self._list_panel.select_index(table_index)
 
     def _refresh_prob_sum(self) -> None:
         if not (0 <= self._current_ix < len(self._records)):

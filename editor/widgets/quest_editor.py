@@ -12,7 +12,6 @@ from typing import List, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
-    QGroupBox,
     QLabel,
     QScrollArea,
     QSplitter,
@@ -23,13 +22,17 @@ from PySide6.QtWidgets import (
 from digimon_core import model
 
 from .form_helpers import (
+    BoldGroupBox as QGroupBox,
     BoundCheckBox,
     BoundHexLineEdit,
     BoundIdCombo,
     BoundSpinBox,
     _make_compact_grid,
+    add_unknown_grid_field,
     item_choices,
     make_form,
+    register_unknown_container,
+    with_open_button,
 )
 from .record_list_panel import RecordListPanel
 
@@ -81,7 +84,7 @@ class QuestEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []  # everything supporting rebind/refresh
 
-        self._list_panel = RecordListPanel(records, _record_label)
+        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -98,6 +101,7 @@ class QuestEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
 
     def _add_field(self, form, label: str, widget) -> None:
@@ -134,10 +138,12 @@ class QuestEditor(QWidget):
         self._item_row = BoundIdCombo(
             first, "item_reward", item_choices(), self._undo_stack,
             none_value=0xFFFF, none_label="(undefined)",
+            details_kind="item",
         )
         self._tp_spin = BoundSpinBox(first, "tamerpoints_reward", 4, self._undo_stack)
         self._add_field(rewards_form, "Money (bits)", self._money_spin)
-        self._add_field(rewards_form, "Item", self._item_row)
+        rewards_form.addRow("Item", with_open_button(self._item_row))
+        self._all_widgets.append(self._item_row)
         self._add_field(rewards_form, "Tamer points", self._tp_spin)
 
         flags = QGroupBox("Quest Flags")
@@ -163,7 +169,10 @@ class QuestEditor(QWidget):
         )
         self._add_field(
             unlock_form, "Min tamer points",
-            BoundSpinBox(first, "unlock_condition_tamerpoints", 2, self._undo_stack),
+            BoundSpinBox(
+                first, "unlock_condition_tamerpoints", 2, self._undo_stack,
+                signed=True,
+            ),
         )
         self._add_field(
             unlock_form, "Online required",
@@ -186,6 +195,7 @@ class QuestEditor(QWidget):
             pointers_grid.addWidget(edit, slot // 2, (slot % 2) * 2 + 1)
 
         unknowns = QGroupBox("Unknown / Unmapped")
+        register_unknown_container(unknowns)
         unknowns_grid = _make_compact_grid(unknowns, cols=2)
         unknown_specs = [
             ("unknown_0x0", 4),
@@ -197,8 +207,7 @@ class QuestEditor(QWidget):
         for slot, (attr, width) in enumerate(unknown_specs):
             edit = self._hex_field(first, attr, byte_width=width)
             self._all_widgets.append(edit)
-            unknowns_grid.addWidget(QLabel(attr), slot // 2, (slot % 2) * 2)
-            unknowns_grid.addWidget(edit, slot // 2, (slot % 2) * 2 + 1)
+            add_unknown_grid_field(unknowns_grid, slot // 2, slot % 2, attr, edit)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)

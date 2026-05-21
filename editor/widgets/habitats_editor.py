@@ -18,7 +18,6 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QCheckBox,
     QGridLayout,
-    QGroupBox,
     QLabel,
     QScrollArea,
     QSplitter,
@@ -29,7 +28,14 @@ from PySide6.QtWidgets import (
 from digimon_core import constants, model
 
 from ..commands import SetAttrCommand
-from .form_helpers import BoundSpinBox, silenced, make_form
+from .form_helpers import (
+    BoldGroupBox as QGroupBox,
+    BoundSpinBox,
+    add_unknown_form_row,
+    silenced,
+    make_form,
+    register_unknown_container,
+)
 from .record_list_panel import RecordListPanel
 
 
@@ -114,7 +120,7 @@ class HabitatsWorldmapEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
-        self._list_panel = RecordListPanel(records, _record_label)
+        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -131,6 +137,7 @@ class HabitatsWorldmapEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
 
     def _add_field(self, form, label: str, widget) -> None:
@@ -171,10 +178,12 @@ class HabitatsWorldmapEditor(QWidget):
         self._add_field(warp_form, "Spawn position flag", BoundSpinBox(first, "spawn_position_flag", 2, self._undo_stack))
 
         unknowns = QGroupBox("Unknown / Unmapped")
+        register_unknown_container(unknowns)
         unknowns_form = make_form(unknowns)
-        self._add_field(unknowns_form, "unknown_0x0e", BoundSpinBox(first, "unknown_0x0e", 2, self._undo_stack))
-        self._add_field(unknowns_form, "unknown_0x10", BoundSpinBox(first, "unknown_0x10", 2, self._undo_stack))
-        self._add_field(unknowns_form, "unknown_0x12", BoundSpinBox(first, "unknown_0x12", 2, self._undo_stack))
+        for attr in ("unknown_0x0e", "unknown_0x10", "unknown_0x12"):
+            spin = BoundSpinBox(first, attr, 2, self._undo_stack)
+            self._all_widgets.append(spin)
+            add_unknown_form_row(unknowns_form, attr, spin)
 
         content = QWidget()
         cl = QVBoxLayout(content)

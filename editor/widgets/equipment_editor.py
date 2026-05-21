@@ -12,7 +12,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QGridLayout,
-    QGroupBox,
     QLabel,
     QScrollArea,
     QSplitter,
@@ -22,7 +21,14 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
-from .form_helpers import BoundSpinBox, _make_compact_grid, make_form
+from .form_helpers import (
+    BoldGroupBox as QGroupBox,
+    BoundSpinBox,
+    _make_compact_grid,
+    add_unknown_grid_field,
+    make_form,
+    register_unknown_container,
+)
 from .record_list_panel import RecordListPanel
 
 
@@ -89,7 +95,7 @@ class EquipmentEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
-        self._list_panel = RecordListPanel(self._records, _record_label)
+        self._list_panel = RecordListPanel(self._records, _record_label, dirty_aware=True)
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -106,7 +112,14 @@ class EquipmentEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
+
+    def select_by_id(self, item_id: int) -> bool:
+        for ix, rec in enumerate(self._records):
+            if rec.id == item_id:
+                return self._list_panel.select_index(ix)
+        return False
 
     def _add_field(self, form, label: str, widget) -> None:
         form.addRow(label, widget)
@@ -157,9 +170,12 @@ class EquipmentEditor(QWidget):
             self._add_grid_field(battle_grid, i // 4, i % 4, label, BoundSpinBox(first, attr, 2, self._undo_stack))
 
         unknowns = QGroupBox("Unknown / Unmapped (raw 2-byte fields, vanilla = 0)")
+        register_unknown_container(unknowns)
         unknowns_grid = self._grid_for(unknowns, cols=2)
         for i, attr in enumerate(_UNKNOWN_FIELDS):
-            self._add_grid_field(unknowns_grid, i // 2, i % 2, attr, BoundSpinBox(first, attr, 2, self._undo_stack))
+            spin = BoundSpinBox(first, attr, 2, self._undo_stack)
+            self._all_widgets.append(spin)
+            add_unknown_grid_field(unknowns_grid, i // 2, i % 2, attr, spin)
 
         content = QWidget()
         cl = QVBoxLayout(content)

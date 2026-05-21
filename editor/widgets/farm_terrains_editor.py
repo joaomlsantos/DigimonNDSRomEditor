@@ -12,7 +12,6 @@ from typing import List
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
-    QGroupBox,
     QLabel,
     QScrollArea,
     QSplitter,
@@ -22,8 +21,26 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
-from .form_helpers import BoundSpinBox, _make_compact_grid, make_form
+from .form_helpers import (
+    BoldGroupBox as QGroupBox,
+    BoundSpinBox,
+    _make_compact_grid,
+    add_unknown_grid_field,
+    make_form,
+    register_unknown_container,
+)
 from .record_list_panel import RecordListPanel
+
+
+# The farm screen can hold at most 8 digimon — values above that don't unlock
+# more pen slots in-game, they just go ignored. Surfaced as both a spinbox
+# warn-state and a footer validation issue so the user sees the cap before
+# editing breaks expectations.
+FARM_DIGIMON_LIMIT_CAP = 8
+_FARM_DIGIMON_LIMIT_MESSAGE = (
+    f"Farm digimon limit above {FARM_DIGIMON_LIMIT_CAP} has no effect — "
+    f"the farm screen tops out at {FARM_DIGIMON_LIMIT_CAP} slots."
+)
 
 
 _SPECIES_EXP_FIELDS = [
@@ -61,7 +78,7 @@ class FarmTerrainsEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
-        self._list_panel = RecordListPanel(records, _record_label)
+        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -78,6 +95,7 @@ class FarmTerrainsEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._refresh_form)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
 
     def _add_field(self, form, label: str, widget) -> None:
@@ -96,7 +114,14 @@ class FarmTerrainsEditor(QWidget):
         identity = QGroupBox("Identity")
         identity_form = make_form(identity)
         self._add_field(identity_form, "Terrain id", BoundSpinBox(first, "id", 2, self._undo_stack, read_only=True))
-        self._add_field(identity_form, "Farm digimon limit", BoundSpinBox(first, "farm_digimon_limit", 2, self._undo_stack))
+        self._add_field(
+            identity_form, "Farm digimon limit",
+            BoundSpinBox(
+                first, "farm_digimon_limit", 2, self._undo_stack,
+                warn_above=FARM_DIGIMON_LIMIT_CAP,
+                warn_message=_FARM_DIGIMON_LIMIT_MESSAGE,
+            ),
+        )
 
         exp_box = QGroupBox("Per-Species Exp")
         exp_grid = _make_compact_grid(exp_box, cols=4)
@@ -107,12 +132,12 @@ class FarmTerrainsEditor(QWidget):
             exp_grid.addWidget(spin, ix // 4, (ix % 4) * 2 + 1)
 
         unknowns = QGroupBox("Unknown / Unmapped (raw 2-byte fields)")
+        register_unknown_container(unknowns)
         unknowns_grid = _make_compact_grid(unknowns, cols=2)
         for ix, (_offset, attr) in enumerate(model.FarmTerrain._UNKNOWN_FIELDS):
             spin = BoundSpinBox(first, attr, 2, self._undo_stack)
             self._all_widgets.append(spin)
-            unknowns_grid.addWidget(QLabel(attr), ix // 2, (ix % 2) * 2)
-            unknowns_grid.addWidget(spin, ix // 2, (ix % 2) * 2 + 1)
+            add_unknown_grid_field(unknowns_grid, ix // 2, ix % 2, attr, spin)
 
         content = QWidget()
         cl = QVBoxLayout(content)
@@ -147,3 +172,28 @@ class FarmTerrainsEditor(QWidget):
             return
         for w in self._all_widgets:
             w.refresh()
+
+
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+
+
+def farm_terrain_issues(records: List[model.FarmTerrain]) -> List[ValidationIssue]:
+    """Footer-level issues for farm terrains.
+
+    Currently only flags `farm_digimon_limit` above the hard 8-slot cap; other
+    fields are still uncharacterised so no further invariants are checked.
+    """
+    issues: List[ValidationIssue] = []
+    for ix, rec in enumerate(records):
+        if rec.farm_digimon_limit > FARM_DIGIMON_LIMIT_CAP:
+            issues.append(ValidationIssue(
+                section="Farm Terrains",
+                category="Farm Digimon Limit",
+                message=(
+                    f"{_terrain_name(ix)} — farm digimon limit {rec.farm_digimon_limit} "
+                    f"exceeds the {FARM_DIGIMON_LIMIT_CAP}-slot cap."
+                ),
+                editor_key="farm_terrains",
+                record_id=ix,
+            ))
+    return issues

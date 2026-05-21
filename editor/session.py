@@ -8,18 +8,24 @@ original ROM bytes and `save()` persists that to disk.
 """
 from __future__ import annotations
 
+import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from digimon_core import loaders, model, rom
+from digimon_core import loaders, model, qol as qol_module, rom
 
 
 @dataclass
 class RomSession:
-    source_path: str
+    source_path: Optional[str]
     version: str
     original_rom_data: bytes  # immutable snapshot used as serialization base
     dirty: bool = False
+    # Path to the .romproj this session was loaded from, if any. None when
+    # the user opened a plain .nds. Tracked separately from source_path so
+    # "Save ROM" and "Save Project" are independently routable.
+    project_path: Optional[str] = None
 
     # parsed model collections
     base_digimon: Dict[int, model.BaseDataDigimon] = field(default_factory=dict)
@@ -40,33 +46,87 @@ class RomSession:
     consumables: List[model.Consumable] = field(default_factory=list)
     farm_items: List[model.FarmItem] = field(default_factory=list)
 
+    # QoL byte-patches applied at save time, *after* serialize_all(). Defaults
+    # to all-off / vanilla parameters — the editor is data-editing-first; QoL
+    # is opt-in.
+    qol: qol_module.QolSettings = field(default_factory=qol_module.QolSettings)
+
     @classmethod
     def from_file(cls, path: str) -> "RomSession":
         rom_data = rom.loadRom(path)
         version = rom.detectVersion(rom_data, path)
-
-        session = cls(
+        return cls._build(
             source_path=path,
             version=version,
-            original_rom_data=bytes(rom_data),
+            vanilla_data=bytes(rom_data),
+            parse_data=rom_data,
         )
-        session.base_digimon = loaders.loadBaseDigimonInfo(version, rom_data)
-        session.enemy_digimon = loaders.loadEnemyDigimonInfo(version, rom_data)
-        session.moves = loaders.loadMoveData(version, rom_data)
-        session.quests = loaders.loadQuestData(version, rom_data)
-        session.encounter_rewards = loaders.loadEncounterRewardData(version, rom_data)
-        session.standard_digivolutions = loaders.loadStandardDigivolutions(version, rom_data)
-        session.armor_digivolutions = loaders.loadArmorDigivolutions(version, rom_data)
-        session.dna_digivolutions, _ = loaders.loadDnaDigivolutions(version, rom_data)
-        session.sprite_map = loaders.loadSpriteMapTable(version, rom_data)
-        session.battle_strings = loaders.loadBattleStringTable(version, rom_data)
-        session.habitats_worldmap = loaders.loadHabitatsWorldmap(version, rom_data)
-        session.farm_terrains = loaders.loadFarmTerrains(version, rom_data)
-        session.starters = loaders.loadStarters(version, rom_data)
-        session.wild_encounter_areas = loaders.loadWildEncounterAreas(version, rom_data)
-        session.equipment = loaders.loadEquipment(version, rom_data)
-        session.consumables = loaders.loadConsumables(version, rom_data)
-        session.farm_items = loaders.loadFarmItems(version, rom_data)
+
+    @classmethod
+    def from_project(
+        cls,
+        project_path: str,
+        vanilla_path: str,
+        vanilla_data: bytes,
+        version: str,
+        patched_data: bytes,
+        qol_settings: qol_module.QolSettings,
+    ) -> "RomSession":
+        """Build a session from a project file's vanilla + diff payload.
+
+        `vanilla_data` is the immutable serialization base (so future
+        serialize_all() writes a fresh diff against the same vanilla). The
+        model objects are parsed from `patched_data` so the editor reflects
+        the project's edits. `source_path` is left as None — the user must
+        explicitly Save As when first exporting the patched ROM.
+        """
+        session = cls._build(
+            source_path=None,
+            version=version,
+            vanilla_data=vanilla_data,
+            parse_data=patched_data,
+        )
+        session.project_path = project_path
+        session.qol = qol_settings
+        # vanilla_path isn't stored on the session — the caller (main_window)
+        # owns the QSettings cache so projects sharing a vanilla ROM don't
+        # each re-prompt the user.
+        del vanilla_path
+        return session
+
+    @classmethod
+    def _build(
+        cls,
+        source_path: Optional[str],
+        version: str,
+        vanilla_data: bytes,
+        parse_data: bytes,
+    ) -> "RomSession":
+        """Shared session-population path used by both from_file and
+        from_project. `vanilla_data` becomes the serialization baseline;
+        `parse_data` is what the loaders read to build the model graph."""
+        session = cls(
+            source_path=source_path,
+            version=version,
+            original_rom_data=vanilla_data,
+        )
+        session.base_digimon = loaders.loadBaseDigimonInfo(version, parse_data)
+        session.enemy_digimon = loaders.loadEnemyDigimonInfo(version, parse_data)
+        session.moves = loaders.loadMoveData(version, parse_data)
+        session.quests = loaders.loadQuestData(version, parse_data)
+        session.encounter_rewards = loaders.loadEncounterRewardData(version, parse_data)
+        session.standard_digivolutions = loaders.loadStandardDigivolutions(version, parse_data)
+        session.armor_digivolutions = loaders.loadArmorDigivolutions(version, parse_data)
+        session.dna_digivolutions, _ = loaders.loadDnaDigivolutions(version, parse_data)
+        session.sprite_map = loaders.loadSpriteMapTable(version, parse_data)
+        session.battle_strings = loaders.loadBattleStringTable(version, parse_data)
+        session.habitats_worldmap = loaders.loadHabitatsWorldmap(version, parse_data)
+        session.farm_terrains = loaders.loadFarmTerrains(version, parse_data)
+        session.starters = loaders.loadStarters(version, parse_data)
+        session.wild_encounter_areas = loaders.loadWildEncounterAreas(version, parse_data)
+        session.equipment = loaders.loadEquipment(version, parse_data)
+        session.consumables = loaders.loadConsumables(version, parse_data)
+        session.farm_items = loaders.loadFarmItems(version, parse_data)
         return session
 
     def serialize_all(self) -> bytearray:
@@ -108,9 +168,32 @@ class RomSession:
             obj.writeToRom(out)
         return out
 
+    def serialize_all_with_qol(self) -> bytearray:
+        """`serialize_all()` plus enabled QoL byte-patches applied on top.
+
+        QoL is applied last so it sits over any model edits — never the other
+        way around. Multiplier-style patches read from the post-serialize_all
+        bytes, so they scale the user-edited values (not vanilla).
+        """
+        out = self.serialize_all()
+        qol_module.apply_qol_patches(out, self.version, self.qol)
+        return out
+
     def save(self, path: Optional[str] = None) -> str:
         target = path or self.source_path
-        rom.writeRom(self.serialize_all(), target)
+        if target is None:
+            raise ValueError("save() called with no path and no source_path set")
+        # Single rolling .bak so a botched write (or a save the user regrets)
+        # doesn't destroy the previous on-disk copy. Only meaningful when
+        # `target` already exists — first-ever Save As to a new path skips it.
+        # copy2 preserves metadata; failure to back up is logged but doesn't
+        # block the save itself (the user explicitly asked to write).
+        if os.path.exists(target):
+            try:
+                shutil.copy2(target, target + ".bak")
+            except OSError:
+                pass
+        rom.writeRom(self.serialize_all_with_qol(), target)
         self.source_path = target
         self.dirty = False
         return target

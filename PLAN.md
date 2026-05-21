@@ -20,23 +20,24 @@ DWDDRandomizer is already structured as a "core + features + UI" stack. The firs
 
 ### What's missing in the model layer
 
-Several model classes parse bytes but never serialize back. The randomizer gets away with this because it either rewrites individual fields in-place (e.g. `randomizeDnaDigivolutions` only touches a few offsets) or uses `getByteArray()` on `BaseDataDigimon` (the one model that has it). For a true editor we need symmetric round-tripping on **every** model.
+**Update:** every model now has a `writeToRom(rom_data)`. The table below is kept as historical context; all rows are implemented today and exercised by `smoke_test.py` round-trip checks on both DUSK_US and DAWN_US ROMs. Item models (`Equipment`, `Consumable`, `FarmItem`) were added beyond the original list once item-data structures landed.
 
 | Class | Has parser | Has serializer |
 | --- | --- | --- |
-| `BaseDataDigimon` | yes | yes (`getByteArray`) |
-| `EnemyDataDigimon` | yes | **missing** |
-| `MoveData` | yes | **missing** |
-| `QuestData` | yes | **missing** |
-| `FarmTerrain` | yes | **missing** |
-| `StandardDigivolution` | yes | **missing** (randomizer writes fields directly) |
-| `ArmorDigivolution` | yes | **missing** |
-| `DNADigivolution` | yes | partial (`writeDnaDigivolutionToRom`) |
-| `EncounterRewardTable` | yes | yes (`getByteRepresentation`) |
-| `HabitatWorldmap` | yes | **missing** |
-| `SpriteMapEntry` / `BattleStringEntry` | yes | **missing** (rarely edited; lower priority) |
-
-Adding `getByteArray()` (or `writeToRom(rom_data)`) to each is mechanical — every field already knows its offset and size.
+| `BaseDataDigimon` | yes | yes |
+| `EnemyDataDigimon` | yes | yes |
+| `MoveData` | yes | yes |
+| `QuestData` | yes | yes |
+| `FarmTerrain` | yes | yes |
+| `StandardDigivolution` | yes | yes |
+| `ArmorDigivolution` | yes | yes |
+| `DNADigivolution` | yes | yes |
+| `EncounterRewardTable` | yes | yes |
+| `HabitatWorldmap` | yes | yes |
+| `SpriteMapEntry` / `BattleStringEntry` | yes | yes |
+| `WildEncounterArea` / `WildEncounter` | yes | yes |
+| `Equipment` / `Consumable` / `FarmItem` | yes | yes |
+| `StarterEntry` | yes | yes |
 
 ---
 
@@ -64,20 +65,15 @@ If the randomizer ever needs to consume the shared model, the extraction is mech
 
 ---
 
-## 3. Core additions before any UI work
+## 3. Core additions before any UI work — ✅ done
 
 These are prerequisites — UI is dead weight without them.
 
-1. **Symmetric serializers.** For every model in the table above, add `getByteArray() -> bytearray` and `writeToRom(rom_data: bytearray)`. Verify with a round-trip test on a clean ROM: parse-all → serialize-all → `assert bytes_match`.
-2. **A `RomSession` object** that owns the loaded `bytearray`, the parsed model graph, the source path, and a dirty flag. All editor mutations go through it so we can drive undo/redo and "Save"/"Save As".
-3. **A `Command` abstraction** for every edit (set HP to N, swap move slot, add evolution, etc). Each command implements `do(session)` / `undo(session)`. Plug into Qt's `QUndoStack`.
-4. **Validators** centralized in `digimon_core/validation.py`:
-   - Digimon IDs must exist in `DIGIMON_ID_TO_STR`.
-   - Move/trait/item IDs must be in range.
-   - Digivolution chain stage transitions are valid (e.g. Rookie → Champion).
-   - Stat values clamped to ROM-storage size (e.g. 16-bit unsigned).
-   - Resistance values within game bounds.
-5. **Cross-reference index.** Build once after load: "which encounter tables reference digimon X", "which digivolutions target digimon X", "which quests grant item Y". Lets the UI jump between related entries.
+1. ~~**Symmetric serializers.**~~ Done — `writeToRom(rom_data)` lives on every model and is exercised by `smoke_test.py` (vanilla → edit → undo → vanilla, byte-equal).
+2. ~~**A `RomSession` object**~~ Done — `editor/session.py` owns `original_rom_data`, the parsed graph, source path, dirty flag, and a `serialize_all()` that rebuilds the output bytes.
+3. ~~**A `Command` abstraction**~~ Done — `editor/commands.py` (`SetAttrCommand` etc.) plugs into `QUndoStack`; every bound widget pushes commands.
+4. ~~**Validators** centralized.~~ Done as **inline widget caps + footer aggregation** rather than a single `digimon_core/validation.py` module. Each editor exposes a `*_issues()` collector function; the validation footer (`editor/widgets/validation.py`) aggregates them into a click-to-navigate popup. Widget-level caps catch out-of-range stat/MP/ATK values at the source; the footer surfaces semantic issues (reciprocal mismatches, exp_curve ranges, reward_slot overruns, starter level vs aptitude, etc.).
+5. ~~**Cross-reference index.**~~ Done — `register_nav_handler` in `editor/widgets/form_helpers.py` exposes "Open in X editor" for digimon/move/item/encounter-reward pickers; the standard-digivolution editor links to the tree viewer via `treeRequested`; the validation footer routes clicks to the offending editor + record id.
 
 ---
 
@@ -105,24 +101,24 @@ A single window with a left-hand navigation tree picking the data domain, and a 
 
 ### Pages (one per data domain)
 
-Mapped directly onto the model classes:
+Mapped directly onto the model classes. Navigation tree is grouped (Digimon Data / Digivolutions / Dungeons / Items) in the left pane.
 
-1. **Digimon → Base Data** — every field of `BaseDataDigimon`: stats, species, type, traits, moves, resistances, signature move, dex habitat, scannable flag, exp curve.
-2. **Digimon → Enemy Data** — `EnemyDataDigimon`: as above but for enemy variants, plus per-species EXP yields.
-3. **Digivolutions → Standard** — tree view per digimon: degeneration target + up to 3 evolutions, each with up to 3 conditions. Drag-drop or "Add evolution" buttons.
-4. **Digivolutions → Armor** — list of armor digivolutions; per-entry: source digimon, trigger item, target digimon, conditions.
-5. **Digivolutions → DNA** — list of DNA recipes: two source digimon + result + conditions.
-6. **Moves** — `MoveData` table; per-entry editor (MP cost, element, effects, hits, range, level learned).
-7. **Traits** — name-only lookup today (no in-ROM structure to edit besides assignment); the UI uses this for trait picker dropdowns on the Digimon page. No standalone editor needed until trait effects research lands.
-8. **Items** — `ITEM_ID_TO_STR` is the catalog; per-item attributes are not yet modeled. **Out of scope for v0.1** beyond picker dropdowns elsewhere. Promote to a real page once item-data structures are documented.
-9. **Encounters → Wild** — area list (using `LOCATION_OFFSETS_TO_NAMES`) → per-area encounter table → per-slot digimon picker + level. Patterned after the existing C# `DigimonWorldDuskEditor`.
-10. **Encounters → Rewards** — `EncounterRewardTable` per area: probability × reward (item or money).
-11. **Battles → Fixed (tamers/bosses)** — same shape as wild encounters but for scripted battles.
-12. **Quests** — `QuestData` editor: rewards (money/item/tamer points), unlock conditions, flags.
-13. **Starters** — the four starter packs; pick 3 digimon per pack + starting level.
-14. **Farm** — `FarmTerrain` editor: digimon limit, per-species EXP yields.
-15. **Habitats / Worldmap** — `HabitatWorldmap` entries: which species the worldmap shows as living in each location, location flags.
-16. **QoL toggles** — a single tab that surfaces DWDDRandomizer's QoL byte-patches as checkboxes (text speed, movement speed, scan rate, farm exp, battle perf, version-exclusive areas, …). These are not "edits to data tables", so they live in their own page and write at save time, not on field change.
+1. **Digimon → Base Data** ✅ — every field of `BaseDataDigimon`: stats, species, type, traits, moves, resistances, signature move, dex habitat, scannable flag, exp curve.
+2. **Digimon → Enemy Data** ✅ — `EnemyDataDigimon`: as above but for enemy variants, plus per-species EXP yields. **Fixed-battle (tamers/bosses) coverage lives here** — most `<unknown>` entries in the enemy table correspond to scripted battle slots, edited through the same form (reskin via sprite-map combo, battle-string overrides). A separate Fixed Battles page (originally §4.11) was therefore folded into this editor and not built standalone.
+3. **Digivolutions → Standard** ✅ — per-digimon detail (degeneration target + 3 evolutions × 3 conditions each). "Show in evolution tree" jumps to the tree viewer (page 4).
+4. **Digivolutions → Evolution Trees** ✅ *(beyond plan)* — read-only forest of forward-evolution trees rooted at digimon with no pre-evolution; filter searches across every descendant name so e.g. typing "Greymon" surfaces Koromon's root. Mirrors DWDDRandomizer's `digivolution_tree_logger.py` semantics (per-tree dedupe for DAG-shaped graphs).
+5. **Digivolutions → Armor** ✅ — armor digivolutions; per-entry: source digimon, trigger item, target digimon, conditions.
+6. **Digivolutions → DNA** ✅ — DNA recipes: two source digimon + result + conditions.
+7. **Moves** ✅ — `MoveData` table; per-entry MP cost, element, effects, hits, range, level learned.
+8. **Traits** — name-only lookup; used as trait picker dropdowns on the Digimon page. No standalone editor (deferred until trait effects research lands; unchanged from plan).
+9. **Items** ✅ *(beyond plan)* — promoted to real editors because item-data structures got modeled: **Equipment**, **Consumables**, **Farm Items**. Per-entry attribute editing (atk_boost, bit_cost, max_points, etc.).
+10. **Dungeons → Wild Encounters** ✅ — areas labelled via `getCurrentLocation`; per-area header (rate bounds) + per-encounter digimon + reward_slot. `num_encounters` field is hidden until slot insertion/deletion is reverse-engineered.
+11. **Dungeons → Encounter Rewards** ✅ — `EncounterRewardTable` per area: probability × reward (item or money).
+12. **Quests** ✅ — `QuestData`: rewards (money/item/tamer points), unlock conditions, flags.
+13. **Starters** ✅ — the starter packs; pick digimon per pack + starting level (level-vs-aptitude cap validated).
+14. **Farm Terrains** ✅ — `FarmTerrain`: digimon limit, per-species EXP yields.
+15. **Habitats / Worldmap** ✅ — `HabitatWorldmap` entries: species shown per location, location flags.
+16. **QoL toggles** — not yet implemented. Will surface DWDDRandomizer's QoL byte-patches as checkboxes (text speed, movement speed, scan rate, farm exp, battle perf, version-exclusive areas, …) and write at save time.
 
 ### UI patterns shared across pages
 
@@ -137,18 +133,24 @@ Mapped directly onto the model classes:
 
 ## 5. Persistence: ROM out + project file
 
-Two distinct save paths:
+Save paths:
 
-1. **Save Patched ROM** (`File → Export ROM…`)
-   Walks every loaded model, calls `writeToRom(rom_data)`, then runs any enabled QoL byte-patches (reusing `DigimonROM.executeQolChanges`), then writes the `.nds`.
-2. **Save Project** (`File → Save Project…`)
-   A `.dnedit` file (TOML or JSON) capturing **diffs from vanilla**, plus QoL toggle states, ROM header version, and editor version. Loading a project requires a vanilla ROM of the same version; the editor applies the diffs into the freshly-loaded model graph. This:
-   - keeps project files tiny and shareable,
-   - lets users rebase their hack onto an updated randomizer/editor release,
-   - dodges any copyright issue around shipping ROM bytes.
+1. **Save Patched ROM** ✅ (`File → Save` / `Save As…`)
+   Walks every loaded model, calls `writeToRom(rom_data)` on a fresh copy of the original ROM bytes (`RomSession.serialize_all()`), then writes the `.nds`. **Rolling `.bak`** alongside the target: `shutil.copy2(target, target + ".bak")` before each overwrite so a botched write (or a regretted save) doesn't destroy the previous on-disk copy. QoL byte-patches not yet wired (will piggy-back on this path once the QoL tab lands).
+2. **Save Project** (`.dnedit`) — **not yet implemented**. Design under discussion: TOML/JSON capturing `(format_version, editor_version, rom_version, qol_toggles, diffs)`. Diff layer choice still open — byte-range diffs (`(offset, length, bytes)` tuples) are leading because they're robust to model changes; field-level diffs would be more readable but need a stable per-field path scheme. QoL section forward-compatible empty until §4.16 lands.
+3. **Generate IPS/xdelta patch** for distribution. Still v0.2+.
 
-Optional third path:
-3. **Generate IPS/xdelta patch** for distribution. Patch tools exist as Python libs (`ndspy`, `python-ips`). Probably v0.2+.
+### Persistence sidecars already shipped
+
+- **Rolling `.bak`** next to the saved ROM (see above).
+- **Per-save changelog** under `<AppDataLocation>/DigimonNDSRomEditor/changelogs/<rom_hash>/`:
+  - `index.txt`: one line per save (`timestamp · N edits · saved_path`).
+  - `<timestamp>.log`: detail file with the `QUndoCommand.text()` of every command between the previous clean index and `index()`. Backward-direction saves (user undid past a previous clean point and saved again) write `[undone] <text>` markers. Action-text only for v1; before/after value capture deferred.
+  - `<rom_hash>` is a SHA-256 prefix of the *vanilla* bytes, so Save As to a new path and re-opens of the same base ROM share history.
+  - File menu has "Open Changelog Folder" entry.
+- **Recent files**: 5-slot list under `File → Open Recent`, deduped by normalised absolute path. Failed/missing-file opens prune themselves.
+- **Window state**: geometry, splitter sizes, last-selected nav key persisted via `QSettings` and restored on next launch.
+- **Close-confirm on unsaved changes**: `closeEvent` and `Open` both route through `_confirm_discard_changes()` (Save/Discard/Cancel). A failed Save is treated as Cancel to avoid silent data loss.
 
 ---
 
@@ -161,38 +163,40 @@ Each milestone is independently shippable.
 - ~~Add serializers + round-trip test on vanilla Dusk + Dawn ROMs.~~ Done — see `digimon_core/tests/test_roundtrip.py` and `smoke_test.py`.
 - ~~PySide6 project skeleton with `RomSession`, `Command`, `QUndoStack`, navigation tree, File menu.~~ Done.
 
-### M1 — Digimon Base Data editor (1 week)
-- Full editing of `BaseDataDigimon` for every digimon.
-- Undo/redo working end-to-end on this page.
-- Save Patched ROM that round-trips through `writeToRom`.
-- This proves the architecture; everything after is repetition.
+### M1 — Digimon Base Data editor — ✅ done
+- ~~Full editing of `BaseDataDigimon` for every digimon.~~
+- ~~Undo/redo working end-to-end on this page.~~
+- ~~Save Patched ROM that round-trips through `writeToRom`.~~
 
-### M2 — Movesets, Traits, Resistances (3–5 days)
-- Move editor (`MoveData`).
-- Polish the trait/move/resistance pickers on Base Data.
+### M2 — Movesets, Traits, Resistances — ✅ done
+- ~~Move editor (`MoveData`).~~
+- ~~Polish the trait/move/resistance pickers on Base Data.~~
 
-### M3 — Digivolutions (1 week)
-- Standard digivolution tree editor — by far the most complex page; visualize the per-digimon graph, edit conditions.
-- Armor + DNA digivolution editors.
+### M3 — Digivolutions — ✅ done
+- ~~Standard digivolution editor.~~
+- ~~Armor + DNA digivolution editors.~~
+- Added beyond plan: read-only Evolution Trees viewer (§4.4).
 
-### M4 — Encounters (1 week)
-- Wild encounter tables (by area).
-- Encounter reward tables.
-- Fixed battles (tamers/bosses).
-- Starters page (small).
+### M4 — Encounters — ✅ done
+- ~~Wild encounter tables (by area).~~
+- ~~Encounter reward tables.~~
+- ~~Fixed battles (tamers/bosses).~~ Folded into the Enemy Data editor — see §4.2.
+- ~~Starters page.~~
 
-### M5 — Quests, Farm, Worldmap (1 week)
-- Quest editor (rewards, unlock conditions).
-- Farm terrain editor.
-- Habitat / worldmap editor.
+### M5 — Quests, Farm, Worldmap — ✅ done
+- ~~Quest editor.~~
+- ~~Farm terrain editor.~~
+- ~~Habitat / worldmap editor.~~
+- Item editors (Equipment, Consumables, Farm Items) added beyond plan.
 
-### M6 — QoL tab + Project files + Polish (1 week)
-- Surface QoL toggles, wire to `DigimonROM.executeQolChanges`.
-- Implement project-file save/load with diff format.
-- Cross-reference jump-to-related-entry.
-- Search across all pages.
+### M6 — QoL tab + Project files + Polish — partial
+- **Not yet:** Surface QoL toggles, wire to `DigimonROM.executeQolChanges`.
+- **Not yet:** Project-file save/load with diff format (`.dnedit`).
+- ~~Cross-reference jump-to-related-entry~~ — done (nav handlers + footer routing + tree-viewer link).
+- Per-editor list filters in place; **cross-page search** still pending.
+- Shipped beyond plan in this milestone: validation footer, recent-files menu, window-state persistence, rolling `.bak` on save, per-save changelog, close-confirm on unsaved changes.
 
-### M7 — Distribution
+### M7 — Distribution — not yet
 - Packaging (PyInstaller, mirroring DWDDRandomizer's `.spec`).
 - Optional: IPS/xdelta patch export.
 
@@ -200,19 +204,31 @@ Each milestone is independently shippable.
 
 ## 7. Risks & open questions
 
-- **Models without serializers are a hidden cost.** Adding them is mostly typing, but every model must be covered by a byte-exact round-trip test before any editor page on top of it is trusted. Vanilla-ROM round-trip tests run in CI catch this cheaply.
-- **Some data tables have unknown fields** (`unknown_0xN` properties throughout `model.py`). Editor should expose them as raw hex in an "Advanced" expander rather than hide them — users hacking the ROM will want them.
-- **Item structure isn't modeled** in DWDDRandomizer (only ID→name). Until research lands, item editing is read-only / picker-only.
-- **Sprite/portrait/string editing is out of scope** for v0.1. The randomizer already loads `SpriteMapEntry` / `BattleStringEntry` but treats them as opaque. Promote to editor pages when there's documented research.
-- **Region support** sticks to `DUSK_US`/`DAWN_US` since those are the only `IMPLEMENTED_HEADERS` in the randomizer. JP support can extend later by filling the offset tables.
-- **Concurrent edits across pages** (e.g. renaming Agumon's species while another page references Agumon's species) must be handled by re-querying the model graph on focus, not by caching widgets' values.
+- ~~**Models without serializers are a hidden cost.**~~ Resolved — every model is covered; `smoke_test.py` runs the round-trip on every editor on both DUSK_US and DAWN_US.
+- ~~**Unknown fields exposure.**~~ Resolved — `View → Show unknown fields` toggle (off by default) reveals the `unknown_0xN` properties across every editor.
+- ~~**Item structure isn't modeled.**~~ Resolved — Equipment, Consumables, and Farm Items each have full editors.
+- **Sprite/portrait/string editing is still out of scope.** `SpriteMapEntry` / `BattleStringEntry` are surfaced indirectly (enemy reskin combo, battle-string overrides on the enemy editor) but no standalone graphics editor — sprite data isn't fully decoded yet (everything beyond pointer-swaps needs more research).
+- **Region support** still sticks to `DUSK_US`/`DAWN_US`. JP coverage can extend later by filling the offset tables.
+- **Concurrent edits across pages** — handled by editors re-reading the model on `_on_selection` / `_on_undo_redo` rather than caching widget values; works in practice. Footer collectors read from the session, not from open widgets, so they stay valid even when the relevant editor isn't constructed.
+- **Shutdown race in module-level singletons.** Fixed for the validation registry (`_safe_emit_changed` swallows `RuntimeError` from emitting on a deleted QObject during Qt teardown). Worth keeping in mind for any future module-level `QObject` singleton.
 
 ---
 
-## 8. Recommended starting point
+## 8. Recommended starting point — historical
 
-1. **M0 first.** Extract `digimon_core`, write round-trip tests, add missing serializers. This pays for itself five times over before any UI code is written.
-2. **Then M1** (Base Data) as a vertical slice to validate `RomSession` + `QUndoStack` + `writeToRom` end-to-end.
-3. Decide after M1 whether the C#-based `DigimonWorldDuskEditor` should be deprecated and folded in, or kept as a niche tool.
+Original sequencing (M0 first, then M1 as vertical slice) executed as planned. The editor reached feature parity with DWDDRandomizer's data coverage at the end of M5 as predicted; M6 polish is now the active milestone.
 
-The editor should reach feature parity with DWDDRandomizer's data coverage by end of M5; M6 makes it actually pleasant to use.
+## 9. What's next (current focus)
+
+Ordered by load-bearing-ness:
+
+1. **Project files (`.dnedit`)** — pending design decision (byte-range vs field-level diffs); see §5.2. Independent of QoL, so a forward-compatible empty `qol_toggles` slot is acceptable in v1.
+2. **QoL toggles tab** — port DWDDRandomizer's byte-patches as checkboxes; write at save time (piggy-back on the existing Save path).
+3. **Cross-page search** — single search box that queries every editor's record list and routes click-throughs via the existing nav handlers / footer routing.
+4. **Packaging (M7)** — PyInstaller spec mirroring DWDDRandomizer's.
+5. **IPS/xdelta export** — v0.2+; useful once project-file workflow is established.
+
+Beyond plan but possibly worth picking up:
+- Before/after value capture in changelog entries (currently action-text only).
+- "Revert this entry to vanilla" per editor (needs the `session.original` reference path; partly implementable today via re-parsing a slice of `original_rom_data`).
+- About dialog with editor version + ROM version readback.

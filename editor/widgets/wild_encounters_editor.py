@@ -15,7 +15,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QGridLayout,
-    QGroupBox,
     QLabel,
     QScrollArea,
     QSplitter,
@@ -25,7 +24,15 @@ from PySide6.QtWidgets import (
 
 from digimon_core import loaders, model
 
-from .form_helpers import BoundIdCombo, BoundSpinBox, digimon_choices, make_form
+from .form_helpers import (
+    BoldGroupBox as QGroupBox,
+    BoundIdComboRow,
+    BoundSpinBox,
+    digimon_choices,
+    get_encounter_rewards_count,
+    make_form,
+    with_open_button_for_spin,
+)
 from .record_list_panel import RecordListPanel
 
 
@@ -50,8 +57,29 @@ class _EncounterRow:
 
     def __init__(self, target: model.WildEncounter, undo_stack: QUndoStack):
         self._target = target
-        self.id_combo = BoundIdCombo(target, "digimon_id", digimon_choices(), undo_stack)
-        self.reward_spin = BoundSpinBox(target, "reward_slot", 2, undo_stack)
+        self.id_combo = BoundIdComboRow(
+            target, "digimon_id", digimon_choices(), undo_stack,
+            include_level=True,
+            nav_kind="enemy_digimon",
+        )
+        # reward_slot indexes into encounter_rewards; anything past the table
+        # length points at nothing and the game won't drop a reward. Warn the
+        # user without blocking — a custom build could ship a larger table.
+        rewards_count = get_encounter_rewards_count()
+        self.reward_spin = BoundSpinBox(
+            target, "reward_slot", 2, undo_stack,
+            warn_above=max(rewards_count - 1, 0) if rewards_count else None,
+            warn_message=(
+                f"Reward slot exceeds the encounter-rewards table "
+                f"({rewards_count} entries). Slot won't resolve in-game."
+            ) if rewards_count else "",
+        )
+        # Spinbox + inline arrow that jumps to the referenced table in the
+        # encounter-rewards editor. The wrapper widget is what gets added to
+        # the grid; the spinbox reference is preserved for refresh().
+        self.reward_widget = with_open_button_for_spin(
+            self.reward_spin, nav_kind="encounter_rewards"
+        )
 
 
 class WildEncountersEditor(QWidget):
@@ -73,6 +101,7 @@ class WildEncountersEditor(QWidget):
         self._list_panel = RecordListPanel(
             areas,
             lambda ix, _rec: self._labels[ix],
+            dirty_aware=True,
         )
         self._list_panel.indexSelected.connect(self._on_selection)
 
@@ -90,6 +119,7 @@ class WildEncountersEditor(QWidget):
         layout.addWidget(splitter)
 
         undo_stack.indexChanged.connect(self._on_undo_redo)
+        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
         self._list_panel.select_first()
 
     def _build_detail_container(self) -> QWidget:
@@ -101,7 +131,6 @@ class WildEncountersEditor(QWidget):
 
         self._header_group = QGroupBox("Area Header")
         self._header_form = make_form(self._header_group)
-        self._num_enc_spin: BoundSpinBox | None = None
         self._rate_lo_spin: BoundSpinBox | None = None
         self._rate_hi_spin: BoundSpinBox | None = None
 
@@ -143,12 +172,14 @@ class WildEncountersEditor(QWidget):
 
         # rebuild header form
         self._clear_layout(self._header_form)
-        self._num_enc_spin = BoundSpinBox(area, "num_encounters", 2, self._undo_stack)
+        # `num_encounters` is intentionally not exposed yet — editing it has no
+        # effect because the editor can't add/remove slots, and the underlying
+        # row-allocation logic isn't fully reverse-engineered. Re-enable once
+        # slot insertion/deletion lands.
         self._rate_lo_spin = BoundSpinBox(area, "rate_lower", 2, self._undo_stack)
         self._rate_hi_spin = BoundSpinBox(area, "rate_upper", 2, self._undo_stack)
-        self._header_form.addRow("Num encounters", self._num_enc_spin)
-        self._header_form.addRow("Rate lower bound", self._rate_lo_spin)
-        self._header_form.addRow("Rate upper bound", self._rate_hi_spin)
+        self._header_form.addRow("Encounter Rate lower bound", self._rate_lo_spin)
+        self._header_form.addRow("Encounter Rate upper bound", self._rate_hi_spin)
 
         # rebuild encounter grid
         self._clear_layout(self._enc_layout)
@@ -170,17 +201,56 @@ class WildEncountersEditor(QWidget):
             self._encounter_rows.append(row)
             self._enc_layout.addWidget(QLabel(f"{row_ix + 1:02d}"), row_ix + 1, 0)
             self._enc_layout.addWidget(row.id_combo, row_ix + 1, 1)
-            self._enc_layout.addWidget(row.reward_spin, row_ix + 1, 2)
+            self._enc_layout.addWidget(row.reward_widget, row_ix + 1, 2)
             self._enc_layout.addWidget(QLabel(f"0x{enc.offset:08x}"), row_ix + 1, 3)
         self._enc_layout.setColumnStretch(1, 1)
 
     def _on_undo_redo(self, _index: int) -> None:
         if not (0 <= self._current_ix < len(self._areas)):
             return
-        if self._num_enc_spin is not None:
-            self._num_enc_spin.refresh()
+        if self._rate_lo_spin is not None:
             self._rate_lo_spin.refresh()
             self._rate_hi_spin.refresh()
         for row in self._encounter_rows:
             row.id_combo.refresh()
             row.reward_spin.refresh()
+
+    def select_by_id(self, area_index: int) -> bool:
+        """Footer navigation hook — area index doubles as the record id."""
+        return self._list_panel.select_index(area_index)
+
+
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+
+
+def wild_encounter_issues(
+    version: str,
+    areas: List[model.WildEncounterArea],
+    encounter_rewards_count: int,
+) -> List[ValidationIssue]:
+    """Footer-level issues for wild encounters.
+
+    Flags reward_slot values beyond the encounter-rewards table — those
+    slots won't resolve in-game. Uses the same labels as the left-pane list
+    so the user can find the offending area immediately.
+    """
+    issues: List[ValidationIssue] = []
+    if not encounter_rewards_count:
+        return issues
+    labels = _build_area_labels(version, areas)
+    cap = encounter_rewards_count - 1
+    for area_ix, area in enumerate(areas):
+        for enc_ix, enc in enumerate(area.encounters):
+            if enc.reward_slot > cap:
+                issues.append(ValidationIssue(
+                    section="Wild Encounters",
+                    category="Reward Slot",
+                    message=(
+                        f"{labels[area_ix]}, encounter #{enc_ix + 1:02d} — "
+                        f"reward slot {enc.reward_slot} exceeds the table "
+                        f"({encounter_rewards_count} entries)."
+                    ),
+                    editor_key="wild_encounter_areas",
+                    record_id=area_ix,
+                ))
+    return issues

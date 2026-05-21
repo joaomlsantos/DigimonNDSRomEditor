@@ -456,10 +456,10 @@ class EnemyDataDigimon:
     move_2: int
     move_3: int
     move_4: int
-    unknown_0x38: int
-    unknown_0x39: int
-    unknown_0x3A: int
-    unknown_0x3B: int
+    usage_weight_signature: int
+    usage_weight_move1: int
+    usage_weight_move2: int
+    usage_weight_move3: int
     holy_exp: int
     dark_exp: int
     dragon_exp: int
@@ -504,10 +504,10 @@ class EnemyDataDigimon:
         self.move_2 = int.from_bytes(digimon_data[0x32:0x34], byteorder="little")
         self.move_3 = int.from_bytes(digimon_data[0x34:0x36], byteorder="little")
         self.move_4 = int.from_bytes(digimon_data[0x36:0x38], byteorder="little")
-        self.unknown_0x38 = digimon_data[0x38]
-        self.unknown_0x39 = digimon_data[0x39]
-        self.unknown_0x3A = digimon_data[0x3a]
-        self.unknown_0x3B = digimon_data[0x3b]
+        self.usage_weight_signature = digimon_data[0x38]
+        self.usage_weight_move1 = digimon_data[0x39]
+        self.usage_weight_move2 = digimon_data[0x3a]
+        self.usage_weight_move3 = digimon_data[0x3b]
         self.holy_exp = int.from_bytes(digimon_data[0x3c:0x40], byteorder="little")
         self.dark_exp = int.from_bytes(digimon_data[0x40:0x44], byteorder="little")
         self.dragon_exp = int.from_bytes(digimon_data[0x44:0x48], byteorder="little")
@@ -584,10 +584,10 @@ class EnemyDataDigimon:
         out[0x32:0x34] = self.move_2.to_bytes(2, byteorder="little")
         out[0x34:0x36] = self.move_3.to_bytes(2, byteorder="little")
         out[0x36:0x38] = self.move_4.to_bytes(2, byteorder="little")
-        out[0x38] = self.unknown_0x38
-        out[0x39] = self.unknown_0x39
-        out[0x3a] = self.unknown_0x3A
-        out[0x3b] = self.unknown_0x3B
+        out[0x38] = self.usage_weight_signature
+        out[0x39] = self.usage_weight_move1
+        out[0x3a] = self.usage_weight_move2
+        out[0x3b] = self.usage_weight_move3
         out[0x3c:0x40] = self.holy_exp.to_bytes(4, byteorder="little")
         out[0x40:0x44] = self.dark_exp.to_bytes(4, byteorder="little")
         out[0x44:0x48] = self.dragon_exp.to_bytes(4, byteorder="little")
@@ -1268,7 +1268,8 @@ class Consumable:
     offset: int
     id: int
     consumable_marker: int
-    bit_cost: int
+    bit_cost: int  # u16 at 0x04..0x06
+    unknown_0x06: int  # u16 at 0x06..0x08 — pending research
     primary_effect_id: int
     secondary_effect_id: int
     effect_value: int
@@ -1278,7 +1279,8 @@ class Consumable:
         self.offset = offset
         self.id = int.from_bytes(data[0:2], byteorder="little")
         self.consumable_marker = int.from_bytes(data[2:4], byteorder="little")
-        self.bit_cost = int.from_bytes(data[4:8], byteorder="little")
+        self.bit_cost = int.from_bytes(data[4:6], byteorder="little")
+        self.unknown_0x06 = int.from_bytes(data[6:8], byteorder="little")
         self.primary_effect_id = int.from_bytes(data[8:0xa], byteorder="little")
         self.secondary_effect_id = int.from_bytes(data[0xa:0xc], byteorder="little")
         self.effect_value = int.from_bytes(data[0xc:0x10], byteorder="little")
@@ -1288,7 +1290,8 @@ class Consumable:
         out = bytearray(self.SIZE)
         out[0:2] = self.id.to_bytes(2, byteorder="little")
         out[2:4] = self.consumable_marker.to_bytes(2, byteorder="little")
-        out[4:8] = self.bit_cost.to_bytes(4, byteorder="little")
+        out[4:6] = self.bit_cost.to_bytes(2, byteorder="little")
+        out[6:8] = self.unknown_0x06.to_bytes(2, byteorder="little")
         out[8:0xa] = self.primary_effect_id.to_bytes(2, byteorder="little")
         out[0xa:0xc] = self.secondary_effect_id.to_bytes(2, byteorder="little")
         out[0xc:0x10] = self.effect_value.to_bytes(4, byteorder="little")

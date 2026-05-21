@@ -16,6 +16,10 @@ from editor.main_window import MainWindow  # noqa: E402
 
 def main() -> int:
     app = QApplication(sys.argv)
+    # QSettings keys off these — set before any QSettings() is constructed so
+    # window-state and recent-files persistence have a consistent backing store.
+    app.setOrganizationName("DigimonNDSRomEditor")
+    app.setApplicationName("DigimonNDSRomEditor")
     win = MainWindow()
     win.show()
     return app.exec()

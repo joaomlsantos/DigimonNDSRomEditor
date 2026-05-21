@@ -23,6 +23,13 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtGui import QUndoStack  # noqa: E402
 
 from editor.session import RomSession  # noqa: E402
+from editor.widgets.form_helpers import is_record_dirty, set_details_providers  # noqa: E402
+from editor.widgets.validation import registry as validation_registry  # noqa: E402
+from editor.widgets.base_digimon_editor import base_digimon_issues  # noqa: E402
+from editor.widgets.move_editor import move_issues  # noqa: E402
+from editor.widgets.standard_digivolution_editor import std_digivolution_issues  # noqa: E402
+from editor.widgets.starters_editor import starter_issues  # noqa: E402
+from editor.widgets.wild_encounters_editor import wild_encounter_issues  # noqa: E402
 from editor.widgets.armor_digivolution_editor import ArmorDigivolutionEditor  # noqa: E402
 from editor.widgets.base_digimon_editor import BaseDigimonEditor  # noqa: E402
 from editor.widgets.dna_digivolution_editor import DNADigivolutionEditor  # noqa: E402
@@ -39,17 +46,24 @@ from editor.widgets.equipment_editor import EquipmentEditor  # noqa: E402
 from editor.widgets.farm_item_editor import FarmItemEditor  # noqa: E402
 from editor.widgets.farm_terrains_editor import FarmTerrainsEditor  # noqa: E402
 from editor.widgets.habitats_editor import HabitatsWorldmapEditor  # noqa: E402
+from editor.widgets.qol_editor import QolEditor  # noqa: E402
 from editor.widgets.starters_editor import StartersEditor  # noqa: E402
 from editor.widgets.wild_encounters_editor import WildEncountersEditor  # noqa: E402
 
 
-ROM_PATH = r"C:\Workspace\digimon_stuffs\rom_files\1420 - Digimon World - Dusk (US).nds"
+DEFAULT_ROM_PATH = r"C:\Workspace\digimon_stuffs\rom_files\1420 - Digimon World - Dusk (US).nds"
 
 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
 
-    session = RomSession.from_file(ROM_PATH)
+    rom_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ROM_PATH
+    print(f"using ROM: {rom_path}")
+    session = RomSession.from_file(rom_path)
+    # Install session-data registry so dynamic-cap warnings (starter level
+    # capped by aptitude, reward_slot capped by encounter_rewards length)
+    # have the data they need.
+    set_details_providers(session)
     print(f"loaded {session.version}: {len(session.base_digimon)} base, "
           f"{len(session.enemy_digimon)} enemy")
 
@@ -184,6 +198,37 @@ def main() -> int:
     assert bytes(session.serialize_all()) == session.original_rom_data
     print("moves: mp_cost edit round-trips through undo cleanly")
 
+    # ---- move signed-value encoding --------------------------------------
+    # Stat-modifier effects (atk/def/spi/spd, resistance, elemental res) store
+    # the value as a signed two's-complement u16. The editor's primary/
+    # secondary value spinbox should flip into signed mode when the effect id
+    # is one of those, and convert -28 ↔ 65508 transparently.
+    # Find an existing move that already uses a Reduce-style primary effect.
+    reduce_move = next(
+        (m for m in session.moves if m.primary_effect in (0x05, 0x06, 0x07, 0x08, 0x0F)),
+        None,
+    )
+    if reduce_move is not None:
+        move_editor._on_selection(session.moves.index(reduce_move))
+        pv = move_editor._primary_value_spin
+        # vanilla raw → expected display under signed interpretation
+        raw = reduce_move.primary_value
+        expected_display = raw - 0x10000 if raw >= 0x8000 else raw
+        assert pv.value() == expected_display, (
+            f"signed display mismatch: raw=0x{raw:04x}, "
+            f"expected display={expected_display}, got {pv.value()}"
+        )
+        # typing -28 should store 65508 on the model
+        pv.setValue(-28)
+        assert reduce_move.primary_value == 0xFFE4, (
+            f"-28 should store as 0xFFE4 (65508); got 0x{reduce_move.primary_value:04x}"
+        )
+        # undo restores
+        undo_stack.undo()
+        assert reduce_move.primary_value == raw
+        assert bytes(session.serialize_all()) == session.original_rom_data
+        print(f"moves: signed value encoding works for effect 0x{reduce_move.primary_effect:02x}")
+
     # ---- standard digivolution editor ------------------------------------
     undo_stack.clear()
     sd_editor = StandardDigivolutionEditor(session.standard_digivolutions, undo_stack)
@@ -198,7 +243,7 @@ def main() -> int:
     assert record.evo_1_condition_value_1 == orig_cond_val + 3, "condition value edit not propagated"
 
     # select "(none)" on evo 1 (index 0 of the combo is the none_value sentinel)
-    evo1_group._id_field.setCurrentIndex(0)
+    evo1_group._id_field.combo.setCurrentIndex(0)
     assert record.evolution_1_id == NO_EVO_SENTINEL, "(none) selection did not write the 0xFFFFFFFF sentinel"
 
     # undo both edits
@@ -227,9 +272,9 @@ def main() -> int:
     dna_editor = DNADigivolutionEditor(session.dna_digivolutions, undo_stack)
     first_dna = session.dna_digivolutions[0]
     orig_d1 = first_dna.digimon_1_id
-    # _d1_row is now a BoundIdCombo over digimon_choices(); pick a different id by
-    # finding an item slot whose userData != current and selecting it.
-    d1_combo = dna_editor._d1_row
+    # _d1_row is a BoundIdComboRow (combo + inline label); reach into `.combo`
+    # to drive the underlying picker.
+    d1_combo = dna_editor._d1_row.combo
     new_ix = next(
         i for i in range(d1_combo.count())
         if d1_combo.itemData(i) != orig_d1
@@ -282,8 +327,8 @@ def main() -> int:
     wild_editor._on_selection(populated_ix)
     first_enc = populated_area.encounters[0]
     orig_id = first_enc.digimon_id
-    # id_combo is a BoundIdCombo over digimon_choices(); pick a different id
-    id_combo = wild_editor._encounter_rows[0].id_combo
+    # id_combo is a BoundIdComboRow (combo + inline label); reach into `.combo`
+    id_combo = wild_editor._encounter_rows[0].id_combo.combo
     new_ix = next(
         i for i in range(id_combo.count())
         if id_combo.itemData(i) is not None and id_combo.itemData(i) != orig_id
@@ -426,6 +471,399 @@ def main() -> int:
     assert bytes(session.serialize_all()) == session.original_rom_data
     print(f"farm items: {len(session.farm_items)} loaded, max_points edit round-trips cleanly")
 
+    # ---- cross-reference navigation --------------------------------------
+    # select_by_id should clear any active filter and land on the target row.
+    target_did = next(iter(sorted(session.base_digimon.keys())))
+    assert base_editor.select_by_id(target_did), "base select_by_id failed"
+    assert enemy_editor.select_by_id(target_did), "enemy select_by_id failed"
+    assert move_editor.select_by_id(3), "move select_by_id failed"
+    assert equipment_editor.select_by_id(next(iter(sorted(session.equipment.keys())))), \
+        "equipment select_by_id failed"
+    assert consumable_editor.select_by_id(session.consumables[0].id), \
+        "consumable select_by_id failed"
+    assert farm_item_editor.select_by_id(session.farm_items[0].id), \
+        "farm-item select_by_id failed"
+    print("nav: select_by_id works on base/enemy/move/equipment/consumable/farm-item editors")
+
+    # ---- validation warnings --------------------------------------------
+    # stat caps in base digimon: HP > 9999 → warn, ATK > 999 → warn
+    hp_widget = base_editor._stat_widgets["hp"]
+    atk_widget = base_editor._stat_widgets["attack"]
+    orig_hp = hp_widget.value()
+    orig_atk = atk_widget.value()
+    hp_widget.setValue(10000)
+    assert "border" in hp_widget.styleSheet(), "HP warning style not applied for >9999"
+    hp_widget.setValue(9999)
+    assert "border" not in hp_widget.styleSheet(), "HP warning style not cleared at cap"
+    atk_widget.setValue(1000)
+    assert "border" in atk_widget.styleSheet(), "ATK warning style not applied for >999"
+    # restore + drain undo so the cleanliness check at end stays green
+    hp_widget.setValue(orig_hp)
+    atk_widget.setValue(orig_atk)
+    while undo_stack.canUndo():
+        undo_stack.undo()
+    assert bytes(session.serialize_all()) == session.original_rom_data, \
+        "validation test must leave bytes vanilla"
+    print("validation: HP/MP/ATK caps flag visually and clear when in range")
+
+    # starter level cap reacts to digimon_id change → uses base aptitude
+    starter_row = starters_editor._rows[0]
+    # find the first combo entry whose digimon id has a base record (so we can
+    # compare against a real aptitude). digimon_choices() may include named-
+    # only ids not present in base_digimon, so iterate until we hit a match.
+    combo = starter_row.id_combo.combo
+    sample_ix = next(
+        i for i in range(combo.count())
+        if isinstance(combo.itemData(i), int) and combo.itemData(i) in session.base_digimon
+    )
+    sample_id = combo.itemData(sample_ix)
+    sample_apt = session.base_digimon[sample_id].aptitude
+    combo.setCurrentIndex(sample_ix)
+    # level under the aptitude → safe; above → warning
+    starter_row.level_spin.setValue(max(sample_apt - 1, 0))
+    assert "border" not in starter_row.level_spin.styleSheet(), \
+        "starter level should be safe at apt-1"
+    starter_row.level_spin.setValue(sample_apt + 1)
+    assert "border" in starter_row.level_spin.styleSheet(), \
+        "starter level should warn above aptitude"
+    while undo_stack.canUndo():
+        undo_stack.undo()
+    assert bytes(session.serialize_all()) == session.original_rom_data
+    print(f"validation: starter level reacts to aptitude (sampled apt={sample_apt})")
+
+    # exp_curve cap warns above 2 (only 0/1/2 are valid engine curves)
+    exp_widget = base_editor._misc_widgets["exp_curve"]
+    orig_exp = exp_widget.value()
+    exp_widget.setValue(2)
+    assert "border" not in exp_widget.styleSheet(), "exp_curve=2 should be safe"
+    exp_widget.setValue(3)
+    assert "border" in exp_widget.styleSheet(), "exp_curve=3 should warn"
+    exp_widget.setValue(orig_exp)
+    while undo_stack.canUndo():
+        undo_stack.undo()
+    assert bytes(session.serialize_all()) == session.original_rom_data
+    print("validation: exp_curve flags values outside 0..2")
+
+    # standard-digivolution reciprocal invariant: vanilla data is consistent,
+    # so all four group combos should be unmarked at load. Pick a record with
+    # an evolution_1 target and rewrite it to a digimon whose `degen_evo_id`
+    # does NOT point back — the evo_1 combo should light up.
+    undo_stack.clear()
+    sd_id_with_evo = next(
+        did for did, r in session.standard_digivolutions.items()
+        if r.evolution_1_id != NO_EVO_SENTINEL
+    )
+    sd_editor._on_selection(sd_id_with_evo)
+    evo1_combo = sd_editor._groups[1]._id_field.combo
+    # vanilla should be clean
+    assert "border" not in evo1_combo.styleSheet(), \
+        f"vanilla evo_1 on 0x{sd_id_with_evo:x} should not warn"
+    # walk combo items directly (digimon_choices() is a subset of all ids),
+    # picking the first one whose degen_evo_id doesn't reciprocate
+    rec = session.standard_digivolutions[sd_id_with_evo]
+    target_ix = None
+    for i in range(evo1_combo.count()):
+        cid = evo1_combo.itemData(i)
+        if not isinstance(cid, int) or cid == sd_id_with_evo:
+            continue
+        cand_rec = session.standard_digivolutions.get(cid)
+        if cand_rec is None or cand_rec.degen_evo_id == sd_id_with_evo:
+            continue
+        if cid in (rec.evolution_1_id, rec.evolution_2_id, rec.evolution_3_id):
+            continue
+        target_ix = i
+        break
+    assert target_ix is not None, "no suitable non-reciprocal candidate found"
+    evo1_combo.setCurrentIndex(target_ix)
+    assert "border" in evo1_combo.styleSheet(), \
+        "evo_1 should warn after pointing at a digimon whose degen doesn't reciprocate"
+    while undo_stack.canUndo():
+        undo_stack.undo()
+    assert "border" not in evo1_combo.styleSheet(), \
+        "undo should clear the reciprocal-mismatch warning"
+    assert bytes(session.serialize_all()) == session.original_rom_data
+    print("validation: std_evo reciprocal mismatch flags & clears")
+
+    # wild-encounter reward_slot warns above table length
+    wild_editor._on_selection(populated_ix)
+    rs = wild_editor._encounter_rows[0].reward_spin
+    rs.setValue(len(session.encounter_rewards) - 1)
+    assert "border" not in rs.styleSheet(), "reward_slot at table-last should be safe"
+    rs.setValue(len(session.encounter_rewards))
+    assert "border" in rs.styleSheet(), "reward_slot past table should warn"
+    while undo_stack.canUndo():
+        undo_stack.undo()
+    assert bytes(session.serialize_all()) == session.original_rom_data
+    print(f"validation: reward_slot warns past table size ({len(session.encounter_rewards)})")
+
+    # ---- dirty markers ---------------------------------------------------
+    # is_record_dirty reports clean records at load time, dirty after an edit,
+    # clean again after undo. Each list-panel kind (DigimonListPanel,
+    # RecordListPanel, MoveListPanel) prepends "● " to the row label when
+    # dirty and matching whitespace when clean.
+    undo_stack.clear()
+    base_target_id = next(iter(sorted(session.base_digimon.keys())))
+    base_target = session.base_digimon[base_target_id]
+    base_row = base_editor._list_panel._row_by_id[base_target_id]
+    base_item = base_editor._list_panel._source_model.item(base_row)
+
+    assert not is_record_dirty(base_target), "base record dirty at load"
+    assert base_item.text().startswith("  "), "clean base row should have whitespace prefix"
+
+    base_editor._on_selection(base_target_id)
+    hp_spin = base_editor._stat_widgets["hp"]
+    orig_hp = hp_spin.value()
+    hp_spin.setValue(orig_hp + 13)
+    assert is_record_dirty(base_target), "base record should be dirty after edit"
+    assert base_item.text().startswith("● "), \
+        f"dirty base row should start with '● ', got {base_item.text()!r}"
+
+    undo_stack.undo()
+    assert not is_record_dirty(base_target), "base record should be clean after undo"
+    assert base_item.text().startswith("  "), "post-undo base row should drop dirty marker"
+
+    # RecordListPanel — exercise via the quest editor.
+    quest_target = session.quests[0]
+    quest_item = quest_editor._list_panel._source_model.item(0)
+    assert not is_record_dirty(quest_target)
+    assert quest_item.text().startswith("  ")
+    quest_editor._on_selection(0)
+    quest_editor._money_spin.setValue(quest_target.money_reward + 500)
+    assert is_record_dirty(quest_target)
+    assert quest_item.text().startswith("● ")
+    undo_stack.undo()
+    assert not is_record_dirty(quest_target)
+    assert quest_item.text().startswith("  ")
+
+    # MoveListPanel — exercise via the move editor.
+    move_target = session.moves[1]
+    move_row = move_editor._list_panel._row_by_id[move_target.id]
+    move_item = move_editor._list_panel._source_model.item(move_row)
+    assert not is_record_dirty(move_target)
+    assert move_item.text().startswith("  ")
+    move_editor._on_selection(1)
+    move_editor._mp_spin.setValue(move_target.mp_cost + 7)
+    assert is_record_dirty(move_target)
+    assert move_item.text().startswith("● ")
+    undo_stack.undo()
+    assert not is_record_dirty(move_target)
+    assert move_item.text().startswith("  ")
+
+    assert bytes(session.serialize_all()) == session.original_rom_data, \
+        "dirty-marker test must leave bytes vanilla"
+    print("dirty markers: base/record/move list panels toggle marker on edit and clear on undo")
+
+    # ---- validation footer registry --------------------------------------
+    # Footer collectors mirror the per-widget red-border caps so every visible
+    # warning also surfaces in the footer list. Vanilla data on Dusk sits
+    # within every cap, so the baseline is empty.
+    undo_stack.clear()
+    reg = validation_registry()
+    reg.clear()
+    reg.register(lambda: base_digimon_issues(session.base_digimon))
+    reg.register(lambda: std_digivolution_issues(session.standard_digivolutions))
+    reg.register(lambda: move_issues(session.moves))
+    reg.register(lambda: starter_issues(session.starters, session.base_digimon))
+    reg.register(lambda: wild_encounter_issues(
+        session.version,
+        session.wild_encounter_areas,
+        len(session.encounter_rewards),
+    ))
+
+    assert reg.collect_all() == [], \
+        f"vanilla data should yield no footer issues; got {len(reg.collect_all())}"
+
+    # Exp Curve breach on the first base digimon.
+    base_first_id = next(iter(sorted(session.base_digimon.keys())))
+    base_first = session.base_digimon[base_first_id]
+    saved_exp = base_first.exp_curve
+    base_first.exp_curve = 5
+    issues = reg.collect_all()
+    assert any(
+        i.section == "Base Digimon" and i.category == "Exp Curve"
+        for i in issues
+    ), f"exp_curve=5 should surface as a footer issue; got {issues}"
+    base_first.exp_curve = saved_exp
+    assert reg.collect_all() == [], "restoring exp_curve must return to clean"
+
+    # Stat cap breach: HP > 9999 must surface in the footer.
+    saved_hp = base_first.hp
+    base_first.hp = 10000
+    issues = reg.collect_all()
+    assert any(
+        i.section == "Base Digimon" and i.category == "HP"
+        for i in issues
+    ), f"HP=10000 should surface as a footer issue; got {issues}"
+    base_first.hp = saved_hp
+    assert reg.collect_all() == [], "restoring HP must return to clean"
+
+    # Level cap breach: level > 99 must surface.
+    saved_level = base_first.level
+    base_first.level = 100
+    issues = reg.collect_all()
+    assert any(
+        i.section == "Base Digimon" and i.category == "Level"
+        for i in issues
+    ), f"level=100 should surface as a footer issue; got {issues}"
+    base_first.level = saved_level
+    assert reg.collect_all() == [], "restoring level must return to clean"
+
+    # Move mp_cost cap breach.
+    saved_mp = session.moves[1].mp_cost
+    session.moves[1].mp_cost = 10000
+    issues = reg.collect_all()
+    assert any(
+        i.section == "Moves" and i.category == "MP Cost"
+        for i in issues
+    ), f"mp_cost=10000 should surface as a footer issue; got {issues}"
+    session.moves[1].mp_cost = saved_mp
+    assert reg.collect_all() == [], "restoring mp_cost must return to clean"
+
+    # Starter level above aptitude.
+    s0 = session.starters[0]
+    apt = session.base_digimon[s0.digimon_id].aptitude if s0.digimon_id in session.base_digimon else 99
+    saved_starter_level = s0.level
+    s0.level = apt + 5
+    issues = reg.collect_all()
+    assert any(
+        i.section == "Starters" and i.category == "Level vs Aptitude"
+        for i in issues
+    ), f"starter level above aptitude should surface; got {issues}"
+    s0.level = saved_starter_level
+    assert reg.collect_all() == [], "restoring starter level must return to clean"
+
+    # Wild encounter reward_slot above the table.
+    enc = next(
+        e for area in session.wild_encounter_areas for e in area.encounters
+    )
+    saved_slot = enc.reward_slot
+    enc.reward_slot = len(session.encounter_rewards) + 1
+    issues = reg.collect_all()
+    assert any(
+        i.section == "Wild Encounters" and i.category == "Reward Slot"
+        for i in issues
+    ), f"reward_slot past the table should surface; got {issues}"
+    enc.reward_slot = saved_slot
+    assert reg.collect_all() == [], "restoring reward_slot must return to clean"
+
+    # Digivolution reciprocal mismatch.
+    sd_ids = sorted(session.standard_digivolutions.keys())
+    src_rec = session.standard_digivolutions[sd_ids[0]]
+    saved_evo = src_rec.evolution_1_id
+    bad_target = next(
+        did for did in sd_ids[1:]
+        if session.standard_digivolutions[did].degen_evo_id != sd_ids[0]
+        and did != saved_evo
+    )
+    src_rec.evolution_1_id = bad_target
+    issues = reg.collect_all()
+    assert any(i.section == "Standard Digivolutions" for i in issues), \
+        "std digivolution collector should flag the new reciprocity break"
+    src_rec.evolution_1_id = saved_evo
+    assert reg.collect_all() == [], "restoring std-evo state must return to clean"
+
+    assert bytes(session.serialize_all()) == session.original_rom_data, \
+        "validation-collector test must leave bytes vanilla"
+    print("validation footer: all collectors mirror widget caps; vanilla is clean")
+
+    # ---- QoL editor ------------------------------------------------------
+    # QoL toggles live on session.qol (a QolSettings dataclass); flipping a
+    # checkbox should push an undo entry, scale the output bytes via
+    # serialize_all_with_qol(), and leave plain serialize_all() unaffected.
+    undo_stack.clear()
+    qol_editor = QolEditor(session.qol, undo_stack)
+    # all off by default → both serialisers must match vanilla
+    assert bytes(session.serialize_all_with_qol()) == session.original_rom_data, \
+        "QoL-off serialize_all_with_qol must equal vanilla"
+    # find the fast_text checkbox among the rows and flip it
+    fast_text_check = next(c for c, _p in qol_editor._rows if c._attr == "fast_text")
+    assert not fast_text_check.isChecked()
+    fast_text_check.setChecked(True)
+    assert session.qol.fast_text is True
+    assert undo_stack.count() == 1, "QoL toggle should be one undo entry"
+    assert bytes(session.serialize_all()) == session.original_rom_data, \
+        "plain serialize_all must stay vanilla even with QoL on"
+    assert bytes(session.serialize_all_with_qol()) != session.original_rom_data, \
+        "QoL-on serialize_all_with_qol must differ from vanilla"
+    undo_stack.undo()
+    assert session.qol.fast_text is False
+    assert bytes(session.serialize_all_with_qol()) == session.original_rom_data, \
+        "QoL undo must restore vanilla output"
+    print("qol: toggle pushes undo, scales output bytes, leaves serialize_all clean")
+
+    # exercise a multiplier param: turn on fast_movement and bump multiplier
+    mv_check = next(c for c, _p in qol_editor._rows if c._attr == "fast_movement")
+    mv_param = next(p for c, p in qol_editor._rows if c is mv_check)
+    assert mv_param is not None, "fast_movement row should have a linked param"
+    mv_check.setChecked(True)
+    mv_param.setValue(3.0)
+    assert session.qol.fast_movement is True
+    assert abs(session.qol.movement_speed_multiplier - 3.0) < 1e-9
+    mvd = bytes(session.serialize_all_with_qol())
+    assert mvd != session.original_rom_data, "movement-speed QoL should mutate the output"
+    while undo_stack.canUndo():
+        undo_stack.undo()
+    assert bytes(session.serialize_all_with_qol()) == session.original_rom_data
+    print("qol: movement-speed multiplier round-trips through undo cleanly")
+
+    # ---- project file round-trip ----------------------------------------
+    # Save the (currently-vanilla) session's edited state as a .romproj, then
+    # apply some edits, save again, reload via from_project and verify the
+    # patched bytes match what was in memory when the project was written.
+    import tempfile
+    from editor import project_file as pf
+
+    undo_stack.clear()
+    # mutate a known field so the diff has at least one entry
+    base_target_id = next(iter(sorted(session.base_digimon.keys())))
+    base_target = session.base_digimon[base_target_id]
+    orig_hp = base_target.hp
+    base_target.hp = orig_hp + 42
+    # set a QoL toggle to verify it survives the round-trip without polluting
+    # the byte diff (QoL goes into its own field on the project file)
+    session.qol.fast_text = True
+
+    edited_bytes = bytes(session.serialize_all())
+    with tempfile.NamedTemporaryFile(suffix=".romproj", delete=False, mode="w", encoding="utf-8") as tf:
+        tmp_path = tf.name
+    try:
+        pf.save_project(
+            tmp_path,
+            rom_version=session.version,
+            vanilla_rom_data=session.original_rom_data,
+            edited_rom_data=edited_bytes,
+            qol=session.qol,
+        )
+        project = pf.load_project(tmp_path)
+        assert project["rom_version"] == session.version
+        assert project["vanilla_rom_sha256"] == pf.vanilla_sha256(session.original_rom_data)
+        assert project["qol"].fast_text is True
+        # rebuild patched bytes from vanilla + diffs and compare
+        patched = bytearray(session.original_rom_data)
+        pf.apply_byte_diff(patched, project["diffs"])
+        assert bytes(patched) == edited_bytes, "round-tripped bytes diverge from edited bytes"
+        # round-trip via RomSession.from_project
+        reloaded = RomSession.from_project(
+            project_path=tmp_path,
+            vanilla_path=rom_path,
+            vanilla_data=session.original_rom_data,
+            version=session.version,
+            patched_data=bytes(patched),
+            qol_settings=project["qol"],
+        )
+        assert reloaded.base_digimon[base_target_id].hp == orig_hp + 42
+        assert reloaded.qol.fast_text is True
+        assert reloaded.project_path == tmp_path
+        assert reloaded.source_path is None
+        print("project file: save + reload preserves edits, QoL state, and vanilla baseline")
+    finally:
+        os.unlink(tmp_path)
+
+    # restore state for any tests that follow
+    base_target.hp = orig_hp
+    session.qol.fast_text = False
+    assert bytes(session.serialize_all()) == session.original_rom_data
+
     base_editor.deleteLater()
     enemy_editor.deleteLater()
     move_editor.deleteLater()
@@ -441,6 +879,7 @@ def main() -> int:
     equipment_editor.deleteLater()
     consumable_editor.deleteLater()
     farm_item_editor.deleteLater()
+    qol_editor.deleteLater()
     print("OK")
     return 0
 
