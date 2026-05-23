@@ -2,6 +2,8 @@
 
 ROM editor for the games **Digimon World: Dawn** and **Digimon World: Dusk**.
 
+![Digimon NDS Rom Editor](public/rom_editor_preview.png)
+
 The information presented in these pages refers to the USA roms (serial codes NTR-A6RE-USA and NTR-A3VE-USA for Dusk and Dawn respectively).
 
 ## Contents
