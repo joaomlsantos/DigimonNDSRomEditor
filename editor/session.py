@@ -45,6 +45,9 @@ class RomSession:
     equipment: Dict[int, model.Equipment] = field(default_factory=dict)
     consumables: List[model.Consumable] = field(default_factory=list)
     farm_items: List[model.FarmItem] = field(default_factory=list)
+    # In-game text. Keyed by region_id (see constants.STRING_REGIONS); each
+    # entry is a list of GameString in offset order.
+    string_regions: Dict[str, List[model.GameString]] = field(default_factory=dict)
 
     # QoL byte-patches applied at save time, *after* serialize_all(). Defaults
     # to all-off / vanilla parameters — the editor is data-editing-first; QoL
@@ -127,6 +130,7 @@ class RomSession:
         session.equipment = loaders.loadEquipment(version, parse_data)
         session.consumables = loaders.loadConsumables(version, parse_data)
         session.farm_items = loaders.loadFarmItems(version, parse_data)
+        session.string_regions = loaders.loadAllStringRegions(version, parse_data)
         return session
 
     def serialize_all(self) -> bytearray:
@@ -166,6 +170,9 @@ class RomSession:
             obj.writeToRom(out)
         for obj in self.farm_items:
             obj.writeToRom(out)
+        for region_strings in self.string_regions.values():
+            for s in region_strings:
+                s.writeToRom(out)
         return out
 
     def serialize_all_with_qol(self) -> bytearray:

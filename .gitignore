@@ -5,3 +5,5 @@ venv/
 *.bak
 .pytest_cache/
 *.romproj
+build/
+dist/

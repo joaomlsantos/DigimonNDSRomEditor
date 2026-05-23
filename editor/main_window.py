@@ -55,6 +55,7 @@ from .widgets.enemy_digimon_editor import EnemyDigimonEditor
 from .widgets.equipment_editor import EquipmentEditor
 from .widgets.farm_item_editor import FarmItemEditor
 from .widgets.farm_terrains_editor import FarmTerrainsEditor, farm_terrain_issues
+from .widgets.string_editor import StringEditor
 from .widgets.habitats_editor import HabitatsWorldmapEditor
 from .widgets.move_editor import MoveEditor, move_issues
 from .widgets.qol_editor import QolEditor
@@ -119,10 +120,23 @@ NAV_GROUPS = [
         ("Farm Items", "farm_items"),
         ("Farm Terrains", "farm_terrains"),
     ]),
+    ("Text", [
+        ("ARM9", "strings_bucket:arm9"),
+        ("Overlays", "strings_bucket:overlay"),
+        ("MSG.PAK", "strings_bucket:msgpak"),
+    ]),
     ("Settings", [
         ("QoL Toggles", "qol_settings"),
     ]),
 ]
+
+# Region-id prefix per nav bucket. The dispatcher merges every region whose
+# id starts with the prefix into a single flat string list.
+_STRING_BUCKET_PREFIXES = {
+    "arm9": "arm9_",
+    "overlay": "overlay",
+    "msgpak": "msgpak_",
+}
 
 
 class MainWindow(QMainWindow):
@@ -903,6 +917,17 @@ class MainWindow(QMainWindow):
             return FarmItemEditor(self.session.farm_items, self.undo_stack)
         if key == "qol_settings":
             return QolEditor(self.session.qol, self.undo_stack)
+        if key.startswith("strings_bucket:"):
+            bucket = key.split(":", 1)[1]
+            prefix = _STRING_BUCKET_PREFIXES.get(bucket)
+            if prefix is None:
+                return None
+            merged: list = []
+            for region_id, region_strings in self.session.string_regions.items():
+                if region_id.startswith(prefix):
+                    merged.extend(region_strings)
+            merged.sort(key=lambda s: s.offset)
+            return StringEditor(merged, self.undo_stack)
         return None
 
     # ---- cross-reference navigation --------------------------------------

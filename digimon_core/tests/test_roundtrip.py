@@ -146,6 +146,20 @@ class RoundtripTestBase:
             obj.writeToRom(target)
         self._assert_region_equal(target, "FarmTerrain")
 
+    def test_strings(self):
+        regions = constants.STRING_REGIONS.get(self.VERSION, [])
+        if not regions:
+            self.skipTest(f"no string regions defined for {self.VERSION}")
+        target = bytearray(self.vanilla)
+        total = 0
+        for region_id, _start, _end, _label in regions:
+            objs = loaders.loadStringRegion(self.VERSION, self.vanilla, region_id)
+            total += len(objs)
+            for obj in objs:
+                obj.writeToRom(target)
+        self.assertGreater(total, 0, "no strings parsed across any region")
+        self._assert_region_equal(target, "GameString")
+
 
 class DuskUsRoundtrip(RoundtripTestBase, unittest.TestCase):
     VERSION = "DUSK_US"

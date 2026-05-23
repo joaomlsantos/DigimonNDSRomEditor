@@ -207,6 +207,35 @@ def loadBattleStringTable(version: str, rom_data: bytearray) -> List[model.Battl
     return out
 
 
+def loadStringRegion(
+    version: str,
+    rom_data: bytearray,
+    region_id: str,
+) -> List[model.GameString]:
+    """Parse one named string region into GameString objects."""
+    from . import strings as _strings
+    regions = constants.STRING_REGIONS.get(version, [])
+    match = next((r for r in regions if r[0] == region_id), None)
+    if match is None:
+        raise KeyError(f"string region {region_id!r} not defined for {version}")
+    _, start, end, _ = match
+    out: List[model.GameString] = []
+    for offset, text, byte_len, terminator in _strings.decode_block(rom_data, start, end):
+        out.append(model.GameString(offset, text, byte_len, terminator, region_id))
+    return out
+
+
+def loadAllStringRegions(
+    version: str,
+    rom_data: bytearray,
+) -> Dict[str, List[model.GameString]]:
+    """Parse every defined string region for `version`."""
+    out: Dict[str, List[model.GameString]] = {}
+    for region_id, _start, _end, _label in constants.STRING_REGIONS.get(version, []):
+        out[region_id] = loadStringRegion(version, rom_data, region_id)
+    return out
+
+
 def loadHabitatsWorldmap(version: str, rom_data: bytearray) -> List[model.HabitatWorldmap]:
     offset_start, offset_end = constants.HABITATS_WORLDMAP_OFFSET[version]
     out: List[model.HabitatWorldmap] = []

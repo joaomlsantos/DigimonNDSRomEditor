@@ -89,6 +89,88 @@ STRING_BATTLE_TABLE_OFFSET = {
     "DAWN_US": (0X00116998, 0x00117824)
 }
 
+
+# In-game text regions: packed runs of strings split on [END] (FE FF) or
+# FF FF (see digimon_core.strings). Each entry is
+# (id, start_offset, end_offset, label).
+#
+# Every region is editable under the same fixed-size constraint: each
+# string's encoded bytes (chars + terminator) must fit within its original
+# byte budget, so ROM pointers — including MSG.PAK's — keep pointing at the
+# same offsets after a save.
+#
+# Offsets sourced from research_docs/data locations_*.txt; Dawn map is TBD.
+STRING_REGIONS = {
+    "DUSK_US": [
+        ("arm9_wild_battle_locations", 0x000F3434, 0x000F34A4, "Wild battle locations"),
+        ("arm9_personalities_etc",     0x000F3A10, 0x000F3D96, "Personalities, species, elements, status, stages, stats, types, tamer rank"),
+        ("arm9_consumable_items",      0x000F3E7C, 0x000F42D6, "Consumable item names"),
+        ("arm9_locations_farmboards",  0x000F4FD8, 0x000F5716, "Locations, farm boards"),
+        ("arm9_key_items",             0x000F5924, 0x000F63F4, "Key item names"),
+        ("arm9_equipment_items",       0x000F6650, 0x000F730A, "Equipment item names"),
+        ("arm9_menu_strings",          0x000F7464, 0x000F8384, "Menu strings"),
+        ("arm9_traits",                0x000F8648, 0x000F9576, "Trait names"),
+        ("arm9_system_strings",        0x00105270, 0x00105440, "System strings"),
+        ("arm9_menu_farmboards",       0x001060C0, 0x001062A4, "Menu farmboards, farm BGMs"),
+        ("arm9_farm_goods",            0x00106364, 0x001066F8, "Farm goods"),
+        ("arm9_npc_names",             0x001067F8, 0x00106B52, "NPC names"),
+        ("arm9_farm_goods_actions",    0x00106CAC, 0x00107396, "Farm goods, farm actions"),
+        ("arm9_tech_menu",             0x001074AE, 0x00107C82, "Tech strings, menu strings"),
+        ("arm9_wireless",              0x00107DEC, 0x0010A7B0, "Wireless communications"),
+        ("arm9_digimon_names_full",    0x0010B6C2, 0x0010D978, "Digimon names (full)"),
+        ("arm9_move_names",            0x0010E4EC, 0x001116CC, "Move names"),
+        ("arm9_digifarm_digilab",      0x00111D20, 0x00116A94, "Digifarm PC, digilab PC, connection strings"),
+        ("arm9_digiegg_enemy_names",   0x00117924, 0x0011C136, "Digiegg names, digimon abbrev, enemy digimon, enemy NPC"),
+        ("arm9_worldmap_prompts",      0x0011FF68, 0x0011FFE8, "Worldmap prompts"),
+
+        ("overlay8_digilab_pc",        0x0024E09C, 0x0024EBA0, "Overlay 8: digilab PC / learn / swap / discard / farm status"),
+        ("overlay9_farm_goods_dup",    0x00264314, 0x002649FD, "Overlay 9: farm goods (repeat?)"),
+        ("overlay9_shop_strings",      0x00264BC8, 0x00265809, "Overlay 9: shop strings"),
+        ("overlay13_digilab_pc_dup",   0x002771F8, 0x00277D1E, "Overlay 13: digilab PC repeat"),
+
+        # One full-range region instead of the named sub-blocks in the
+        # research doc — the gaps between sub-blocks (and especially the
+        # ~900KB tail past msgpak_legendary_tamer) contain real strings
+        # that were getting skipped. Outer bounds from
+        # research_docs/data locations_dusk.txt (start/end of MSG.PAK).
+        ("msgpak_all",                 0x0117E400, 0x01309294, "MSG.PAK"),
+    ],
+    "DAWN_US": [
+        # Derived from Dusk via head/tail signature matching against the Dawn
+        # ROM, then disambiguated by neighbor projection where signatures
+        # repeated. See research_docs/data locations_dusk.txt for the Dusk map.
+        ("arm9_wild_battle_locations", 0x000F3338, 0x000F33A8, "Wild battle locations"),
+        ("arm9_personalities_etc",     0x000F3914, 0x000F3C9A, "Personalities, species, elements, status, stages, stats, types, tamer rank"),
+        ("arm9_consumable_items",      0x000F3D80, 0x000F41DA, "Consumable item names"),
+        ("arm9_locations_farmboards",  0x000F4EDC, 0x000F561A, "Locations, farm boards"),
+        ("arm9_key_items",             0x000F5828, 0x000F62F8, "Key item names"),
+        ("arm9_equipment_items",       0x000F6554, 0x000F7202, "Equipment item names"),
+        ("arm9_menu_strings",          0x000F7368, 0x000F8288, "Menu strings"),
+        ("arm9_traits",                0x000F854C, 0x000F947A, "Trait names"),
+        ("arm9_system_strings",        0x00105174, 0x00105344, "System strings"),
+        ("arm9_menu_farmboards",       0x00105FC4, 0x001061A8, "Menu farmboards, farm BGMs"),
+        ("arm9_farm_goods",            0x00106268, 0x001065FC, "Farm goods"),
+        ("arm9_npc_names",             0x001066FC, 0x00106A56, "NPC names"),
+        ("arm9_farm_goods_actions",    0x00106BB0, 0x0010729A, "Farm goods, farm actions"),
+        ("arm9_tech_menu",             0x001073B2, 0x00107B86, "Tech strings, menu strings"),
+        ("arm9_wireless",              0x00107CF0, 0x0010A6B4, "Wireless communications"),
+        ("arm9_digimon_names_full",    0x0010B5C6, 0x0010D87C, "Digimon names (full)"),
+        ("arm9_move_names",            0x0010E3F0, 0x001115D0, "Move names"),
+        ("arm9_digifarm_digilab",      0x00111C24, 0x00116998, "Digifarm PC, digilab PC, connection strings"),
+        ("arm9_digiegg_enemy_names",   0x00117828, 0x0011C03A, "Digiegg names, digimon abbrev, enemy digimon, enemy NPC"),
+        ("arm9_worldmap_prompts",      0x0011FDC4, 0x0011FE44, "Worldmap prompts"),
+
+        ("overlay8_digilab_pc",        0x0024DE9C, 0x0024E9A0, "Overlay 8: digilab PC / learn / swap / discard / farm status"),
+        ("overlay9_farm_goods_dup",    0x00264114, 0x002647FD, "Overlay 9: farm goods (repeat?)"),
+        ("overlay9_shop_strings",      0x002649C8, 0x00265609, "Overlay 9: shop strings"),
+        ("overlay13_digilab_pc_dup",   0x00276FF8, 0x00277B1E, "Overlay 13: digilab PC repeat"),
+
+        # One full-range region — see DUSK_US note above. Outer bounds
+        # supplied by user (0x117E200 - 0x1309200).
+        ("msgpak_all",                 0x0117E200, 0x01309200, "MSG.PAK"),
+    ],
+}
+
 FARM_TERRAINS_START_OFFSET = {
     "DUSK_US": 0x001310A8,
     "DAWN_US": 0x00130EE8

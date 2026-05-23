@@ -2,6 +2,7 @@ from enum import Enum
 from typing import List, Tuple
 
 from . import constants
+from . import strings as _strings
 
 
 class Species(Enum):
@@ -130,6 +131,75 @@ class BattleStringEntry:
 
     def writeToRom(self, rom_data: bytearray):
         rom_data[self.offset:self.offset + self.SIZE] = self.getByteArray()
+
+
+class GameString:
+    """A single in-game string at a fixed ROM offset.
+
+    Strings end at FE FF ([END]) or FF FF. The terminator is owned by the
+    string (its bytes are counted in `original_byte_length`) but kept out of
+    `text` to avoid confusing the editor. Pointers to this offset live
+    elsewhere in the ROM and aren't repointed by the editor, so the encoded
+    bytes must fit within `original_byte_length`; shorter encodings are
+    padded with NUL bytes.
+
+    When an edit shortens the string, the terminator is rewritten as [END]
+    (FE FF) regardless of what was originally there — that's the unified
+    in-engine sentinel that stops rendering cleanly.
+    """
+
+    offset: int
+    text: str
+    original_byte_length: int  # bytes from offset through terminator, inclusive
+    original_terminator: int   # END_MARKER or TERMINATOR
+    region_id: str
+
+    def __init__(
+        self,
+        offset: int,
+        text: str,
+        original_byte_length: int,
+        original_terminator: int,
+        region_id: str = "",
+    ):
+        self.offset = offset
+        self.text = text
+        self.original_byte_length = original_byte_length
+        self.original_terminator = original_terminator
+        self.region_id = region_id
+
+    def _resolved_terminator(self) -> int:
+        """Pick the terminator to write: original on exact-fit, [END] if shortened."""
+        # +2 for the terminator itself; if there's room left over, the user
+        # truncated the string and per the spec we write [END] so the engine
+        # stops cleanly. Otherwise the original terminator is preserved.
+        char_bytes = _strings.byte_length(self.text, terminator=None)
+        if char_bytes + 2 < self.original_byte_length:
+            return _strings.END_MARKER
+        return self.original_terminator
+
+    def encoded_length(self) -> int:
+        """Byte length of `text` re-encoded with its trailing terminator."""
+        return _strings.byte_length(self.text, terminator=self._resolved_terminator())
+
+    def fits(self) -> bool:
+        return self.encoded_length() <= self.original_byte_length
+
+    def getByteArray(self) -> bytearray:
+        encoded = _strings.encode_string(
+            self.text, terminator=self._resolved_terminator()
+        )
+        if len(encoded) > self.original_byte_length:
+            raise _strings.StringTooLongError(
+                f"string at 0x{self.offset:08x} ({self.region_id}): "
+                f"encoded {len(encoded)} bytes exceeds budget {self.original_byte_length}"
+            )
+        out = bytearray(self.original_byte_length)
+        out[:len(encoded)] = encoded
+        return out
+
+    def writeToRom(self, rom_data: bytearray):
+        rom_data[self.offset:self.offset + self.original_byte_length] = self.getByteArray()
 
 
 class HabitatWorldmap:

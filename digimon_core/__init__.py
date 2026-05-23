@@ -8,6 +8,7 @@ from . import constants
 from . import loaders
 from . import model
 from . import rom
+from . import strings
 
 from .model import (
     ArmorDigivolution,
@@ -21,6 +22,7 @@ from .model import (
     EncounterRewardTable,
     EnemyDataDigimon,
     FarmTerrain,
+    GameString,
     HabitatWorldmap,
     ItemType,
     LvlUpMode,
@@ -47,6 +49,7 @@ __all__ = [
     "loaders",
     "model",
     "rom",
+    "strings",
     "ArmorDigivolution",
     "BaseDataDigimon",
     "BattleStringEntry",
@@ -58,6 +61,7 @@ __all__ = [
     "EncounterRewardTable",
     "EnemyDataDigimon",
     "FarmTerrain",
+    "GameString",
     "HabitatWorldmap",
     "ItemType",
     "LvlUpMode",
