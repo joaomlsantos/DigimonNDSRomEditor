@@ -131,9 +131,9 @@ STRING_REGIONS = {
         # One full-range region instead of the named sub-blocks in the
         # research doc — the gaps between sub-blocks (and especially the
         # ~900KB tail past msgpak_legendary_tamer) contain real strings
-        # that were getting skipped. Outer bounds from
-        # research_docs/data locations_dusk.txt (start/end of MSG.PAK).
-        ("msgpak_all",                 0x0117E400, 0x01309294, "MSG.PAK"),
+        # that were getting skipped. Start moved past the 0x570-byte
+        # MSG.PAK file header so the first entry isn't header noise.
+        ("msgpak_all",                 0x0117E970, 0x01309294, "MSG.PAK"),
     ],
     "DAWN_US": [
         # Derived from Dusk via head/tail signature matching against the Dawn
@@ -165,9 +165,10 @@ STRING_REGIONS = {
         ("overlay9_shop_strings",      0x002649C8, 0x00265609, "Overlay 9: shop strings"),
         ("overlay13_digilab_pc_dup",   0x00276FF8, 0x00277B1E, "Overlay 13: digilab PC repeat"),
 
-        # One full-range region — see DUSK_US note above. Outer bounds
-        # supplied by user (0x117E200 - 0x1309200).
-        ("msgpak_all",                 0x0117E200, 0x01309200, "MSG.PAK"),
+        # One full-range region — see DUSK_US note above. Start moved past
+        # the matching 0x570-byte MSG.PAK header (header runs 0x117E200..
+        # 0x117E770; first real string at 0x117E770).
+        ("msgpak_all",                 0x0117E770, 0x01309200, "MSG.PAK"),
     ],
 }
 

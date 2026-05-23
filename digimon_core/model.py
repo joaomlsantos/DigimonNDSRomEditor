@@ -167,6 +167,13 @@ class GameString:
         self.original_byte_length = original_byte_length
         self.original_terminator = original_terminator
         self.region_id = region_id
+        # Snapshot of `text` at parse time. The validation collector compares
+        # the live `text` against this to skip the (expensive) encode pass for
+        # unmodified strings — by construction, a parsed string always fits
+        # its budget. Identity check first (the common case after assignment
+        # diverges) falls back to value equality so undoing back to vanilla
+        # also takes the fast path.
+        self._initial_text = text
 
     def _resolved_terminator(self) -> int:
         """Pick the terminator to write: original on exact-fit, [END] if shortened."""

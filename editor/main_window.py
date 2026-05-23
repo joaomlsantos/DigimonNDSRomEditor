@@ -55,7 +55,7 @@ from .widgets.enemy_digimon_editor import EnemyDigimonEditor
 from .widgets.equipment_editor import EquipmentEditor
 from .widgets.farm_item_editor import FarmItemEditor
 from .widgets.farm_terrains_editor import FarmTerrainsEditor, farm_terrain_issues
-from .widgets.string_editor import StringEditor
+from .widgets.string_editor import StringEditor, string_issues
 from .widgets.habitats_editor import HabitatsWorldmapEditor
 from .widgets.move_editor import MoveEditor, move_issues
 from .widgets.qol_editor import QolEditor
@@ -778,6 +778,7 @@ class MainWindow(QMainWindow):
             len(session.encounter_rewards),
         ))
         reg.register(lambda: farm_terrain_issues(session.farm_terrains))
+        reg.register(lambda: string_issues(session.string_regions))
         reg.notify_changed()
         self.undo_stack.clear()
         # Drop any open editor — it still references the previous session's
@@ -796,8 +797,38 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         self._refresh_actions()
 
+    def _save_guard_ok(self) -> bool:
+        """Block save when any string is over its byte budget.
+
+        Pointers to each string's offset are fixed in the ROM; an over-budget
+        encoded string would overflow into the next field on disk. Returns
+        True if save can proceed.
+        """
+        if self.session is None:
+            return False
+        bad = self.session.over_budget_strings()
+        if not bad:
+            return True
+        sample_lines = []
+        for s in bad[:5]:
+            preview = s.text.replace("[BR]", " ")[:60]
+            sample_lines.append(
+                f"  • 0x{s.offset:08X}: {s.encoded_length()} / {s.original_byte_length} bytes — {preview!r}"
+            )
+        more = f"\n  …and {len(bad) - 5} more" if len(bad) > 5 else ""
+        QMessageBox.critical(
+            self,
+            "Cannot save: strings over budget",
+            f"{len(bad)} string(s) exceed their original byte budget and can't be saved "
+            f"without misaligning ROM pointers.\n\n" + "\n".join(sample_lines) + more +
+            "\n\nShorten or rewrite the offending strings, then save again.",
+        )
+        return False
+
     def _on_save(self) -> None:
         if self.session is None:
+            return
+        if not self._save_guard_ok():
             return
         # Project sessions start with no source_path so "Save" doesn't
         # silently overwrite the vanilla ROM — fall through to Save As the
@@ -820,6 +851,8 @@ class MainWindow(QMainWindow):
 
     def _on_save_as(self) -> None:
         if self.session is None:
+            return
+        if not self._save_guard_ok():
             return
         # Default the dialog to the session's last ROM path when it exists;
         # otherwise (project sessions, fresh) leave it empty so the user picks

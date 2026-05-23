@@ -9,7 +9,7 @@ rewritten as [END] so the engine stops cleanly at the new boundary.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, QSignalBlocker, QTimer
 from PySide6.QtGui import QFont, QUndoStack
@@ -259,3 +259,86 @@ class StringEditor(QWidget):
         else:
             self._budget_label.setStyleSheet("color: gray;")
         self._budget_label.setText(label)
+
+    # ---- external navigation -----------------------------------------------
+
+    def select_by_id(self, offset: int) -> None:
+        """Jump to the row whose string starts at `offset`. Used by the
+        validation footer's click-to-navigate, where `record_id` carries the
+        offending string's ROM offset."""
+        for row, s in enumerate(self._strings):
+            if s.offset == offset:
+                # Clear any active filter that would otherwise hide the row.
+                if self._string_list.isRowHidden(row):
+                    with QSignalBlocker(self._search):
+                        self._search.clear()
+                    self._apply_filter("")
+                self._string_list.setCurrentRow(row)
+                self._string_list.scrollToItem(self._string_list.item(row))
+                return
+
+
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+
+
+_BUCKET_LABELS = {
+    "arm9": ("ARM9 Strings", "arm9_"),
+    "overlay": ("Overlay Strings", "overlay"),
+    "msgpak": ("MSG.PAK Strings", "msgpak_"),
+}
+
+
+def _bucket_for_region(region_id: str) -> Optional[str]:
+    for bucket, (_label, prefix) in _BUCKET_LABELS.items():
+        if region_id.startswith(prefix):
+            return bucket
+    return None
+
+
+def string_issues(
+    string_regions: Dict[str, List[model.GameString]],
+) -> List[ValidationIssue]:
+    """Footer-level issues for in-game text.
+
+    Reports any string whose encoded bytes exceed its original byte budget.
+    Pointers to each string's offset are baked into the ROM and aren't
+    repointed by the editor, so an over-budget write would clobber the next
+    field on disk. The save guard refuses to write while any of these exist;
+    surfacing them in the footer lets the user find and shorten them.
+    """
+    issues: List[ValidationIssue] = []
+    for region_id, strings in string_regions.items():
+        bucket = _bucket_for_region(region_id)
+        if bucket is None:
+            continue
+        section_label, _ = _BUCKET_LABELS[bucket]
+        editor_key = f"strings_bucket:{bucket}"
+        for s in strings:
+            # This collector runs on every undo-stack tick (every keystroke
+            # editor-wide), so the per-string check must stay cheap. Parsed
+            # strings always fit by construction, so identity-equal text
+            # (unmodified since load) skips straight to the next entry —
+            # that's the 99% case. Value equality covers undo-to-vanilla.
+            t = s.text
+            init = s._initial_text
+            if t is init or t == init:
+                continue
+            # Every char/token encodes to exactly one 2-byte LE word, so
+            # `len(text) * 2 + 2` is an upper bound on encoded size. If even
+            # that fits, we can skip the expensive encode_string() pass.
+            if len(t) * 2 + 2 <= s.original_byte_length:
+                continue
+            if s.fits():
+                continue
+            preview = _preview(s.text)
+            issues.append(ValidationIssue(
+                section=section_label,
+                category="Over budget",
+                message=(
+                    f"0x{s.offset:08X}: {s.encoded_length()} / "
+                    f"{s.original_byte_length} bytes — {preview}"
+                ),
+                editor_key=editor_key,
+                record_id=s.offset,
+            ))
+    return issues

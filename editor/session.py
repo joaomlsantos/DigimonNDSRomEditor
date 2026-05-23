@@ -186,6 +186,20 @@ class RomSession:
         qol_module.apply_qol_patches(out, self.version, self.qol)
         return out
 
+    def over_budget_strings(self) -> List[model.GameString]:
+        """Strings whose encoded length exceeds their original byte budget.
+
+        Pointers to each string's offset are baked into the ROM and aren't
+        repointed by the editor, so writing an over-budget encoded string
+        would clobber whatever follows it. Save paths gate on this list.
+        """
+        bad: List[model.GameString] = []
+        for region_strings in self.string_regions.values():
+            for s in region_strings:
+                if not s.fits():
+                    bad.append(s)
+        return bad
+
     def save(self, path: Optional[str] = None) -> str:
         target = path or self.source_path
         if target is None:
