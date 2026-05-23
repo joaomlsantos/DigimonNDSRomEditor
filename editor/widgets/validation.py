@@ -203,7 +203,7 @@ class _IssuesPopup(QFrame):
         self.setStyleSheet(
             "#ValidationIssuesPopup { background: palette(window);"
             " border: 1px solid palette(mid); }"
-            "QLabel#section { font-weight: bold; color: palette(mid);"
+            "QLabel#section { font-weight: bold; color: palette(text);"
             " padding: 4px 8px; background: palette(alternate-base); }"
             "QLabel#category { font-weight: bold; color: palette(text);"
             " padding: 2px 12px; }"

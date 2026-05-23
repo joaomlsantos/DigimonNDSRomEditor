@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple, Type
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics, QRegularExpressionValidator, QUndoStack
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtWidgets import (
@@ -194,8 +194,11 @@ class NoWheelComboBox(QComboBox):
         event.ignore()
 
 
-_WARN_QSS = "QSpinBox { border: 1px solid #c0392b; background: #fdecea; }"
-_COMBO_WARN_QSS = "QComboBox { border: 1px solid #c0392b; background: #fdecea; }"
+# Pin the foreground colour alongside the pink background — without it, dark
+# system themes draw the value in their default light text colour, which
+# disappears against the warn-state background.
+_WARN_QSS = "QSpinBox { border: 1px solid #c0392b; background: #fdecea; color: #2b1b1b; }"
+_COMBO_WARN_QSS = "QComboBox { border: 1px solid #c0392b; background: #fdecea; color: #2b1b1b; }"
 
 
 class BoundSpinBox(NoWheelSpinBox):
@@ -254,6 +257,14 @@ class BoundSpinBox(NoWheelSpinBox):
             # see at a glance that the field can't be touched.
             self.setEnabled(False)
             self.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        # Debounce undo pushes so holding an arrow key (or typing digits)
+        # doesn't fire the full validation + form-refresh cascade per event.
+        # Visual warn-state still updates immediately in `_on_value_changed`.
+        self._pending_commit = False
+        self._commit_timer = QTimer(self)
+        self._commit_timer.setSingleShot(True)
+        self._commit_timer.setInterval(150)
+        self._commit_timer.timeout.connect(self._commit_pending)
         with silenced(self):
             self.setValue(self._to_display(getattr(target, attr)))
         self._update_warn_state()
@@ -297,22 +308,48 @@ class BoundSpinBox(NoWheelSpinBox):
             super().setToolTip(self._base_tooltip)
 
     def rebind(self, new_target) -> None:
+        # Flush any in-flight edit against the *old* target before switching;
+        # otherwise the debounced push would land on the new target's record.
+        self._flush_pending()
         self._target = new_target
         with silenced(self):
             self.setValue(self._to_display(getattr(new_target, self._attr)))
         self._update_warn_state()
 
     def refresh(self) -> None:
+        # External value change (undo/redo, programmatic edit) — discard any
+        # pending typed edit so we don't immediately push it back on top.
+        self._commit_timer.stop()
+        self._pending_commit = False
         with silenced(self):
             self.setValue(self._to_display(getattr(self._target, self._attr)))
         self._update_warn_state()
 
-    def _on_value_changed(self, new_value: int) -> None:
+    def focusOutEvent(self, event):  # noqa: N802 — Qt override name
+        self._flush_pending()
+        super().focusOutEvent(event)
+
+    def _on_value_changed(self, _new_value: int) -> None:
+        # Keep the warn border live so the user sees out-of-range feedback as
+        # they scrub; defer the undo push (and the cascade it triggers).
         self._update_warn_state()
-        storage = self._to_storage(new_value)
+        self._pending_commit = True
+        self._commit_timer.start()
+
+    def _commit_pending(self) -> None:
+        if not self._pending_commit:
+            return
+        self._pending_commit = False
+        storage = self._to_storage(self.value())
         if getattr(self._target, self._attr) == storage:
             return
         self._undo_stack.push(SetAttrCommand(self._target, self._attr, storage))
+
+    def _flush_pending(self) -> None:
+        if not self._pending_commit:
+            return
+        self._commit_timer.stop()
+        self._commit_pending()
 
 
 class BoundHexLineEdit(QLineEdit):

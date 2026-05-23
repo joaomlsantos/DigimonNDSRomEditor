@@ -13,10 +13,10 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    # No bundled data files yet. If an icon / splash / docs are added later,
-    # list them here as (source, target_dir) tuples — same shape DWDDRandomizer
-    # uses for `public/dusk_transparent.png`.
-    datas=[],
+    # Bundle the app icon so `QApplication.setWindowIcon` can find it at
+    # runtime — the `icon=` field below only stamps the EXE's file icon
+    # (what Explorer renders for the file), not the window/taskbar icon.
+    datas=[('public/editor.ico', 'public')],
     # PySide6 hooks ship with PyInstaller; nothing else in the project pulls
     # in dynamic imports that the static analyser would miss.
     hiddenimports=[],

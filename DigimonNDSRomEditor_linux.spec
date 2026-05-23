@@ -15,7 +15,10 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    # Bundle the app icon so `QApplication.setWindowIcon` can find it at
+    # runtime — `icon=` below only affects the desktop-entry icon, not the
+    # window/taskbar icon Qt draws while the app is running.
+    datas=[('public/editor.png', 'public')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
