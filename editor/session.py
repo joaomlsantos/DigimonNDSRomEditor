@@ -13,7 +13,7 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from digimon_core import loaders, model, qol as qol_module, rom
+from digimon_core import constants, loaders, model, qol as qol_module, rom
 
 
 @dataclass
@@ -131,6 +131,12 @@ class RomSession:
         session.consumables = loaders.loadConsumables(version, parse_data)
         session.farm_items = loaders.loadFarmItems(version, parse_data)
         session.string_regions = loaders.loadAllStringRegions(version, parse_data)
+        # Seed QoL parameter defaults from the actual bytes at their ARM-imm
+        # offsets so the editor displays the current value (vanilla on a fresh
+        # ROM, the user's previously-patched value otherwise). from_project()
+        # then replaces the whole `qol` field with the project's saved state.
+        session.qol.movement_speed = parse_data[constants.MOVEMENT_SPEED_OFFSET[version]]
+        session.qol.scan_rate = parse_data[constants.BASE_SCAN_RATE_OFFSET[version]]
         return session
 
     def serialize_all(self) -> bytearray:

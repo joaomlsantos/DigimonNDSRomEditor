@@ -13,6 +13,8 @@ from typing import Dict, List, Tuple
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
+    QComboBox,
+    QCompleter,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -164,9 +166,22 @@ class _ReskinRow:
 
         self._combo = NoWheelComboBox()
         self._combo.setMaximumWidth(280)
+        # Editable + NoInsert + substring completer mirrors BoundIdCombo: user
+        # can type any name fragment to filter, free-typed text never inserts.
+        self._combo.setEditable(True)
+        self._combo.setInsertPolicy(QComboBox.NoInsert)
+        completer = QCompleter(self._combo)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._combo.setCompleter(completer)
         for base_id, name in self._pickable:
             self._combo.addItem(f"0x{base_id:03x}  {name}", userData=base_id)
+        completer.setModel(self._combo.model())
         self._combo.currentIndexChanged.connect(self._on_changed)
+        line_edit = self._combo.lineEdit()
+        if line_edit is not None:
+            line_edit.editingFinished.connect(self._snap_text_to_selection)
 
         self._status = QLabel("")
         self._status.setStyleSheet("color: palette(mid);")
@@ -221,6 +236,19 @@ class _ReskinRow:
                 with silenced(self._combo):
                     self._combo.setCurrentIndex(i)
                 break
+
+    def _snap_text_to_selection(self) -> None:
+        """Revert free-typed text to the current item's label on focus-out."""
+        line_edit = self._combo.lineEdit()
+        if line_edit is None:
+            return
+        ix = self._combo.currentIndex()
+        if ix < 0:
+            return
+        expected = self._combo.itemText(ix)
+        if line_edit.text() != expected:
+            with silenced(self._combo):
+                line_edit.setText(expected)
 
     def _on_changed(self, _index: int) -> None:
         enemy_id = self._target_enemy_id

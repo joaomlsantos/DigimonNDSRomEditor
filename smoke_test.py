@@ -1,12 +1,19 @@
-"""Headless smoke test for the Base / Enemy digimon editors.
+"""Headless smoke test for every editor in the app.
 
-Loads a real ROM, instantiates both editors, exercises the round-trip path:
+Loads a real ROM and walks each editor (digimon, moves, digivolutions,
+quests, encounters, items, habitats, farm, strings, QoL, project files),
+exercising the round-trip path for each:
   1. parse → serialize_all() equals vanilla
-  2. change a stat via the editor's bound spinbox
-  3. undo → serialize_all() equals vanilla again
-  4. redo → serialize_all() reflects the change in exactly one byte region
+  2. mutate one field via the editor's bound widget
+  3. assert serialize_all() differs at the expected offset
+  4. undo → model + serialize_all() restored to vanilla
 
-Run: python smoke_test.py
+Beyond the per-editor round-trips, also checks: select_by_id navigation
+for the click-to-jump pickers; validation-cap collectors mirror their
+widget-level warnings; dirty-state markers; the over-budget save guard
+for in-game text; and project-file save/reload preserves QoL + edits.
+
+Run: python smoke_test.py [optional path to .nds]
 """
 import os
 import sys
@@ -22,6 +29,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtGui import QUndoStack  # noqa: E402
 
+from digimon_core import constants  # noqa: E402
 from editor.session import RomSession  # noqa: E402
 from editor.widgets.form_helpers import is_record_dirty, set_details_providers  # noqa: E402
 from editor.widgets.validation import registry as validation_registry  # noqa: E402
@@ -48,6 +56,7 @@ from editor.widgets.farm_terrains_editor import FarmTerrainsEditor  # noqa: E402
 from editor.widgets.habitats_editor import HabitatsWorldmapEditor  # noqa: E402
 from editor.widgets.qol_editor import QolEditor  # noqa: E402
 from editor.widgets.starters_editor import StartersEditor  # noqa: E402
+from editor.widgets.string_editor import StringEditor, string_issues  # noqa: E402
 from editor.widgets.wild_encounters_editor import WildEncountersEditor  # noqa: E402
 
 
@@ -471,6 +480,72 @@ def main() -> int:
     assert bytes(session.serialize_all()) == session.original_rom_data
     print(f"farm items: {len(session.farm_items)} loaded, max_points edit round-trips cleanly")
 
+    # ---- string editor (text) --------------------------------------------
+    # Strings sit at fixed ROM offsets — pointers aren't repointed — so the
+    # editor's whole correctness story is "the encoded bytes stay within
+    # original_byte_length". Walk one bucket end-to-end: pick a string,
+    # round-trip a same-length edit through undo, then deliberately blow
+    # past the budget and check both the save-guard list and the validation
+    # collector light up. Use a bucket with non-trivial content (MSG.PAK)
+    # to also exercise the fast-path identity check on _initial_text.
+    undo_stack.clear()
+    msgpak_strings = []
+    for region_id, region_strings in session.string_regions.items():
+        if region_id.startswith("msgpak_"):
+            msgpak_strings.extend(region_strings)
+    msgpak_strings.sort(key=lambda s: s.offset)
+    assert msgpak_strings, "no MSG.PAK strings loaded — region config regression?"
+    string_editor = StringEditor(msgpak_strings, undo_stack)
+
+    # Find a string with at least 4 chars of plain text we can mutate
+    # in-place without changing encoded length (so the round-trip survives
+    # without padding semantics getting in the way).
+    plain = next(
+        (s for s in msgpak_strings
+         if len(s.text) >= 4 and "[" not in s.text and s.fits()),
+        None,
+    )
+    assert plain is not None, "no plain MSG.PAK string available for editing"
+    orig_text = plain.text
+    # `_set_current` jumps the editor to a specific GameString.
+    string_editor._set_current(plain)
+    # Substitute first char with one of equal encoded width (any ASCII letter
+    # is 2 bytes encoded, same as any other). textChanged starts the debounce
+    # timer; bypass it by calling _commit_pending_edit directly so the test
+    # doesn't depend on the Qt event loop.
+    new_first = "Z" if orig_text[0] != "Z" else "Y"
+    string_editor._text_edit.setPlainText(new_first + orig_text[1:])
+    string_editor._commit_pending_edit()
+    assert plain.text != orig_text, "string edit did not propagate to model"
+    assert undo_stack.count() == 1
+    assert bytes(session.serialize_all()) != session.original_rom_data, \
+        "string edit not reflected in serialize_all()"
+    undo_stack.undo()
+    assert plain.text == orig_text, "undo did not restore string text"
+    assert bytes(session.serialize_all()) == session.original_rom_data, \
+        "undo did not restore vanilla bytes"
+    undo_stack.clear()
+    print(f"strings: edited MSG.PAK string at 0x{plain.offset:08X}, round-trip clean")
+
+    # Over-budget detection — must show up in both session.over_budget_strings()
+    # and the string_issues() collector (the latter is what routes through the
+    # validation footer's click-to-navigate).
+    assert session.over_budget_strings() == [], "unexpected over-budget strings on vanilla"
+    assert string_issues(session.string_regions) == [], "string_issues dirty on vanilla"
+    plain.text = "X" * (plain.original_byte_length * 2)  # guaranteed overflow
+    bad = session.over_budget_strings()
+    assert plain in bad, "over_budget_strings() failed to surface inflated string"
+    issues = string_issues(session.string_regions)
+    assert any(i.record_id == plain.offset for i in issues), \
+        "string_issues() did not include the inflated string"
+    assert any(i.category == "Over budget" for i in issues)
+    # Restore — leave the session clean for whatever runs next.
+    plain.text = orig_text
+    assert session.over_budget_strings() == []
+    assert bytes(session.serialize_all()) == session.original_rom_data
+    print(f"strings: {sum(len(v) for v in session.string_regions.values())} loaded, "
+          f"over-budget detection + collector wired correctly")
+
     # ---- cross-reference navigation --------------------------------------
     # select_by_id should clear any active filter and land on the target row.
     target_did = next(iter(sorted(session.base_digimon.keys())))
@@ -791,20 +866,23 @@ def main() -> int:
         "QoL undo must restore vanilla output"
     print("qol: toggle pushes undo, scales output bytes, leaves serialize_all clean")
 
-    # exercise a multiplier param: turn on fast_movement and bump multiplier
+    # exercise the absolute-value movement-speed param: toggle on, bump value.
+    # Vanilla byte is 2; pick something else so the output differs.
     mv_check = next(c for c, _p in qol_editor._rows if c._attr == "fast_movement")
     mv_param = next(p for c, p in qol_editor._rows if c is mv_check)
     assert mv_param is not None, "fast_movement row should have a linked param"
+    assert session.qol.movement_speed == 2, "vanilla movement byte should seed default"
     mv_check.setChecked(True)
-    mv_param.setValue(3.0)
+    mv_param.setValue(8)
     assert session.qol.fast_movement is True
-    assert abs(session.qol.movement_speed_multiplier - 3.0) < 1e-9
+    assert session.qol.movement_speed == 8
     mvd = bytes(session.serialize_all_with_qol())
     assert mvd != session.original_rom_data, "movement-speed QoL should mutate the output"
+    assert mvd[constants.MOVEMENT_SPEED_OFFSET[session.version]] == 8
     while undo_stack.canUndo():
         undo_stack.undo()
     assert bytes(session.serialize_all_with_qol()) == session.original_rom_data
-    print("qol: movement-speed multiplier round-trips through undo cleanly")
+    print("qol: movement-speed absolute value round-trips through undo cleanly")
 
     # ---- project file round-trip ----------------------------------------
     # Save the (currently-vanilla) session's edited state as a .romproj, then
@@ -879,6 +957,7 @@ def main() -> int:
     equipment_editor.deleteLater()
     consumable_editor.deleteLater()
     farm_item_editor.deleteLater()
+    string_editor.deleteLater()
     qol_editor.deleteLater()
     print("OK")
     return 0

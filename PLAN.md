@@ -118,7 +118,8 @@ Mapped directly onto the model classes. Navigation tree is grouped (Digimon Data
 13. **Starters** ✅ — the starter packs; pick digimon per pack + starting level (level-vs-aptitude cap validated).
 14. **Farm Terrains** ✅ — `FarmTerrain`: digimon limit, per-species EXP yields.
 15. **Habitats / Worldmap** ✅ — `HabitatWorldmap` entries: species shown per location, location flags.
-16. **QoL toggles** — not yet implemented. Will surface DWDDRandomizer's QoL byte-patches as checkboxes (text speed, movement speed, scan rate, farm exp, battle perf, version-exclusive areas, …) and write at save time.
+16. **QoL toggles** ✅ — DWDDRandomizer's byte-patches surfaced as checkboxes (text speed, movement speed, scan rate, farm exp, battle perf, version-exclusive areas, …). `RomSession.serialize_all_with_qol()` applies enabled patches on top of model writes at save time.
+17. **Text / Strings** ✅ *(beyond plan)* — in-game text editor with three buckets in the nav tree: **ARM9**, **Overlays**, **MSG.PAK**. Each bucket merges its constituent regions into a single offset-sorted list with substring search; the right pane has a [BR]/[END]/marker-aware text edit + a live "X / Y bytes — Z free" budget meter. Strings are at fixed ROM offsets (pointers aren't repointed), so per-string `original_byte_length` is a hard cap — over-budget edits are flagged in the validation footer and the Save path refuses to write until they're shortened. MSG.PAK is parsed as a single full-range region (not the named sub-blocks from the research doc) so dev/debug strings and tail content stay editable.
 
 ### UI patterns shared across pages
 
@@ -136,8 +137,8 @@ Mapped directly onto the model classes. Navigation tree is grouped (Digimon Data
 Save paths:
 
 1. **Save Patched ROM** ✅ (`File → Save` / `Save As…`)
-   Walks every loaded model, calls `writeToRom(rom_data)` on a fresh copy of the original ROM bytes (`RomSession.serialize_all()`), then writes the `.nds`. **Rolling `.bak`** alongside the target: `shutil.copy2(target, target + ".bak")` before each overwrite so a botched write (or a regretted save) doesn't destroy the previous on-disk copy. QoL byte-patches not yet wired (will piggy-back on this path once the QoL tab lands).
-2. **Save Project** (`.dnedit`) — **not yet implemented**. Design under discussion: TOML/JSON capturing `(format_version, editor_version, rom_version, qol_toggles, diffs)`. Diff layer choice still open — byte-range diffs (`(offset, length, bytes)` tuples) are leading because they're robust to model changes; field-level diffs would be more readable but need a stable per-field path scheme. QoL section forward-compatible empty until §4.16 lands.
+   Walks every loaded model, calls `writeToRom(rom_data)` on a fresh copy of the original ROM bytes (`RomSession.serialize_all_with_qol()` — model writes then QoL byte-patches on top), then writes the `.nds`. **Rolling `.bak`** alongside the target: `shutil.copy2(target, target + ".bak")` before each overwrite so a botched write (or a regretted save) doesn't destroy the previous on-disk copy. Save is gated on `session.over_budget_strings()` — any string whose encoded bytes exceed its slot would clobber the next field on disk, so the writer refuses and the validation footer points to the offenders.
+2. **Save Project** (`.romproj`) ✅ — JSON file capturing `(format_version, editor_version, rom_version, vanilla_sha256, qol_settings, byte_diff)`. Byte-range diffs (`compute_byte_diff` walks vanilla and edited in lockstep emitting `(offset, bytes)` per mismatch run) won over field-level for robustness against model changes. Opening a project verifies vanilla SHA-256, applies the diff, reparses the model graph. QoL state is stored separately from the diff so it doesn't compound across round-trips.
 3. **Generate IPS/xdelta patch** for distribution. Still v0.2+.
 
 ### Persistence sidecars already shipped
@@ -189,12 +190,12 @@ Each milestone is independently shippable.
 - ~~Habitat / worldmap editor.~~
 - Item editors (Equipment, Consumables, Farm Items) added beyond plan.
 
-### M6 — QoL tab + Project files + Polish — partial
-- **Not yet:** Surface QoL toggles, wire to `DigimonROM.executeQolChanges`.
-- **Not yet:** Project-file save/load with diff format (`.dnedit`).
+### M6 — QoL tab + Project files + Polish — ✅ done
+- ~~Surface QoL toggles, wire into the save path.~~ Done — `editor/widgets/qol_editor.py` + `serialize_all_with_qol()`.
+- ~~Project-file save/load with diff format.~~ Done — `.romproj` JSON with byte-range diffs against vanilla; see §5.2.
 - ~~Cross-reference jump-to-related-entry~~ — done (nav handlers + footer routing + tree-viewer link).
 - Per-editor list filters in place; **cross-page search** still pending.
-- Shipped beyond plan in this milestone: validation footer, recent-files menu, window-state persistence, rolling `.bak` on save, per-save changelog, close-confirm on unsaved changes.
+- Shipped beyond plan in this milestone: validation footer, recent-files menu, window-state persistence, rolling `.bak` on save, per-save changelog, close-confirm on unsaved changes, Strings editor (§4.17), over-budget save guard, perf-snapshot fast path on string-budget validation.
 
 ### M7 — Distribution — not yet
 - Packaging (PyInstaller, mirroring DWDDRandomizer's `.spec`).
@@ -220,15 +221,128 @@ Original sequencing (M0 first, then M1 as vertical slice) executed as planned. T
 
 ## 9. What's next (current focus)
 
+The data-coverage milestones (M0–M6) are all done. The active push is on workflow / discoverability features that make the editor faster to use on a real romhack.
+
 Ordered by load-bearing-ness:
 
-1. **Project files (`.dnedit`)** — pending design decision (byte-range vs field-level diffs); see §5.2. Independent of QoL, so a forward-compatible empty `qol_toggles` slot is acceptable in v1.
-2. **QoL toggles tab** — port DWDDRandomizer's byte-patches as checkboxes; write at save time (piggy-back on the existing Save path).
-3. **Cross-page search** — single search box that queries every editor's record list and routes click-throughs via the existing nav handlers / footer routing.
-4. **Packaging (M7)** — PyInstaller spec mirroring DWDDRandomizer's.
-5. **IPS/xdelta export** — v0.2+; useful once project-file workflow is established.
+1. **Cross-reference / "Used by" panel** (§10) — when viewing a digimon (or move, or item), show every record that references it: evolutions in both directions, encounters, starters, drops, quest rewards, DNA recipes. Uniquely valuable for this game's interconnected data; can't be done outside the editor. Reuses the existing nav-handler routing.
+2. **Cross-page search** — single search box that queries every editor's record list (digimon names, move names, item names, in-game strings) and routes click-throughs via the nav handlers / footer routing.
+3. **Bulk-edit operations** — apply a transform across a record set with a diff preview before commit. Saves hundreds of clicks for balance passes.
+4. **Header toolbar with icon buttons** — Ghidra-style icon row for Save ROM / Save Project / Export (saved memory: `project_future_header_bar.md`).
+5. **Packaging (M7)** — PyInstaller spec mirroring DWDDRandomizer's.
+6. **IPS/xdelta patch export** — v0.2+; useful once distribution workflow is established.
 
 Beyond plan but possibly worth picking up:
 - Before/after value capture in changelog entries (currently action-text only).
 - "Revert this entry to vanilla" per editor (needs the `session.original` reference path; partly implementable today via re-parsing a slice of `original_rom_data`).
 - About dialog with editor version + ROM version readback.
+- Wider validation coverage (encounter rewards, equipment, consumables, farm items have no `*_issues()` collectors yet).
+- Strings export/import (CSV/JSON) — deferred: byte-budget per string limits translation workflow value.
+- Randomizer integration — seed-based randomization of evolution trees / starters / encounters; pairs with the cross-reference panel.
+
+---
+
+## 10. Plan: Cross-reference / "Used by" panel
+
+**Goal.** From any record in the editor, see every other record that references it, with click-to-jump for each reference. Initial scope: digimon, moves, items, standard digivolutions (the four most interconnected entity types). Romhackers routinely break routes by editing a digimon without seeing what's wired into it; this panel is the antidote.
+
+### 10.1 Reference inventory
+
+What references what, by entity type. Drawn directly from the model classes — every row below maps to a literal field on a literal class.
+
+| Target entity | Source record | Source field(s) |
+| --- | --- | --- |
+| **Digimon (by id)** | `StandardDigivolution` | per-entry `id` (self), `degeneration_target`, each `digivolutions[i].target` |
+| | `ArmorDigivolution` | `source_id`, `target_id` |
+| | `DNADigivolution` | `source_1_id`, `source_2_id`, `result_id` |
+| | `EnemyDataDigimon` | row id (enemy variant of a base digimon) |
+| | `WildEncounter` (within `WildEncounterArea`) | `digimon_id` |
+| | `StarterEntry` | `digimon_id` |
+| | `BaseDataDigimon` | own row — for completeness, plus other digimon's `signature_move` learners can be derived via the move panel |
+| **Move (by id)** | `BaseDataDigimon` | `moves[i].move_id`, `signature_move` |
+| | `EnemyDataDigimon` | `moves[i].move_id`, `signature_move` |
+| **Item (by id)** | `EncounterRewardTable` | `rewards[i].reward_id` (when reward kind == item) |
+| | `QuestData` | reward fields (item kind) |
+| | `ArmorDigivolution` | `trigger_item` |
+| | `StandardDigivolution` / `ArmorDigivolution` / `DNADigivolution` | any condition referencing an item id (TBD per-condition decoding) |
+| **Standard digivolution (by digimon id)** | reverse-evolution edges: every other `StandardDigivolution` whose `digivolutions[i].target` matches | (already used by the Evolution Trees viewer's pre-evolution walk) |
+
+### 10.2 Architecture
+
+**`editor/xref.py`** — pure-data reverse index. One class `XrefIndex` with:
+
+- A constructor that takes a `RomSession` and builds reverse maps in O(N) one-shot.
+- Query methods returning `List[XrefRef]`:
+  - `references_to_digimon(digimon_id) -> List[XrefRef]`
+  - `references_to_move(move_id) -> List[XrefRef]`
+  - `references_to_item(item_id) -> List[XrefRef]`
+  - `references_to_evolution_source(digimon_id) -> List[XrefRef]` (reverse evolution edges)
+- An `XrefRef` dataclass mirroring `ValidationIssue`'s shape so the same nav-handler infra moves rows:
+  ```python
+  @dataclass(frozen=True)
+  class XrefRef:
+      group: str          # "Evolutions", "Encounters", "Starters", "DNA Recipes", …
+      label: str          # human-readable: "Greymon — evolves from (lvl 14)"
+      editor_key: str     # routes through _build_editor_for()
+      record_id: Optional[int]   # passed to widget.select_by_id() after open
+  ```
+- No QObject inheritance; pure functions tested in isolation against a fixture session.
+
+The session owns one `XrefIndex` instance, rebuilt on `_install_session()` and on every undo-stack `indexChanged` (same hook the validation registry already uses). Build cost target: **< 10 ms** on Dusk — same envelope as the post-fix `string_issues()`. If we miss that target, fall back to dirty-flag invalidation per entity type.
+
+### 10.3 UI
+
+**`editor/widgets/xref_panel.py`** — a single collapsible widget:
+
+```
+┌─ Used by (12) ────────────────────────────────[ ▼ ]─┐
+│ Evolutions (4)                                       │
+│   • Greymon — evolves to (lvl 14)         [open →]   │
+│   • Koromon — evolves from (lvl 8)        [open →]   │
+│   • Greymon X — evolves to (lvl 30)       [open →]   │
+│   • Tyrannomon — DNA recipe partner       [open →]   │
+│ Encounters (3)                                       │
+│   • Tropical Jungle slot 4 (15% rate)     [open →]   │
+│   …                                                  │
+│ Starters (1)                                         │
+│   • Pack 3, level 5                       [open →]   │
+└──────────────────────────────────────────────────────┘
+```
+
+- One row per `XrefRef`, grouped by `group` header.
+- Click anywhere on the row → `_navigate_to_issue(editor_key, record_id)` (reuse the existing main-window method; rename to `_navigate_to_key` if its docstring's "issue" framing reads wrong).
+- Collapsed by default if `len(refs) == 0`; auto-expanded otherwise. Persisted to `QSettings` like the other panel-state bits.
+
+**Placement.** Two options, decide before implementing:
+
+- **(a) Bottom of the detail form.** Lives inside the editor widget, scrolls with the form. Pro: stays attached to the record. Con: requires plumbing into four editors; vertical space competes with the form fields.
+- **(b) Right-side dock that reacts to selection.** One dock for all editors; the dock listens for a selection-changed signal and re-queries the index. Pro: zero-touch in the editors; consistent location. Con: needs a session-wide "what's selected right now" signal which doesn't exist today.
+
+Preference is **(a)** for the first pass — touch each editor once, ship something useful, defer the cross-cutting selection signal until we have a second consumer (cross-page search would be that consumer).
+
+### 10.4 Phasing
+
+| Phase | Output | Effort |
+| --- | --- | --- |
+| **A — Index + tests** | `editor/xref.py` with `XrefIndex`, `XrefRef`, full reverse-map build, unit tests on a real session covering each `references_to_*` method | 0.5 d |
+| **B — Panel widget** | `XrefPanel(refs: List[XrefRef], navigate: Callable[[str, Optional[int]], None])` rendering grouped rows; reused across editors | 0.5 d |
+| **C — Wire into Base Digimon editor** | Panel under the detail form; rebuild on selection change, refresh on `indexChanged`. Validate UX against a real Dusk ROM session before moving on. | 0.5 d |
+| **D — Wire into Enemy Digimon, Move, Item editors** | Same pattern, three editors. Each takes ~1 hr if Phase C lands the shape. | 0.5 d |
+| **E — `select_by_id` audit** | A few editors don't expose `select_by_id` yet (or expose it under a different name). Add where missing so click-through always lands on the right row. | 0.25 d |
+
+Phase A is independently shippable as an API — the panel can be added later. Phases C–E benefit from being verified in a browser/session before moving on (per the UI-testing guidance), not just type-checked.
+
+### 10.5 Risks
+
+- **Index rebuild cost.** If `XrefIndex` rebuild on every `indexChanged` exceeds ~10 ms, the perf regression we just fixed comes back through a different door. Mitigation: benchmark before wiring to `indexChanged`; if too slow, swap to per-entity-type dirty flags driven by the `SetAttrCommand` path.
+- **Field-path naming drift.** The inventory in §10.1 references field names that need to be cross-checked against the actual model classes before coding — anything renamed since the table was written will fail at import time. Resolve by grep-confirming each field name during Phase A.
+- **Item-condition decoding.** Some digivolution conditions reference items but the per-condition decoding isn't centralized today (lives inline in each digivolution editor). The first cut can skip item-condition refs and revisit once a `digivolution_conditions` decoder helper exists.
+- **Click-through to in-game strings.** The strings editor already exposes `select_by_id(offset)`. Strings aren't in the §10.1 inventory yet, but if cross-page search lands as the next workflow item it'll want the same routing.
+
+### 10.6 Acceptance criteria
+
+- Opening the Base Digimon editor and selecting Agumon shows a populated "Used by" panel with at least: evolutions (both directions), at least one wild encounter, the starter pack entry, every DNA recipe Agumon participates in.
+- Clicking any row opens the named editor and selects the named record.
+- The panel updates within 50 ms of switching selections in the master list.
+- An edit that adds a reference (e.g. changing a `StandardDigivolution.digivolutions[0].target` to Agumon) makes the panel reflect the new reference within one undo-stack tick.
+- The whole feature adds < 10 ms to per-keystroke validation refresh on a clean Dusk ROM.

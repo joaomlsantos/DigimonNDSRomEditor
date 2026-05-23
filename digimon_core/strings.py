@@ -274,12 +274,20 @@ def _parse_placeholder(token: str) -> int:
 
 # ---- public API --------------------------------------------------------------
 
-def decode_string(data: bytes, offset: int) -> Tuple[str, int, int]:
+def decode_string(data: bytes, offset: int, *, end: Optional[int] = None) -> Tuple[str, int, int]:
     """Decode one in-game string starting at `offset`.
 
     A string ends at the first FE FF ([END]) or FF FF byte pair. The
     terminator is consumed but NOT included in the returned text (it's
     tracked separately so encode() can re-emit the same one).
+
+    `end` caps where the scan is allowed to read. Callers parsing a bounded
+    region (e.g. an ARM9 string block whose declared bounds butt up against
+    the next data table) pass the region's exclusive end so a string that
+    fails to terminate inside the region can't silently chew into the
+    neighbouring bytes — which would mark them owned by this string at
+    save time and overwrite any edits made through the neighbouring
+    model's editor.
 
     Returns (text, bytes_consumed, terminator_value). `terminator_value` is
     END_MARKER or TERMINATOR, or 0 if the stream ran out before a terminator
@@ -287,9 +295,9 @@ def decode_string(data: bytes, offset: int) -> Tuple[str, int, int]:
     """
     tokens: List[str] = []
     cur = offset
-    end = len(data)
+    hard_end = len(data) if end is None else min(end, len(data))
     terminator = 0
-    while cur + 1 < end:
+    while cur + 1 < hard_end:
         word = _read_word(data, cur)
         cur += 2
         if word == TERMINATOR or word == END_MARKER:
@@ -359,11 +367,13 @@ def decode_block(data: bytes, start: int, end: int) -> List[Tuple[int, str, int,
     out: List[Tuple[int, str, int, int]] = []
     cur = start
     while cur + 1 < end:
-        text, consumed, terminator = decode_string(data, cur)
+        text, consumed, terminator = decode_string(data, cur, end=end)
         if consumed == 0 or terminator == 0:
             # No more terminators in the region — bail to avoid an infinite
-            # loop and to leave any trailing tail-bytes for the round-trip to
-            # surface as a length mismatch.
+            # loop and to leave any trailing tail-bytes unowned. They keep
+            # their original bytes through `serialize_all` because no model
+            # writes them back; the neighbouring data table (whose bounds
+            # this region butts up against) keeps full ownership.
             break
         out.append((cur, text, consumed, terminator))
         cur += consumed

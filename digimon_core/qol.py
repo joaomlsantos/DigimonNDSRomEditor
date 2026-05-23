@@ -4,12 +4,15 @@ Each patch is a small idempotent mutation of the output ROM bytes. They are
 applied *after* `RomSession.serialize_all()` writes the user-edited model
 state, so they sit on top of normal edits — never the other way around.
 
-Multiplier-style patches (movement speed) scale the *current* byte values.
-Re-opening a QoL-patched output and saving again with QoL still on will
-compound the multiplier — for round-trip-safe persistence use project files,
-which store QoL state separately from the byte diff. Wild-encounter rates
-and farm EXP gains live in the regular editors (Wild Encounters, Farm
-Terrains), since they're direct model fields — no QoL multiplier needed.
+Parameter-style patches (movement speed, scan rate) write absolute values
+directly into the target ARM immediate byte — no multiplier semantics. The
+defaults in this dataclass match the vanilla Dusk/Dawn US bytes; the session
+overwrites them with whatever's actually in the loaded ROM at parse time so
+the editor displays the real current value.
+
+Wild-encounter rates and farm EXP gains live in the regular editors (Wild
+Encounters, Farm Terrains), since they're direct model fields — no QoL
+multiplier needed.
 
 Ported from DWDDRandomizer's `qol_script.py`. Logic kept faithful; defaults
 shift to "all off, vanilla parameters" since the editor is data-editing-first
@@ -32,9 +35,12 @@ class QolSettings:
     fast_scan: bool = False
     unlock_exclusive_areas: bool = False
     improve_battle_performance: bool = False
-    # parameters — only consulted when the matching toggle is on
-    movement_speed_multiplier: float = 2.0
-    scan_rate: int = 10
+    # parameters — only consulted when the matching toggle is on. Defaults
+    # are the vanilla Dusk/Dawn US byte values; RomSession overwrites them
+    # with what's actually in the loaded ROM so the editor shows the real
+    # current value (1..255 — single-byte ARM immediate at the offset).
+    movement_speed: int = 2
+    scan_rate: int = 15
 
 
 def apply_qol_patches(rom_data: bytearray, version: str, settings: QolSettings) -> None:
@@ -42,7 +48,7 @@ def apply_qol_patches(rom_data: bytearray, version: str, settings: QolSettings) 
     if settings.fast_text:
         _apply_text_speed(rom_data, version)
     if settings.fast_movement:
-        _apply_movement_speed(rom_data, version, settings.movement_speed_multiplier)
+        _apply_movement_speed(rom_data, version, settings.movement_speed)
     if settings.expand_player_name:
         _apply_player_name(rom_data, version)
     if settings.fast_scan:
@@ -58,12 +64,12 @@ def _apply_text_speed(rom: bytearray, version: str) -> None:
     rom[offset:offset + 4] = binascii.unhexlify("030010e3")
 
 
-def _apply_movement_speed(rom: bytearray, version: str, multiplier: float) -> None:
+def _apply_movement_speed(rom: bytearray, version: str, new_speed: int) -> None:
     offset = constants.MOVEMENT_SPEED_OFFSET[version]
-    # Clamp the immediate byte so a wild multiplier doesn't corrupt the
-    # surrounding opcode bytes (MOV reg, #imm).
-    speed = max(2, min(255, int(2 * multiplier)))
-    rom[offset:offset + 4] = binascii.unhexlify(f"{speed:02x}10a0e3")
+    # The byte at this offset is the immediate of a MOV r1, #imm ARM instruction
+    # (vanilla 0x02); only the low byte is meaningful — anything wider would
+    # corrupt the opcode/rotate bytes. Clamp 1..255 to match the widget cap.
+    rom[offset] = max(1, min(255, new_speed))
 
 
 def _apply_player_name(rom: bytearray, version: str) -> None:
@@ -73,7 +79,8 @@ def _apply_player_name(rom: bytearray, version: str) -> None:
 
 def _apply_scan_rate(rom: bytearray, version: str, new_rate: int) -> None:
     offset = constants.BASE_SCAN_RATE_OFFSET[version]
-    rom[offset] = max(0, min(255, new_rate))
+    # Single byte at the ARM immediate of an RSB instruction (vanilla 0x0F).
+    rom[offset] = max(1, min(255, new_rate))
 
 
 def _apply_exclusive_areas(rom: bytearray, version: str) -> None:

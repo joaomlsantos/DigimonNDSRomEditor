@@ -140,10 +140,10 @@ class QolEditor(QWidget):
         intro = QLabel(
             "Quality-of-life byte-patches applied at save time, after every "
             "data edit. Toggles are off by default; flipping them is undoable "
-            "like any other edit. The movement-speed multiplier scales the "
-            "current byte value, so saving a QoL-patched ROM and re-opening "
-            "it will compound the multiplier on the next save — use a project "
-            "file (.romproj) for round-trip-safe persistence of these settings."
+            "like any other edit. Parameter values shown below are read from "
+            "the loaded ROM at open time; on save they overwrite the same byte "
+            "directly. Use a project file (.romproj) to persist QoL state "
+            "separately from byte edits."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: palette(mid); padding-bottom: 8px;")
@@ -153,17 +153,17 @@ class QolEditor(QWidget):
         body.addWidget(self._build_section(
             "Pacing",
             [
-                ("fast_text", "Increase text speed (1.5×)", None),
-                ("fast_movement", "Increase movement speed",
-                 ("movement_speed_multiplier", 1.0, 5.0, 0.25, 2, "×")),
+                ("fast_text", "Increase text speed", None),
+                ("fast_movement", "Set player movement speed",
+                 ("movement_speed", 1, 255, "")),
                 ("improve_battle_performance", "Improve battle performance", None),
             ],
         ))
         body.addWidget(self._build_section(
             "Scanning",
             [
-                ("fast_scan", "Increase base scan rate",
-                 ("scan_rate", 1, 100, "")),
+                ("fast_scan", "Set Base Scan Rate",
+                 ("scan_rate", 1, 255, "")),
             ],
         ))
         body.addWidget(self._build_section(
@@ -215,10 +215,10 @@ class QolEditor(QWidget):
             # is disabled is the checkbox itself.
             param_widget.setEnabled(check.isChecked())
             check.toggled.connect(param_widget.setEnabled)
-            h.addStretch(1)
+            # Sit the spinbox right next to the checkbox label (a stretch on
+            # the right pushes the pair to the left edge of the row).
             h.addWidget(param_widget)
-        else:
-            h.addStretch(1)
+        h.addStretch(1)
 
         self._rows.append((check, param_widget))
         return row

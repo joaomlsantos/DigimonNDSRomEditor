@@ -165,7 +165,10 @@ class _MoveValueSpinBox(NoWheelSpinBox):
         self._attr = attr
         self._effect_attr = effect_attr
         self._undo_stack = undo_stack
-        self._signed = False
+        # None sentinel so the first _sync_mode_silent() call always sets the
+        # range — Qt's default 0..99 satisfies `minimum() != maximum()` and
+        # would otherwise trip the no-op guard, leaving the cap at 99.
+        self._signed: object = None
         self.setMinimumWidth(90)
         self.setMaximumWidth(100)
         self._sync_mode_silent()
