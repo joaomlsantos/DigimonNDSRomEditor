@@ -107,7 +107,7 @@ Special thanks to:
 - [@Dreaker](https://github.com/Dreaker75), who composed a set of thorough [code notes](https://retroachievements.org/codenotes.php?g=16152) for these games and has been supporting this project's efforts through brainstorming, feature testing and listening to me yap about ROM editing for hours [:
 - [@GrowaSowa](https://gamebanana.com/members/2851165), who's made several contributions deciphering previously unknown ROM data and functions [:
 - [@HansyRod](https://github.com/HansyRod), who tested the app, provided very useful polishing feedback, and guided me throughout various design decisions (check out his [RVGL Randomizer](https://github.com/HansyRod/rvgl-randomizer)!) [:
-- Everyone who's supported both this project and the [Randomizer](https://github.com/joaomlsantos/DWDDRandomizer) <3
+- Everyone who's supported both this project and [DWDDRandomizer](https://github.com/joaomlsantos/DWDDRandomizer) <3
 
 ## Support
 
