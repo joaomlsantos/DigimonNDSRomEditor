@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -39,6 +38,7 @@ from .form_helpers import (
     digimon_choices,
     digimon_name,
     digimon_stage_rank,
+    wrap_in_scroll,
 )
 
 
@@ -271,10 +271,7 @@ class StandardDigivolutionEditor(QWidget):
             content_layout.addWidget(group)
         content_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
-        return scroll
+        return wrap_in_scroll(content)
 
     def _on_selection(self, digimon_id: int) -> None:
         target = self._entries.get(digimon_id)

@@ -25,7 +25,6 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
-    QScrollArea,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -45,6 +44,7 @@ from .form_helpers import (
     silenced,
     with_open_button,
     with_open_button_placeholder,
+    wrap_in_scroll,
 )
 from .record_list_panel import RecordListPanel
 
@@ -301,10 +301,7 @@ class EncounterRewardsEditor(QWidget):
         cl.addWidget(group)
         cl.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
-        return scroll
+        return wrap_in_scroll(content)
 
     def _on_selection(self, ix: int) -> None:
         if not (0 <= ix < len(self._records)):

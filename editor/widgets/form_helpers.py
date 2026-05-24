@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QScrollArea,
     QSpinBox,
     QStyle,
     QStyleOptionGroupBox,
@@ -124,6 +125,36 @@ def _tighten_form(form) -> None:
     # `FieldsStayAtSizeHint`, widgets render at their sizeHint and labels sit
     # tight to the left, matching the compact grids visually.
     form.setFieldGrowthPolicy(_QFL.FieldsStayAtSizeHint)
+
+
+def wrap_in_scroll(content: QWidget, parent: Optional[QWidget] = None) -> QScrollArea:
+    """Wrap an editor's content widget in the standard scroll area.
+
+    Mirrors the shape every editor was using inline (`QScrollArea` +
+    `setWidgetResizable(True)` + `setWidget`) and adds one extra step: after
+    the first layout pass it pins the content's `minimumWidth` to the
+    realised `sizeHint().width()`. Without that pin, `setWidgetResizable`
+    forces the inner widget to viewport width at low resolutions and the
+    rightmost combos / fields clip past their `sizeHint`; with it, the
+    scroll area surfaces a horizontal scrollbar instead.
+
+    The sizeHint is deferred via `QTimer.singleShot(0)` because reading it
+    synchronously during `_build_form()` returns the pre-layout fallback,
+    which is usually wider or narrower than the actual rendered width.
+    """
+    scroll = QScrollArea(parent) if parent is not None else QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setWidget(content)
+
+    def _pin_min_width() -> None:
+        try:
+            content.setMinimumWidth(content.sizeHint().width())
+        except RuntimeError:
+            # Widget already deleted (editor torn down before the tick fired).
+            pass
+
+    QTimer.singleShot(0, _pin_min_width)
+    return scroll
 
 
 def make_form(parent: QWidget):

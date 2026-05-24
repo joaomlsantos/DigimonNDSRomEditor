@@ -7,7 +7,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QLabel,
-    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -22,6 +21,7 @@ from .form_helpers import (
     add_unknown_form_row,
     make_form,
     register_unknown_container,
+    wrap_in_scroll,
 )
 from .record_list_panel import RecordListPanel
 
@@ -118,10 +118,7 @@ class ConsumableEditor(QWidget):
         cl.addWidget(unknowns)
         cl.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
-        return scroll
+        return wrap_in_scroll(content)
 
     def _on_selection(self, ix: int) -> None:
         if not (0 <= ix < len(self._records)):

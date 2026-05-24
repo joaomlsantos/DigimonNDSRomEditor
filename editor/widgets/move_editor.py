@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListView,
-    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -38,6 +37,7 @@ from .form_helpers import (
     make_form,
     register_unknown_container,
     silenced,
+    wrap_in_scroll,
 )
 
 
@@ -444,10 +444,7 @@ class MoveEditor(QWidget):
         content_layout.addWidget(misc_box)
         content_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
-        return scroll
+        return wrap_in_scroll(content)
 
     # ---- selection / refresh --------------------------------------------
 

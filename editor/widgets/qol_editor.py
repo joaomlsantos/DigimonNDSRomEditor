@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
-    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -29,7 +28,7 @@ from PySide6.QtWidgets import (
 from digimon_core import qol
 
 from ..commands import SetAttrCommand
-from .form_helpers import BoldGroupBox as QGroupBox, silenced
+from .form_helpers import BoldGroupBox as QGroupBox, silenced, wrap_in_scroll
 
 
 class _BoundBoolCheck(QCheckBox):
@@ -177,9 +176,7 @@ class QolEditor(QWidget):
 
         container = QWidget()
         container.setLayout(body)
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(container)
+        scroll = wrap_in_scroll(container, self)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)

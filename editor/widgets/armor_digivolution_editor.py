@@ -12,7 +12,6 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
-    QScrollArea,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -33,6 +32,7 @@ from .form_helpers import (
     digimon_name,
     item_choices,
     with_open_button,
+    wrap_in_scroll,
 )
 from .record_list_panel import RecordListPanel
 
@@ -183,9 +183,7 @@ class ArmorDigivolutionEditor(QWidget):
         content_layout.addWidget(degen)
         content_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
+        scroll = wrap_in_scroll(content)
 
         # update list label when identity ids change so the left pane stays in sync
         self._digimon_row.combo.currentIndexChanged.connect(lambda _i: self._refresh_list_label())

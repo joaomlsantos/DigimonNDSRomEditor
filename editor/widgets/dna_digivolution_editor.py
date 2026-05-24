@@ -12,7 +12,6 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
-    QScrollArea,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -30,6 +29,7 @@ from .form_helpers import (
     BoundSpinBox,
     digimon_choices,
     digimon_name,
+    wrap_in_scroll,
 )
 from .record_list_panel import RecordListPanel
 
@@ -168,9 +168,7 @@ class DNADigivolutionEditor(QWidget):
         content_layout.addWidget(conditions)
         content_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
+        scroll = wrap_in_scroll(content)
 
         for row in (self._d1_row, self._d2_row, self._evo_row):
             row.combo.currentIndexChanged.connect(lambda _i: self._refresh_list_label())

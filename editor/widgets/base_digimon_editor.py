@@ -8,7 +8,6 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
-    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -27,6 +26,7 @@ from .form_helpers import (
     _make_compact_grid,
     add_unknown_form_row,
     make_form,
+    wrap_in_scroll,
     move_choices,
     trait_choices,
 )
@@ -245,10 +245,7 @@ class BaseDigimonEditor(QWidget):
         content_layout.addWidget(misc_box)
         content_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
-        return scroll
+        return wrap_in_scroll(content)
 
     # ---- selection / refresh --------------------------------------------
 

@@ -13,7 +13,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QLabel,
-    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -33,6 +32,7 @@ from .form_helpers import (
     make_form,
     register_unknown_container,
     with_open_button,
+    wrap_in_scroll,
 )
 from .record_list_panel import RecordListPanel
 
@@ -218,9 +218,7 @@ class QuestEditor(QWidget):
             content_layout.addWidget(group)
         content_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
+        scroll = wrap_in_scroll(content)
 
         self._stars_spin.valueChanged.connect(lambda _v: self._refresh_list_label())
 

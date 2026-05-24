@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QCompleter,
     QHBoxLayout,
     QLabel,
-    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -40,6 +39,7 @@ from .form_helpers import (
     move_choices,
     silenced,
     trait_choices,
+    wrap_in_scroll,
 )
 
 
@@ -468,10 +468,7 @@ class EnemyDigimonEditor(QWidget):
         for spin in self._exp_widgets.values():
             spin.valueChanged.connect(lambda _v: self._refresh_exp_total())
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
-        return scroll
+        return wrap_in_scroll(content)
 
     # ---- selection / refresh --------------------------------------------
 

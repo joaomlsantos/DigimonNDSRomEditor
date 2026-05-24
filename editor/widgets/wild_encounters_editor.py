@@ -16,7 +16,6 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
-    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -32,6 +31,7 @@ from .form_helpers import (
     get_encounter_rewards_count,
     make_form,
     with_open_button_for_spin,
+    wrap_in_scroll,
 )
 from .record_list_panel import RecordListPanel
 
@@ -150,9 +150,7 @@ class WildEncountersEditor(QWidget):
         content_layout.addWidget(self._enc_group)
         content_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._content)
+        scroll = wrap_in_scroll(self._content)
         return scroll
 
     def _clear_layout(self, layout) -> None:

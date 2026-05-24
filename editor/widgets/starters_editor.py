@@ -19,7 +19,6 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
-    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -32,6 +31,7 @@ from .form_helpers import (
     BoundSpinBox,
     digimon_choices,
     get_base_digimon,
+    wrap_in_scroll,
 )
 
 
@@ -127,9 +127,7 @@ class StartersEditor(QWidget):
             content_layout.addWidget(pack_box)
         content_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
+        scroll = wrap_in_scroll(content)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
