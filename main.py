@@ -13,6 +13,7 @@ from PySide6.QtGui import QIcon  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from editor.main_window import MainWindow  # noqa: E402
+from editor.prefs import configure_storage  # noqa: E402
 
 
 def _resource_path(relative: str) -> str:
@@ -27,9 +28,12 @@ def _resource_path(relative: str) -> str:
 
 
 def main() -> int:
+    # Resolve the ini location before any prefs() consumer runs.
+    configure_storage()
     app = QApplication(sys.argv)
-    # QSettings keys off these — set before any QSettings() is constructed so
-    # window-state and recent-files persistence have a consistent backing store.
+    # Prefs storage doesn't depend on these (editor.prefs constructs QSettings
+    # with explicit org/app names), but Qt itself uses them for window-class
+    # grouping on Linux and the AppUserModelID on Windows — keep them set.
     app.setOrganizationName("DigimonNDSRomEditor")
     app.setApplicationName("DigimonNDSRomEditor")
     # PyInstaller's `icon=` only sets the EXE's file icon (what Explorer shows

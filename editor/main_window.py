@@ -11,7 +11,7 @@ import os
 from collections import namedtuple
 from typing import Optional, Tuple
 
-from PySide6.QtCore import QItemSelectionModel, QSettings, Qt, QUrl
+from PySide6.QtCore import QItemSelectionModel, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QStandardItem, QStandardItemModel, QUndoStack
 from PySide6.QtWidgets import (
     QDialog,
@@ -27,7 +27,9 @@ from PySide6.QtWidgets import (
 )
 
 from . import project_file
+from .auto_updater import UpdateChecker
 from .changelog import changelog_dir, changelog_root, record_save, rom_hash
+from .prefs import prefs
 from .session import RomSession
 from digimon_core import rom as rom_module
 from .widgets.form_helpers import (
@@ -160,6 +162,13 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         self._refresh_actions()
         self._restore_window_state()
+
+        # Fire-and-forget GitHub release check. Stored on self so the QObject
+        # outlives the daemon thread; the dialog only appears if a newer
+        # version is published than `EDITOR_VERSION` and the user hasn't
+        # already skipped it.
+        self._update_checker = UpdateChecker(self)
+        self._update_checker.start(project_file.EDITOR_VERSION)
 
     # ---- UI construction -------------------------------------------------
 
@@ -367,7 +376,7 @@ class MainWindow(QMainWindow):
     # ---- window state persistence ---------------------------------------
 
     def _restore_window_state(self) -> None:
-        settings = QSettings()
+        settings = prefs()
         geom = settings.value(SETTINGS_GEOMETRY)
         if geom is not None:
             self.restoreGeometry(geom)
@@ -385,7 +394,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def _save_window_state(self) -> None:
-        settings = QSettings()
+        settings = prefs()
         settings.setValue(SETTINGS_GEOMETRY, self.saveGeometry())
         settings.setValue(SETTINGS_STATE, self.saveState())
         settings.setValue(SETTINGS_SPLITTER, self._splitter.sizes())
@@ -395,7 +404,7 @@ class MainWindow(QMainWindow):
     # ---- recent files ----------------------------------------------------
 
     def _recent_paths(self, rl: _RecentList) -> list[str]:
-        settings = QSettings()
+        settings = prefs()
         raw = settings.value(rl.setting_key, [])
         if isinstance(raw, str):
             # QSettings collapses single-element lists to a bare string on some
@@ -404,7 +413,7 @@ class MainWindow(QMainWindow):
         return [str(p) for p in (raw or [])]
 
     def _write_recent_paths(self, rl: _RecentList, paths: list[str]) -> None:
-        QSettings().setValue(rl.setting_key, paths[:MAX_RECENT_FILES])
+        prefs().setValue(rl.setting_key, paths[:MAX_RECENT_FILES])
         self._rebuild_recent_menu(rl)
 
     def _push_recent(self, rl: _RecentList, path: str) -> None:
@@ -533,7 +542,7 @@ class MainWindow(QMainWindow):
         the chosen path in QSettings under the SHA-256 so future project
         opens skip the prompt entirely.
         """
-        settings = QSettings()
+        settings = prefs()
         cache_key = SETTINGS_VANILLA_PATHS_PREFIX + expected_sha256
         cached = settings.value(cache_key)
         if isinstance(cached, str) and cached and os.path.exists(cached):
