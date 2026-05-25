@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QHBoxLayout,
-    QLabel,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -135,18 +134,6 @@ class QolEditor(QWidget):
         body = QVBoxLayout()
         body.setContentsMargins(12, 12, 12, 12)
         body.setSpacing(6)
-
-        intro = QLabel(
-            "Quality-of-life byte-patches applied at save time, after every "
-            "data edit. Toggles are off by default; flipping them is undoable "
-            "like any other edit. Parameter values shown below are read from "
-            "the loaded ROM at open time; on save they overwrite the same byte "
-            "directly. Use a project file (.romproj) to persist QoL state "
-            "separately from byte edits."
-        )
-        intro.setWordWrap(True)
-        intro.setStyleSheet("color: palette(mid); padding-bottom: 8px;")
-        body.addWidget(intro)
 
         # ---- groupings keep semantically related patches together ----------
         body.addWidget(self._build_section(
