@@ -20,7 +20,7 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[('public/editor.icns', 'public')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -65,8 +65,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # Drop-in point for later:
-    #   icon='public/editor.icns',
+    icon='public/editor.icns',
 )
 coll = BUNDLE(
     exe,
@@ -76,6 +75,5 @@ coll = BUNDLE(
     upx=False,
     upx_exclude=[],
     name='DigimonNDSRomEditor.app',
-    # Drop-in point for later:
-    #   icon='public/editor.icns',
+    icon='public/editor.icns',
 )
