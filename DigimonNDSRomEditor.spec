@@ -68,8 +68,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='public/editor.ico',
-    # Drop-in point for later:
-    #   version='version_info.txt',
+    version='version_info.txt',
 )
 coll = COLLECT(
     exe,

@@ -1,0 +1,31 @@
+VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=(0, 1, 0, 0),
+        prodvers=(0, 1, 0, 0),
+        mask=0x3f,
+        flags=0x0,
+        OS=0x4,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0)
+    ),
+    kids=[
+        StringFileInfo(
+            [
+                StringTable(
+                    u'040904B0',
+                    [
+                        StringStruct(u'FileDescription', u'Digimon NDS ROM Editor'),
+                        StringStruct(u'FileVersion', u'0.1.0'),
+                        StringStruct(u'InternalName', u'DigimonNDSRomEditor'),
+                        StringStruct(u'LegalCopyright', u'(C) 2026 João Santos'),
+                        StringStruct(u'OriginalFilename', u'DigimonNDSRomEditor.exe'),
+                        StringStruct(u'ProductName', u'Digimon NDS ROM Editor'),
+                        StringStruct(u'ProductVersion', u'0.1.0')
+                    ]
+                )
+            ]
+        ),
+        VarFileInfo([VarStruct(u'Translation', [0x0409, 0x04B0])])
+    ]
+)
