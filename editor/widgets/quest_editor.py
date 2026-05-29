@@ -6,8 +6,7 @@ the rewards isn't yet documented in research_docs/quests_research.txt).
 """
 from __future__ import annotations
 
-import os
-from typing import List, Optional
+from typing import List
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
@@ -18,7 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from digimon_core import model
+from digimon_core import constants, model
 
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
@@ -37,31 +36,8 @@ from .form_helpers import (
 from .record_list_panel import RecordListPanel
 
 
-# Quest names live in research_docs/ alongside the other authored research
-# notes. They're loaded lazily on first access so the editor still works in
-# environments where the file is missing (the labels just fall back to the
-# numeric form).
-_QUEST_NAMES_CACHE: Optional[List[str]] = None
-
-
-def _quest_names() -> List[str]:
-    global _QUEST_NAMES_CACHE
-    if _QUEST_NAMES_CACHE is not None:
-        return _QUEST_NAMES_CACHE
-    here = os.path.dirname(os.path.abspath(__file__))
-    # widgets -> editor -> DigimonNDSRomEditor -> workspace root
-    workspace = os.path.abspath(os.path.join(here, "..", "..", ".."))
-    path = os.path.join(workspace, "research_docs", "quest_names.txt")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            _QUEST_NAMES_CACHE = [line.rstrip("\r\n") for line in f.readlines()]
-    except OSError:
-        _QUEST_NAMES_CACHE = []
-    return _QUEST_NAMES_CACHE
-
-
 def _quest_name(ix: int) -> str:
-    names = _quest_names()
+    names = constants.QUEST_NAMES
     if 0 <= ix < len(names) and names[ix]:
         return names[ix]
     return "<unnamed>"

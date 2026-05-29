@@ -32,17 +32,14 @@ from .form_helpers import (
 from .record_list_panel import RecordListPanel
 
 
-# Rank field is a 2-byte enum-style value at offset 0x02. The byte layout
-# isn't a clean ordinal, but the six observed values map to the visible
-# in-game grade letters. "Other" is the value seeds and similar non-graded
-# items use — kept as a labelled choice so the dropdown round-trips it.
+# Rank is the single byte at offset 0x03 (ordinal 0=S..4=D). The byte at
+# offset 0x02 is an independent data-size value, exposed as its own field.
 _RANK_CHOICES: List[Tuple[str, int]] = [
-    ("S-Rank", 0x000C),
-    ("A-Rank", 0x0110),
-    ("B-Rank", 0x020C),
-    ("C-Rank", 0x0308),
-    ("D-Rank", 0x0404),
-    ("Other",  0x0400),
+    ("S-Rank", 0),
+    ("A-Rank", 1),
+    ("B-Rank", 2),
+    ("C-Rank", 3),
+    ("D-Rank", 4),
 ]
 
 
@@ -109,6 +106,7 @@ class FarmItemEditor(QWidget):
         identity = QGroupBox("Identity")
         identity_form = make_form(identity)
         self._add_field(identity_form, "Item id",     BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True))
+        self._add_field(identity_form, "Data size",   BoundSpinBox(first, "data_size", 1, self._undo_stack, hex_display=True))
         self._add_field(identity_form, "Rank",        BoundIntChoiceCombo(first, "rank", _RANK_CHOICES, self._undo_stack))
         self._add_field(identity_form, "Max points",  BoundSpinBox(first, "max_points", 2, self._undo_stack))
         self._add_field(identity_form, "Bit cost",    BoundSpinBox(first, "bit_cost", 4, self._undo_stack))

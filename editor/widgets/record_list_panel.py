@@ -41,6 +41,11 @@ class RecordListPanel(QWidget):
         self._records = records
         self._inner_label_for = label_for
         self._dirty_aware = dirty_aware
+        # Pin the user's last selection so it survives filter changes and
+        # label refreshes. Qt's selection model maps through layout changes,
+        # but it drops selections when the filter hides the row, and the view
+        # never re-scrolls on its own after the proxy resettles.
+        self._tracked_source_row: int = -1
 
         self._source_model = QStandardItemModel(self)
         for ix, rec in enumerate(records):
@@ -55,7 +60,7 @@ class RecordListPanel(QWidget):
 
         self._filter_box = QLineEdit()
         self._filter_box.setPlaceholderText("Filter…")
-        self._filter_box.textChanged.connect(self._proxy.setFilterFixedString)
+        self._filter_box.textChanged.connect(self._on_filter_text_changed)
 
         self._view = QListView()
         self._view.setModel(self._proxy)
@@ -109,6 +114,7 @@ class RecordListPanel(QWidget):
             if self._dirty_aware:
                 prefix = DIRTY_PREFIX if is_record_dirty(self._records[index]) else CLEAN_PREFIX
             item.setText(prefix + new_label)
+        self._ensure_tracked_visible()
 
     def refresh_dirty_state(self) -> None:
         """Re-render every row label so dirty markers track the current state."""
@@ -118,10 +124,29 @@ class RecordListPanel(QWidget):
             item = self._source_model.item(ix)
             if item is not None:
                 item.setText(self._decorated_label(ix))
+        self._ensure_tracked_visible()
+
+    def _on_filter_text_changed(self, text: str) -> None:
+        self._proxy.setFilterFixedString(text)
+        self._ensure_tracked_visible()
+
+    def _ensure_tracked_visible(self) -> None:
+        if self._tracked_source_row < 0:
+            return
+        src_index = self._source_model.index(self._tracked_source_row, 0)
+        proxy_index = self._proxy.mapFromSource(src_index)
+        if not proxy_index.isValid():
+            return
+        if self._view.currentIndex() != proxy_index:
+            self._view.setCurrentIndex(proxy_index)
+        self._view.scrollTo(proxy_index)
 
     def _on_current_changed(self, current, _previous):
         if not current.isValid():
             return
         ix = current.data(Qt.UserRole)
-        if ix is not None:
-            self.indexSelected.emit(int(ix))
+        if ix is None:
+            return
+        ix = int(ix)
+        self._tracked_source_row = ix
+        self.indexSelected.emit(ix)

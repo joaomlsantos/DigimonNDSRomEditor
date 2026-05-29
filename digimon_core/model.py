@@ -1382,11 +1382,13 @@ class Consumable:
 class FarmItem:
     """One 0x30-byte farm-item record.
 
-    Only id (0x00), rank (0x02), max_points (0x10), and bit_cost (0x1C) are
-    documented in research_docs/farm_items_research.txt. The remaining 2-byte
-    slots are preserved through `_UNKNOWN_FIELDS` so the record round-trips
-    even though those fields aren't exposed in the editor UI for editing
-    individually (they're listed under an "advanced" group there).
+    Documented: id (0x00, u16), data_size (0x02, u8), rank (0x03, u8),
+    max_points (0x10, u16), bit_cost (0x1C, u32). Bytes 0x02 and 0x03 used to
+    be treated as a single u16 `rank` field — they're independent, with the
+    high byte holding the rank ordinal (0=S, 1=A, 2=B, 3=C, 4=D) and the low
+    byte holding an item-specific data size. The remaining 2-byte slots are
+    preserved through `_UNKNOWN_FIELDS` so the record round-trips even though
+    those fields aren't exposed in the editor UI individually.
     """
     SIZE = 0x30
 
@@ -1414,6 +1416,7 @@ class FarmItem:
 
     offset: int
     id: int
+    data_size: int
     rank: int
     max_points: int
     bit_cost: int
@@ -1421,7 +1424,8 @@ class FarmItem:
     def __init__(self, data: bytearray, offset: int):
         self.offset = offset
         self.id = int.from_bytes(data[0:2], byteorder="little")
-        self.rank = int.from_bytes(data[2:4], byteorder="little")
+        self.data_size = data[2]
+        self.rank = data[3]
         self.max_points = int.from_bytes(data[0x10:0x12], byteorder="little")
         self.bit_cost = int.from_bytes(data[0x1C:0x20], byteorder="little")
         for field_offset, attr in self._UNKNOWN_FIELDS:
@@ -1430,7 +1434,8 @@ class FarmItem:
     def getByteArray(self) -> bytearray:
         out = bytearray(self.SIZE)
         out[0:2] = self.id.to_bytes(2, byteorder="little")
-        out[2:4] = self.rank.to_bytes(2, byteorder="little")
+        out[2] = self.data_size & 0xFF
+        out[3] = self.rank & 0xFF
         out[0x10:0x12] = self.max_points.to_bytes(2, byteorder="little")
         out[0x1C:0x20] = self.bit_cost.to_bytes(4, byteorder="little")
         for field_offset, attr in self._UNKNOWN_FIELDS:

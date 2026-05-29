@@ -22,6 +22,7 @@ from digimon_core import constants, model
 
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
+    BoundIntChoiceCombo,
     BoundSpinBox,
     _make_compact_grid,
     add_unknown_grid_field,
@@ -71,6 +72,19 @@ _BATTLE_BOOSTS: List[Tuple[str, str]] = [
 _UNKNOWN_FIELDS: List[str] = [
     "unknown_0x08", "unknown_0x0a", "unknown_0x0c", "unknown_0x0e",
     "unknown_0x10", "unknown_0x12", "unknown_0x14",
+]
+
+_SPECIES_CHOICES: List[Tuple[str, int]] = [
+    ("Holy",                  0),
+    ("Dark",                  1),
+    ("Dragon",                2),
+    ("Beast",                 3),
+    ("Bird",                  4),
+    ("Machine",               5),
+    ("Aquan",                 6),
+    ("Insect/Plant",          7),
+    ("Unknown",               8),
+    ("Any (no requirement)", 10),
 ]
 
 
@@ -146,7 +160,7 @@ class EquipmentEditor(QWidget):
         identity_form = make_form(identity)
         self._add_field(identity_form, "Item id",            BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True))
         self._add_field(identity_form, "Level requirement",  BoundSpinBox(first, "lvl_condition", 1, self._undo_stack))
-        self._add_field(identity_form, "Species requirement", BoundSpinBox(first, "species_condition", 1, self._undo_stack))
+        self._add_field(identity_form, "Species requirement", BoundIntChoiceCombo(first, "species_condition", _SPECIES_CHOICES, self._undo_stack))
         self._add_field(identity_form, "Bit cost",           BoundSpinBox(first, "bit_cost", 4, self._undo_stack))
 
         stats_box = QGroupBox("Stat Boosts")
