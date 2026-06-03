@@ -1444,3 +1444,75 @@ class FarmItem:
 
     def writeToRom(self, rom_data: bytearray):
         rom_data[self.offset:self.offset + self.SIZE] = self.getByteArray()
+
+
+class FarmTrainingPen:
+    """One 0x1C-byte farm-training-pen record.
+
+    Each training pen produces an outcome (great failure / failure / success /
+    great success) when a farm good is used; the four chance bytes at 0x12-0x15
+    sum to `total_odds` (typically 0x64 = 100). The four stat-delta values
+    (great_failure_value..great_success_value) are signed s16 — vanilla weapons
+    use 0xFFFF (-1) for `great_failure_value` to subtract a point on a miss.
+    """
+    SIZE = 0x1C
+
+    offset: int
+    string_id: int
+    sprite_id: int
+    stat_op_id: int
+    great_failure_value: int   # s16
+    failure_value: int         # s16
+    success_value: int         # s16
+    great_success_value: int   # s16
+    stat_cap: int
+    total_odds: int
+    great_failure_chance: int  # u8
+    failure_chance: int        # u8
+    success_chance: int        # u8
+    great_success_chance: int  # u8
+    animation_id: int
+    sound_id: int
+    vertical_position: int
+
+    def __init__(self, data: bytearray, offset: int):
+        self.offset = offset
+        self.string_id           = int.from_bytes(data[0x00:0x02], byteorder="little")
+        self.sprite_id           = int.from_bytes(data[0x02:0x04], byteorder="little")
+        self.stat_op_id          = int.from_bytes(data[0x04:0x06], byteorder="little")
+        self.great_failure_value = int.from_bytes(data[0x06:0x08], byteorder="little", signed=True)
+        self.failure_value       = int.from_bytes(data[0x08:0x0A], byteorder="little", signed=True)
+        self.success_value       = int.from_bytes(data[0x0A:0x0C], byteorder="little", signed=True)
+        self.great_success_value = int.from_bytes(data[0x0C:0x0E], byteorder="little", signed=True)
+        self.stat_cap            = int.from_bytes(data[0x0E:0x10], byteorder="little")
+        self.total_odds          = int.from_bytes(data[0x10:0x12], byteorder="little")
+        self.great_failure_chance = data[0x12]
+        self.failure_chance       = data[0x13]
+        self.success_chance       = data[0x14]
+        self.great_success_chance = data[0x15]
+        self.animation_id         = int.from_bytes(data[0x16:0x18], byteorder="little")
+        self.sound_id             = int.from_bytes(data[0x18:0x1A], byteorder="little")
+        self.vertical_position    = int.from_bytes(data[0x1A:0x1C], byteorder="little")
+
+    def getByteArray(self) -> bytearray:
+        out = bytearray(self.SIZE)
+        out[0x00:0x02] = self.string_id.to_bytes(2, byteorder="little")
+        out[0x02:0x04] = self.sprite_id.to_bytes(2, byteorder="little")
+        out[0x04:0x06] = self.stat_op_id.to_bytes(2, byteorder="little")
+        out[0x06:0x08] = self.great_failure_value.to_bytes(2, byteorder="little", signed=True)
+        out[0x08:0x0A] = self.failure_value.to_bytes(2, byteorder="little", signed=True)
+        out[0x0A:0x0C] = self.success_value.to_bytes(2, byteorder="little", signed=True)
+        out[0x0C:0x0E] = self.great_success_value.to_bytes(2, byteorder="little", signed=True)
+        out[0x0E:0x10] = self.stat_cap.to_bytes(2, byteorder="little")
+        out[0x10:0x12] = self.total_odds.to_bytes(2, byteorder="little")
+        out[0x12] = self.great_failure_chance & 0xFF
+        out[0x13] = self.failure_chance & 0xFF
+        out[0x14] = self.success_chance & 0xFF
+        out[0x15] = self.great_success_chance & 0xFF
+        out[0x16:0x18] = self.animation_id.to_bytes(2, byteorder="little")
+        out[0x18:0x1A] = self.sound_id.to_bytes(2, byteorder="little")
+        out[0x1A:0x1C] = self.vertical_position.to_bytes(2, byteorder="little")
+        return out
+
+    def writeToRom(self, rom_data: bytearray):
+        rom_data[self.offset:self.offset + self.SIZE] = self.getByteArray()

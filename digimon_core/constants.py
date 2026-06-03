@@ -214,6 +214,30 @@ FARM_ITEM_OFFSETS = {
     "DAWN_US": (0x00131A8C, 0x00132AAC),
 }
 
+# Farm training pens: 48 records × 0x1C bytes, contiguous. DAWN_US TBD.
+FARM_TRAINING_PEN_OFFSETS = {
+    "DUSK_US": (0x0013170C, 0x00131C4C),
+    "DAWN_US": (0x0013154C, 0x00131A8C),
+}
+
+# Display labels for the 48 training pens in offset order. The string_id at
+# bytes 0..1 of each record matches the list index (the in-game string lives
+# in MSG.PAK and isn't read directly by the editor).
+FARM_TRAINING_PEN_NAMES = [
+    "Water Gun", "Rain Cloud", "Holy Flame", "Volcano",
+    "Flutter Fan", "Tornado", "Shocker", "Lightning",
+    "Laser Beam", "Energy Ball", "Cross", "Holy Crown",
+    "Black Fog", "Curse", "Dumbbell", "Super Punch",
+    "Pico Hammer", "Shield", "Math Drill", "Mag Square",
+    "Stopwatch", "Track Shoes", "Glove", "Keychain",
+    "HP CoreChip", "HP CoreChip D", "MP CoreChip", "MP CoreChip D",
+    "Dragon Cap", "Dragon Cap D", "Animal Cap", "Animal Cap D",
+    "Water Cap", "Water Cap D", "Bird Cap", "Bird Cap D",
+    "Insect Cap", "Insect Cap D", "Mech Cap", "Mech Cap D",
+    "Dark Cap", "Dark Cap D", "Holy Cap", "Holy Cap D",
+    "DNA Code", "Bone", "Spare Rib", "None",
+]
+
 # Consumables: 57 records × 0x14 bytes, contiguous.
 CONSUMABLE_OFFSETS = {
     "DUSK_US": (0x000F34A4, 0x000F3918),

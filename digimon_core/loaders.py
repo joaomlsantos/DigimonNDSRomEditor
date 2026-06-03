@@ -323,6 +323,19 @@ def loadFarmItems(version: str, rom_data: bytearray) -> List[model.FarmItem]:
     return out
 
 
+def loadFarmTrainingPens(version: str, rom_data: bytearray) -> List[model.FarmTrainingPen]:
+    rng = constants.FARM_TRAINING_PEN_OFFSETS.get(version)
+    if rng is None:
+        return []
+    offset_start, offset_end = rng
+    out: List[model.FarmTrainingPen] = []
+    seek = offset_start
+    while seek < offset_end:
+        out.append(model.FarmTrainingPen(rom_data[seek:seek + model.FarmTrainingPen.SIZE], seek))
+        seek += model.FarmTrainingPen.SIZE
+    return out
+
+
 def loadEquipment(version: str, rom_data: bytearray) -> Dict[int, model.Equipment]:
     """Brute-force id-scan the equipment region.
 
