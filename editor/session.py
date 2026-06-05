@@ -11,9 +11,16 @@ from __future__ import annotations
 import os
 import shutil
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from digimon_core import constants, fat, fnt, loaders, model, pak, qol as qol_module, rom
+from digimon_core import constants, fat, fnt, loaders, model, msgpak, pak, qol as qol_module, rom
+
+
+# Every sprite trio the editor knows how to splice on save. Used by
+# from_project to pre-load any pak that diverges from vanilla (so a
+# project's sprite edits survive a re-save even if the user never opens
+# the sprite browser) and by _apply_sprite_pak_splice to iterate.
+SPRITE_PAK_PATHS = ("DAT/SPR_CHR.PAK", "DAT/SPR_PAL.PAK", "DAT/SPR_CEL.PAK")
 
 
 @dataclass
@@ -54,6 +61,14 @@ class RomSession:
     # is opt-in.
     qol: qol_module.QolSettings = field(default_factory=qol_module.QolSettings)
 
+    # Lazy PakFile cache for sprite directories. Parsing all 1627-entry sprite
+    # paks at session open would cost ~50ms+ per pak with no payoff for users
+    # who never open the sprite browser; populated on first sprite_pak() call.
+    _sprite_pak_cache: Dict[str, pak.PakFile] = field(default_factory=dict)
+    # Sprite paks with at least one ReplaceSpriteCommand applied. Serialize
+    # iterates this on save to splice the rebuilt pak over its FAT slot.
+    _dirty_sprite_paks: Set[str] = field(default_factory=set)
+
     @classmethod
     def from_file(cls, path: str) -> "RomSession":
         rom_data = rom.loadRom(path)
@@ -91,6 +106,25 @@ class RomSession:
         )
         session.project_path = project_path
         session.qol = qol_settings
+        # Sprite paks aren't parsed during _build (they're lazy). If the
+        # project's byte diff touched any of them, eagerly pre-load from
+        # patched_data so sprite_pak() returns the project's state (not
+        # vanilla) and the splice path captures them into a re-save's diff
+        # even when the user never opens the sprite browser.
+        # Each side's FAT is queried separately — an msgpak grow inside
+        # the project would have shifted every later file's FAT entry, so
+        # vanilla and patched can map this pak to different ROM offsets.
+        ft_vanilla = fnt.FileTable.from_rom(vanilla_data)
+        ft_patched = fnt.FileTable.from_rom(patched_data)
+        for pak_name in SPRITE_PAK_PATHS:
+            try:
+                v_start, v_end = ft_vanilla.resolve(pak_name)
+                p_start, p_end = ft_patched.resolve(pak_name)
+            except KeyError:
+                continue
+            if vanilla_data[v_start:v_end] != patched_data[p_start:p_end]:
+                session._sprite_pak_cache[pak_name] = pak.PakFile(patched_data[p_start:p_end])
+                session._dirty_sprite_paks.add(pak_name)
         # vanilla_path isn't stored on the session — the caller (main_window)
         # owns the QSettings cache so projects sharing a vanilla ROM don't
         # each re-prompt the user.
@@ -143,8 +177,17 @@ class RomSession:
         session.qol.scan_rate = parse_data[constants.BASE_SCAN_RATE_OFFSET[version]]
         return session
 
-    def serialize_all(self) -> bytearray:
-        """Write every model back onto a copy of the original ROM bytes."""
+    def serialize_all(self, *, skip_sprite_splice: bool = False) -> bytearray:
+        """Write every model back onto a copy of the original ROM bytes.
+
+        ``skip_sprite_splice`` leaves sprite paks at their vanilla bytes
+        instead of rebuilding them. Used by project save so the byte diff
+        captures only equal-length model edits — sprite edits ride the
+        :meth:`sprite_pak_edits` channel and are replayed at load time
+        (mirrors how MSG.PAK over-budget strings use ``string_edits``).
+        Without this flag, a single grown sprite would balloon the byte
+        diff to span every downstream-shifted file.
+        """
         out = bytearray(self.original_rom_data)
         for obj in self.base_digimon.values():
             obj.writeToRom(out)
@@ -196,6 +239,13 @@ class RomSession:
                 if is_msgpak:
                     continue
                 s.writeToRom(out)
+        # Sprite pak splice runs inside serialize_all (not just _with_qol)
+        # so direct ROM saves include sprite edits. Project save passes
+        # ``skip_sprite_splice=True`` and snapshots per-entry edits into
+        # the sprite_edits channel instead — otherwise a single grown
+        # sprite would shift every downstream file and bloat the byte diff.
+        if not skip_sprite_splice:
+            self._apply_sprite_pak_splice(out)
         return out
 
     def serialize_all_with_qol(self) -> bytearray:
@@ -210,6 +260,74 @@ class RomSession:
         self._apply_msgpak_resize(out)
         self._trim_trailing_padding(out)
         return out
+
+    def sprite_pak(self, pak_name: str) -> pak.PakFile:
+        """Lazy-load and cache one of the sprite pak directories.
+
+        ``pak_name`` is the FAT path (e.g. ``"DAT/SPR_CHR.PAK"``). The
+        PakFile is parsed from ``original_rom_data`` for fresh ROM sessions;
+        project sessions whose byte diff touched this pak pre-populate the
+        cache from ``patched_data`` in :meth:`from_project` so the live
+        ``pak.entries`` start at the project's edited state.
+        """
+        cached = self._sprite_pak_cache.get(pak_name)
+        if cached is not None:
+            return cached
+        ft = fnt.FileTable.from_rom(self.original_rom_data)
+        start, end = ft.resolve(pak_name)
+        cached = pak.PakFile(self.original_rom_data[start:end])
+        self._sprite_pak_cache[pak_name] = cached
+        return cached
+
+    def mark_sprite_pak_dirty(self, pak_name: str) -> None:
+        """Flag ``pak_name`` for re-splice on the next ``serialize_all``.
+
+        Called by :class:`commands.ReplaceSpriteCommand` on every redo/undo.
+        Idempotent — the splice only runs once per save regardless of how
+        many entries inside the pak were touched.
+        """
+        self._dirty_sprite_paks.add(pak_name)
+
+    def _apply_sprite_pak_splice(self, out: bytearray) -> None:
+        """Rebuild every dirty sprite pak and splice it into the ROM.
+
+        Uses the same ``fat.splice_range`` + ``fat.resize_fat_entry``
+        machinery MSG.PAK rides on, so a grown pak shifts every downstream
+        FAT entry + NDS header offset by an 0x200-aligned step (DS file
+        loader requires that alignment). Shrunk paks reclaim whole 0x200
+        blocks; sub-block leftover stays as 0xFF padding inside the
+        container so the next file still starts on a boundary.
+
+        Splice order matters when multiple paks are dirty: each splice
+        shifts every byte past the container's old end, invalidating any
+        cached offsets for files at higher ROM addresses. Iterating in
+        **descending pak_start order** keeps the lower-offset paks'
+        pre-resolved offsets valid (those files don't move when a
+        higher-offset file is spliced first).
+        """
+        if not self._dirty_sprite_paks:
+            return
+        file_table = fnt.FileTable.from_rom(bytes(out))
+        # Snapshot offsets BEFORE any splice — they're valid for every pak
+        # as long as we process highest-offset-first (each splice only
+        # shifts content past its own container_end).
+        dirty: List[Tuple[int, int, str]] = []
+        for pak_name in self._dirty_sprite_paks:
+            try:
+                pak_start, pak_end = file_table.resolve(pak_name)
+            except KeyError:
+                continue
+            if pak_name in self._sprite_pak_cache:
+                dirty.append((pak_start, pak_end, pak_name))
+        for pak_start, pak_end, pak_name in sorted(dirty, reverse=True):
+            pak_obj = self._sprite_pak_cache[pak_name]
+            new_bytes = pak_obj.to_bytes()
+            idx, _cs, ce = fat.find_container(out, pak_start, pak_end)
+            content_delta = len(new_bytes) - (pak_end - pak_start)
+            aligned_shift = fat.splice_range(
+                out, pak_start, pak_end, ce, new_bytes
+            )
+            fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
 
     def over_budget_strings(self) -> List[model.GameString]:
         """Non-MSG.PAK strings whose encoded length exceeds their byte budget.
@@ -268,6 +386,57 @@ class RomSession:
                 if s.text != s._initial_text:
                     out.append((region_id, s.offset, s.text))
         return out
+
+    def sprite_pak_edits(self) -> List[Tuple[str, int, bytes]]:
+        """Snapshot per-entry sprite edits for the .romproj sprite_edits channel.
+
+        For each dirty pak, compares every entry against a freshly-parsed
+        vanilla PakFile (from ``original_rom_data``) and emits one tuple
+        per differing slot. Comparing against the in-memory pak's own
+        ``original_entry`` would be wrong for project-loaded sessions
+        because the cached PakFile was parsed from patched_data (project
+        state), not vanilla.
+        """
+        out: List[Tuple[str, int, bytes]] = []
+        if not self._dirty_sprite_paks:
+            return out
+        file_table = fnt.FileTable.from_rom(self.original_rom_data)
+        for pak_name in sorted(self._dirty_sprite_paks):
+            edited = self._sprite_pak_cache.get(pak_name)
+            if edited is None:
+                continue
+            try:
+                v_start, v_end = file_table.resolve(pak_name)
+            except KeyError:
+                continue
+            vanilla = pak.PakFile(self.original_rom_data[v_start:v_end])
+            n = min(edited.count, vanilla.count)
+            for i in range(n):
+                v_bytes = vanilla.original_entry(i)
+                if edited.entries[i] != v_bytes:
+                    out.append((pak_name, i, bytes(edited.entries[i])))
+        return out
+
+    def apply_sprite_pak_edits(
+        self, edits: List[Tuple[str, int, bytes]],
+    ) -> None:
+        """Replay sprite-entry edits from a .romproj onto the in-memory paks.
+
+        Each tuple is ``(pak_name, entry_idx, new_compressed_bytes)``.
+        Marks each touched pak dirty so the next ``serialize_all`` runs
+        the splice + FAT-shift path. Raises ``KeyError`` on unknown pak
+        name (signals project/ROM version drift) and ``IndexError`` on
+        out-of-range ``entry_idx``.
+        """
+        for pak_name, idx, new_bytes in edits:
+            pak_obj = self.sprite_pak(pak_name)
+            if not (0 <= idx < pak_obj.count):
+                raise IndexError(
+                    f"sprite_edits: entry {idx} out of range for "
+                    f"{pak_name} (count={pak_obj.count})"
+                )
+            pak_obj.replace_entry(idx, new_bytes)
+            self.mark_sprite_pak_dirty(pak_name)
 
     def apply_string_edits(self, edits: List[Tuple[str, int, str]]) -> None:
         """Replay logical string edits from a .romproj onto the parsed model.
@@ -338,7 +507,7 @@ class RomSession:
             entry_start_in_pak, _ = p.original_entry_range(entry_idx)
             off_in_entry = file_off - entry_start_in_pak
             entry_bytes = p.original_entry(entry_idx)
-            groups = pak.parse_msgpak_entry_groups(entry_bytes)
+            groups = msgpak.parse_entry_groups(entry_bytes)
             g_idx = next(
                 (i for i, (gs, ge) in enumerate(groups)
                  if gs <= off_in_entry < ge),
@@ -354,7 +523,7 @@ class RomSession:
         for entry_idx, group_idxs in affected.items():
             entry_bytes = p.original_entry(entry_idx)
             entry_start_in_pak, _ = p.original_entry_range(entry_idx)
-            groups = pak.parse_msgpak_entry_groups(entry_bytes)
+            groups = msgpak.parse_entry_groups(entry_bytes)
             payloads: List[bytes] = []
             for g_idx, (gs, ge) in enumerate(groups):
                 if g_idx not in group_idxs:
@@ -370,7 +539,7 @@ class RomSession:
                         continue
                     new_payload.extend(s.encoded_bytes_for_grow())
                 payloads.append(bytes(new_payload))
-            p.replace_entry(entry_idx, pak.rebuild_msgpak_entry(payloads))
+            p.replace_entry(entry_idx, msgpak.rebuild_entry(payloads))
 
         new_pak_bytes = p.to_bytes()
         idx, _cs, ce = fat.find_container(out, pak_start, pak_end)

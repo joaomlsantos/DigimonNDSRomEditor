@@ -197,9 +197,9 @@ Each milestone is independently shippable.
 - Per-editor list filters in place; **cross-page search** still pending.
 - Shipped beyond plan in this milestone: validation footer, recent-files menu, window-state persistence, rolling `.bak` on save, per-save changelog, close-confirm on unsaved changes, Strings editor (§4.17), over-budget save guard, perf-snapshot fast path on string-budget validation.
 
-### M7 — Distribution — not yet
-- Packaging (PyInstaller, mirroring DWDDRandomizer's `.spec`).
-- Optional: IPS/xdelta patch export.
+### M7 — Distribution — ✅ done (packaging)
+- ~~Packaging (PyInstaller, mirroring DWDDRandomizer's `.spec`).~~ Done — `DigimonNDSRomEditor.spec` (Windows), `DigimonNDSRomEditor_macOS.spec`, `DigimonNDSRomEditor_linux.spec`.
+- Optional: IPS/xdelta patch export — still pending.
 
 ---
 
@@ -208,7 +208,7 @@ Each milestone is independently shippable.
 - ~~**Models without serializers are a hidden cost.**~~ Resolved — every model is covered; `smoke_test.py` runs the round-trip on every editor on both DUSK_US and DAWN_US.
 - ~~**Unknown fields exposure.**~~ Resolved — `View → Show unknown fields` toggle (off by default) reveals the `unknown_0xN` properties across every editor.
 - ~~**Item structure isn't modeled.**~~ Resolved — Equipment, Consumables, and Farm Items each have full editors.
-- ~~**Sprite/portrait editing is still out of scope.**~~ Partially unblocked — NCGR/NCLR round-trip is now working (see §11). Pointer-swap reskins (`SpriteMapEntry`) remain the only in-editor mechanism today; actually swapping pixels still requires the standalone `rom_files/ncgr_to_png.py` converter + manual ROM injection. A first-class sprite editor is now a feasible next push (§11). String editing is no longer out of scope and ships in §4.17.
+- ~~**Sprite/portrait editing is still out of scope.**~~ Shipped — see §11. Sprites editor supports PNG and NCGR+NCLR import/export, grows past in-pak and in-FAT-slot caps via shared FAT-shift machinery (§12), and persists in `.romproj` via the v3 sprite_edits channel. Named-category labels (portraits / UI / battle minis / habitat previews) remain deferred until a sprite-ID → role table lands in the research notes repo. String editing is no longer out of scope and ships in §4.17.
 - **Region support** still sticks to `DUSK_US`/`DAWN_US`. JP coverage can extend later by filling the offset tables. §13 (FAT-driven loading) additionally unlocks compatibility with language-patched DUSK_US / DAWN_US ROMs where the patch grew FAT-listed files (translation jobs typically extend MSG.PAK) — see §13.7.
 - **Concurrent edits across pages** — handled by editors re-reading the model on `_on_selection` / `_on_undo_redo` rather than caching widget values; works in practice. Footer collectors read from the session, not from open widgets, so they stay valid even when the relevant editor isn't constructed.
 - **Shutdown race in module-level singletons.** Fixed for the validation registry (`_safe_emit_changed` swallows `RuntimeError` from emitting on a deleted QObject during Qt teardown). Worth keeping in mind for any future module-level `QObject` singleton.
@@ -229,14 +229,14 @@ Ordered by load-bearing-ness:
 2. **Cross-page search** — single search box that queries every editor's record list (digimon names, move names, item names, in-game strings) and routes click-throughs via the nav handlers / footer routing.
 3. **Bulk-edit operations** — apply a transform across a record set with a diff preview before commit. Saves hundreds of clicks for balance passes.
 4. **Header toolbar with icon buttons** — Ghidra-style icon row for Save ROM / Save Project / Export (saved memory: `project_future_header_bar.md`).
-5. **Sprite editor (§11)** — newly feasible now that NCGR/NCLR round-trip works and the load-bearing RAHC+0x12 field is understood. First domain in the editor that touches graphics rather than data tables; opens the door to portrait/UI reskins from inside the app.
-6. **Packaging (M7)** — PyInstaller spec mirroring DWDDRandomizer's.
-7. **IPS/xdelta patch export** — v0.2+; useful once distribution workflow is established.
+5. **IPS/xdelta patch export** — v0.2+; useful for distribution workflows where shipping a full ROM isn't viable.
+
+Sprite editor (§11) is no longer on this list — phases A–G all shipped, including the v3 `.romproj` `sprite_edits` channel that keeps project diffs small when a sprite grows. Named-category labels for the sprite browser stay deferred (see §11.4-G note). Packaging (M7) shipped via three PyInstaller specs (Windows / macOS / Linux); IPS/xdelta export is the only M7 leftover.
 
 Beyond plan but possibly worth picking up:
 - Before/after value capture in changelog entries (currently action-text only).
 - "Revert this entry to vanilla" per editor (needs the `session.original` reference path; partly implementable today via re-parsing a slice of `original_rom_data`).
-- About dialog with editor version + ROM version readback.
+- ~~About dialog with editor version + ROM version readback.~~ Done — `action_about` → `_show_about` in `main_window.py`.
 - Wider validation coverage (encounter rewards, equipment, consumables, farm items have no `*_issues()` collectors yet).
 - Strings export/import (CSV/JSON) — deferred: byte-budget per string limits translation workflow value.
 - Randomizer integration — seed-based randomization of evolution trees / starters / encounters; pairs with the cross-reference panel.
@@ -352,109 +352,113 @@ Phase A is independently shippable as an API — the panel can be added later. P
 
 ## 11. Plan: Sprite editor (Graphics page)
 
-**Goal.** Edit DWDD's tile-based sprites (portraits, UI frames, battle minis, move animations) from inside the editor: pick a sprite, export to PNG for external editing in GIMP/Aseprite, then re-import and have the change take effect in-game. First domain in the editor that touches pixel data; built on the round-trip work in `rom_files/ncgr_to_png.py`.
+**Goal.** Edit DWDD's tile-based sprites (portraits, UI frames, battle minis, move animations) from inside the editor. Two import/export surfaces are exposed deliberately — a **PNG** path for users editing in GIMP/Aseprite, and an **NCGR + NCLR** path for users who want lossless round-trip of the engine-native files (e.g. patch authors swapping assets between projects, or anyone working from datamined dumps). Both are first-class; neither is a fallback for the other.
 
 ### 11.1 Findings from the standalone converter work
 
-Established empirically while building `rom_files/ncgr_to_png.py` (decode/encode) and `rom_files/inject_test.py` (ROM-level splice):
+Established empirically while building `rom_files/ncgr_to_png.py` (decode/encode), `rom_files/dump_ncer.py` (cell parser), and `rom_files/inject_test.py` (ROM-level splice):
 
-- **File format.** DWDD's `SPR_*.PAK` files are flat containers whose directory entries (4-byte offset + 4-byte size, size's high bit being a 0x80 flag) point at NDS-standard NCGR (tile data) and NCLR (palette) files. Cell layout / animation lives in companion NCER (`SPR_CEL.PAK`) and NANR (`SPR_ANM.PAK`). Every PAK entry is **RLE-0x30 compressed** (NDS BIOS RLE: header `0x30 + 24-bit out size`, MSB-flagged flag bytes for runs vs literals). `SPR_CHR.PAK` alone contains 1627 entries.
-- **Round-trip works.** Decode (`NCGR + NCLR → PNG`) and encode (`PNG → NCGR + NCLR`) are byte-stable for tile data given the same palette. Compression is also reversible — random fuzz survives `compress_rle30 → decompress_rle30`.
-- **RAHC+0x12 is load-bearing and per-sprite.** Most NCGRs use `0x0000` there, but a subset (e.g. Julia's portrait 1566, sprite 0500) use `0x0020`. Zeroing it on re-encode does not glitch colors — it shifts tile rows (bottom row missing, top row duplicated). Diagnosis path was a byte-diff of the offending NCGR; preservation via `--template-ncgr` in `rom_files/ncgr_to_png.py encode` fixed it. The field is metadata about how the loader allocates the sprite, not a parameter the tile bytes are encoded against; same-shape tile data under the original header always works (saved memory: `project_ncgr_rahc_header_preserve.md`).
-- **Width during decode is cosmetic.** Tile-byte order in the NCGR is a flat raster sequence; the `--width` flag only changes the PNG's tile-row wrap for human viewing. Re-encode infers `(tw, th)` from PNG dimensions and walks tiles in the same raster order. Only gotcha: if `n_tiles` doesn't divide evenly by the chosen width, decode pads with transparent slots and re-encode treats those as real all-zero tiles, inflating the NCGR. For exact round-trips pick a divisor.
-- **Palette flexibility.** 4bpp NCGRs always need 16 palette slots even when fewer colors are used (unused slots padded with `(0,0,0)`); the engine ignores them but they must be present. Slot 0 is hardware-transparent on OBJ layer — the encoder supports `--transparent-rgb R,G,B` to flag a GIMP "key color" as slot 0 and write the same RGB back into slot 0 of the output NCLR so GIMP shows the key color on re-open.
-- **NCER constrains tile count, not tile contents.** OAMs reference tile indices and dimensions (parsed by `rom_files/dump_ncer.py`); replacing tile bytes is safe as long as the number of tiles and the OAM-implied geometry are preserved. Shrinking tile count strands OAMs at higher indices on garbage; growing is harmless but wasted. For v0.1 the editor enforces "PNG must produce the same tile count as the original" — same-shape replacement only.
-- **PAK-internal injection.** Same-compressed-size replacements need no PAK directory rewrite. Anything else requires patching the affected directory entry's size and adding the signed delta to every downstream entry's offset (`rom_files/shift_offsets.py` automates that). If the PAK itself grows beyond its FAT slot, `rom_files/inject_test.py` already handles ROM-level FAT + header shifting in 0x200-aligned increments.
+- **File format.** DWDD's `SPR_*.PAK` files are flat containers whose directory entries (4-byte offset + 4-byte size, size's high bit being a 0x80 flag) point at NDS-standard NCGR (tile data), NCLR (palette), NCER (cells/OAMs), and NANR (animation). Every PAK entry is **RLE-0x30 compressed** (NDS BIOS RLE: header `0x30 + 24-bit out size`, MSB-flagged flag bytes for runs vs literals). `SPR_CHR.PAK` contains 1627 entries on Dusk.
+- **Round-trip works.** Decode (`NCGR + NCLR → PNG`) and encode (`PNG → NCGR + NCLR`) are byte-stable for tile data given the same palette. Compression is reversible — random fuzz survives `compress_rle30 → decompress_rle30`.
+- **RAHC+0x12 is load-bearing and per-sprite.** Most NCGRs use `0x0000`, but a subset (e.g. Julia's portrait 1566, sprite 0500) use `0x0020`. Zeroing it on re-encode does not glitch colors — it shifts tile rows (bottom row missing, top row duplicated). Diagnosis: byte-diff. Preservation via `build_ncgr_from_template` (always reuse the original RAHC bytes) fixed it. The field is metadata about how the loader allocates the sprite, not a parameter the tile bytes are encoded against (memory: `project_ncgr_rahc_header_preserve.md`).
+- **Width during decode is cosmetic.** Tile-byte order in the NCGR is a flat raster sequence; width only changes the PNG's tile-row wrap for human viewing. Re-encode infers `(tw, th)` from PNG dimensions. Only gotcha: if tile count doesn't divide evenly by the chosen width, decode pads with transparent slots and re-encode treats those as real all-zero tiles, inflating the NCGR. For exact round-trips pick a divisor — or skip PNG and use the NCGR+NCLR export.
+- **Palette flexibility.** 4bpp NCGRs always need 16 palette slots even when fewer colors are used; the engine ignores unused slots but they must be present. Slot 0 is hardware-transparent on the OBJ layer. **8bpp NCGRs paired with 16-color NCLR banks** (e.g. entries 943, 944) are concatenated by the engine: pixel byte `i` maps to bank `i // 16`, color `i % 16`. The browser and renderer flatten on the fly so the preview matches the engine; a naive single-bank lookup crashes with `IndexError`.
+- **NCER constrains tile count, not tile contents.** OAMs reference tile indices + dimensions; replacing tile bytes is safe as long as enough tiles are present. **Computing the required tile count is non-trivial:** the OAM `tile` field indexes 32-byte slots, not 8×8 tiles. For 1D mapping the boundary is `32 << (mapping & 0xFF)` bytes per slot. For 2D mapping the slot stride is fixed at 32 bytes regardless of bit depth — so an 8bpp tile (64B) consumes **two** slots, and the linear NCGR tile index is `oam.tile / 2`. The correct formula (`digimon_core/ncer.min_tiles_required`) works in bytes:
+
+  ```
+  end_byte  = oam.tile * slot_bytes + oam.n_tiles * bytes_per_tile
+  min_tiles = ceil(end_byte / bytes_per_tile)
+  ```
+
+  Verified against all 1627 vanilla Dusk entries; the naive linear formula (`tile + n_tiles`) over-counts the 477 8bpp+2D sprites because it doesn't account for the half-tile-per-slot stride.
+- **CHR[N] ↔ PAL[N] ↔ CEL[N] holds for `SPR_*.PAK`.** Verified empirically across the trio. **Does not hold for `MCHR_*.PAK`** — those use a different pairing the editor doesn't claim to support yet (memory: `project_sprite_pak_pair_heuristic.md`).
+- **PAK-internal injection.** Same-compressed-size replacements need no PAK directory rewrite. Anything else requires patching the affected directory entry's size and adding the signed delta to every downstream entry's offset — handled by `PakFile.to_bytes` (§11.2). If the PAK itself grows beyond its FAT slot, the §12 FAT-shift path takes over.
 
 ### 11.2 Architecture
 
-**`digimon_core/sprite.py`** — port of the pure functions from `rom_files/ncgr_to_png.py` (`decompress_rle30`, `compress_rle30`, `parse_nclr`, `parse_ncgr`, `unpack_pixels`, `encode_tiles`, `build_ncgr_from_template`, `build_nclr`, `png_to_indexed`). No PIL dependency in the parsing side; rendering returns a flat `bytes` of RGBA pixels and `(w, h)`, which the Qt layer wraps in a `QImage` (`QImage.Format_RGBA8888`). Re-exporting to PNG goes through `QImage.save()` so we avoid pulling Pillow into the editor's runtime.
+The graphics subsystem splits into four pure-function modules in `digimon_core/`, plus one Qt widget. Pure modules are PIL-free; rendering returns flat RGBA bytes + dimensions and the Qt layer wraps them in `QImage(Format_RGBA8888)`. PNG export goes through `QImage.save()` so the editor doesn't pull in Pillow at runtime.
 
-**`digimon_core/pak.py`** — PAK directory reader/writer. One class:
+**`digimon_core/sprite.py`** — codec layer:
+- `decompress_rle30` / `compress_rle30` / `maybe_decompress` — NDS BIOS RLE.
+- `find_block(data, magic)` — generic NDS sub-block walker.
+- `parse_ncgr(raw) → (tile_bytes, bit_depth, hint_w, hint_h, is_bitmap)`.
+- `parse_nclr(raw) → (palettes, bit_depth)`.
+- `unpack_pixels` / `render_rgba` — pixel decode (defensive: indices past palette length render transparent rather than crashing — covers 8bpp+16-color-bank quirk).
+- `encode_tiles(indices, w, h, bpp4) → bytes`.
+- `build_ncgr_from_template(tile_bytes, template_raw)` — swaps tile data while reusing the original RAHC header verbatim (RAHC+0x12 preservation).
+- `build_nclr(palette, bpp4, include_pcmp=True)` — vanilla-shaped NCLR output.
 
-```python
-class PakFile:
-    entries: List[bytes]    # decompressed payloads, in directory order
+**`digimon_core/ncer.py`** — cell/OAM parser:
+- `parse_ncer(raw) → Ncer{cells, mapping, boundary_bytes, is_1d}`.
+- `min_tiles_required(ncer, bpp4) → int` — the byte-math formula above; the import-time tile-count gate uses this.
+- `cell_tile_ranges(ncer, bpp4)` — per-cell linear `[(tile_start, tile_end), …]` ranges; used by the preview's OAM overlay (Phase D-ish).
 
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "PakFile": ...
-    def to_bytes(self) -> bytes: ...   # re-compresses, rebuilds directory
-```
+**`digimon_core/pak.py`** — generic DWDD pak directory:
+- `PakFile(raw)` parses the `u32 count + count × (u32 offset, u32 size_with_flag)` header. Per-entry flag (top bit of size) is preserved verbatim — never interpreted.
+- `replace_entry(idx, new_bytes)` — in-place swap; original snapshot retained so unmodified entries can still be read via `original_entry(idx)`.
+- `to_bytes()` — rebuilds with 4-byte inter-entry alignment so a no-edit save is byte-identical to vanilla. Shared by both MSG.PAK (§12) and sprite paks; no MSG.PAK-specific knowledge leaks in.
 
-Directory format is documented in `research_docs/spr_paks_research.txt`: `u32 count, then count × (u32 offset, u32 size_with_0x80_flag)`. `to_bytes` writes RLE-0x30 payloads concatenated, alignment-preserved, and patches the directory in lockstep.
+**`digimon_core/msgpak.py`** — MSG.PAK-specific sub-header helpers, separated from `pak.py` so sprite code never imports MSG-only logic.
 
-**Session integration.** `RomSession` gains a `paks: Dict[str, PakFile]` field lazily populated on demand (only when the sprite editor is opened — full 1627-entry decompression of every PAK is too slow for cold-load). Saves re-serialize each touched PAK and splice it back via the existing FAT-resize path (port `inject_test.py`'s container-resize logic into a session method `replace_fat_entry(filename, new_bytes)`). Same-size PAK replacements are the fast path and need no FAT touch.
-
-**Asset model.**
-
-```python
-@dataclass
-class SpriteAsset:
-    pak_name: str             # "SPR_CHR.PAK"
-    ncgr_index: int           # entry index inside the PAK
-    nclr_index: int           # paired NCLR — found by walking PAK for matching-stem entries
-    ncer_index: Optional[int] # cell metadata if known (cross-PAK reference)
-    width_tiles: int          # hint for the decoder; defaults from research notes per PAK kind
-
-    def to_qimage(self, pak: PakFile) -> QImage: ...
-    def replace_from_png(self, png_path: Path, pak: PakFile,
-                         transparent_rgb: Optional[Tuple[int,int,int]]) -> None:
-        # Reuses the original NCGR's RAHC header as the template, so RAHC+0x12
-        # is preserved automatically.
-```
-
-The "find paired NCLR" heuristic deserves its own investigation: PAK entries don't carry filenames, only positions. First cut: most sprites use the same numeric index across PAKs (CHR[N] pairs with PAL[N]). Validate before committing UI to it.
+**Session integration.** `RomSession.sprite_pak(name)` lazily loads and caches the three `SPR_*.PAK` directories from `original_rom_data`. Browsing 1627 entries cold parses only the small outer directory; per-entry decompression happens on click. Cold-load on Dusk is sub-100ms — no thumbnail cache needed.
 
 ### 11.3 UI
 
-**New nav-tree group: "Graphics".** Sub-pages (one per PAK or per sprite category — TBD once we know what 1627 entries actually contain):
+**Nav-tree group: "Sprites" → "Sprite Sheets".** Single page driving all three `SPR_*.PAK` directories simultaneously, paired by index.
 
-- **Portraits** — `SPR_CHR.PAK` filtered to portrait-shaped entries (32×40 dimensions, by far the easiest visual category to triage).
-- **UI frames** — `SPR_CHR.PAK` filtered to small tile blocks.
-- **Battle minis / animations / habitat previews** — same backing PAK, different filter heuristics.
+**Layout** (`editor/widgets/sprite_browser.py`):
+- Left: filterable index list (`0000` … `1626`).
+- Right: preview pane + controls + metadata block.
+  - Preview: `render_rgba` output displayed at 2× for small sprites, native scale otherwise.
+  - Width-tiles spin: cosmetic — reflows the linear NCGR for human viewing. Defaults to the RAHC hint when set, else 4.
+  - Palette-bank combo: per-bank pick for 4bpp; collapses to a single "Flat (banks concatenated)" entry for 8bpp + 16-color-bank NCLRs.
+  - Metadata: NCGR tiles, bit depth, palette count, NCER cell count, OBJ mapping (1D/2D + boundary), `min_tiles_required`, CHR entry bytes (compressed / raw). `min_tiles_required > NCGR tiles` surfaces a ⚠ — vanilla never trips this; replacements might.
 
-Within each page:
-
-- **Master list.** A `QListView` in icon mode (thumbnails), backed by a `QAbstractListModel` that lazy-decodes on `data(Qt.DecorationRole)` and caches the resulting `QImage`. Numeric index as the label until we have semantic names.
-- **Detail panel.** Larger preview (zoomed), file-info readout (dimensions, palette size, RAHC+0x12 value), three buttons:
-  - **Export PNG…** — writes the decoded PNG to a user-chosen path.
-  - **Replace from PNG…** — opens a file picker, runs `replace_from_png`, refreshes the thumbnail, pushes a `ReplaceSpriteCommand` onto the undo stack so Ctrl+Z reverts the swap.
-  - **Revert to vanilla** — re-decodes from `original_rom_data`.
-- **Transparent-color picker** in the detail panel — colour swatch that defaults to whatever sits at slot 0 of the original NCLR; the user can repick before importing so GIMP-painted key colors get recognised.
-
-Undo/redo: `ReplaceSpriteCommand` snapshots the old PAK payload bytes and the new payload bytes; redo/undo swap them on the PAK instance. Cheap (PAKs are small in memory once decompressed).
+**Phase C/D add per-entry import/export controls** — see §11.4 for the dual-format design.
 
 ### 11.4 Phasing
 
-| Phase | Output | Effort |
+| Phase | Output | Status |
 | --- | --- | --- |
-| **A — Port + bench** | `digimon_core/sprite.py` (parsers, encoders, RAHC-template builder) and `digimon_core/pak.py` (read-only `from_bytes`). Round-trip unit test: every entry in `SPR_CHR.PAK` decode → render → compare against the reference PNG dump from `rom_files/ncgr_to_png.py batch`. | 1 d |
-| **B — Read-only thumbnail browser** | Graphics nav group + master-list thumbnails for `SPR_CHR.PAK`. No editing yet. Lazy-decode + per-entry image cache; verify total cold-load < 2 s on Dusk. | 1 d |
-| **C — Export PNG** | "Export PNG…" button + width-divisor enforcement so re-import is exact. | 0.5 d |
-| **D — Replace from PNG (same-size)** | "Replace from PNG…" using `build_ncgr_from_template` for header preservation. Requires the new encoded NCGR to be the same compressed size as the original (validation at import time). Wire into `ReplaceSpriteCommand` + undo stack. Verify in DeSmuME against the Julia portrait test. | 1 d |
-| **E — PAK directory rewrite** | Lift the "same compressed size" constraint by patching the affected entry's size and shifting every downstream entry's offset (port `rom_files/shift_offsets.py`'s logic). PAK total size still ≤ original FAT slot. | 0.5 d |
-| **F — ROM-level FAT shifting** | Lift the "PAK fits in FAT slot" constraint by routing through the shared `digimon_core/fat.py` helpers (§12.2). This is the last constraint — after this, sprites can grow arbitrarily. MSG.PAK saves share the same code path. | 1 d |
-| **G — Categorisation pass** | Replace numeric index labels with human-readable categories (portraits / UI / battle minis / animations / habitat previews). Heuristic-driven: dimensions, palette size, OAM count, and any naming pattern that surfaces in the research repo. | 0.5 d |
+| **A — Pure-function modules + tests** | `digimon_core/sprite.py` (RLE-30, parse/build NCGR/NCLR, encode_tiles, render_rgba), `digimon_core/ncer.py` (`parse_ncer`, `min_tiles_required` byte-math). `pak.py` split into generic directory + `msgpak.py`. Tests: RLE-30 round-trip, RAHC header preservation, `min_tiles_required` matches CHR tile count for every Dusk SPR_CHR entry. | ✅ done |
+| **B — Read-only browser** | Sprites nav group + `SpriteBrowser` widget (index list, preview, palette/width controls, metadata block). Lazy `RomSession.sprite_pak(name)`. Verified: 1627 entries render without crashing; 0 spurious `min_tiles_required` mismatches across vanilla Dusk. | ✅ done |
+| **C — Dual-format export** ✅ **Done** | Two export actions per entry: **Export PNG…** (renders via `render_rgba`, saves via `QImage.save`; user-friendly) and **Export NCGR+NCLR…** (writes the decompressed NCGR + NCLR bytes as a pair of `.NCGR` / `.NCLR` files; lossless round-trip). PNG export warns when the chosen width doesn't divide the tile count (would pad on re-import). | 0.5 d |
+| **D — Dual-format import (same-tile-count)** ✅ **Done** | Three import actions per entry: **Import from PNG (match palette)…** (quantises against the current NCLR, CHR-only swap), **Import from PNG (new palette)…** (median-cut over the PNG, rewrites the displayed bank as well — sibling sprites that share the bank pick up the new colors), and **Import from NCGR+NCLR…** (accepts engine-native bytes; lossless round-trip with the export path). All three wire into `ReplaceSpriteCommand`, run a `min_tiles_required` check, and the NCGR path warns when incoming RAHC+0x12 differs from the original. | 1 d |
+| **E — PAK directory rewrite on save** ✅ **Done** | `editor/session.py`'s `_apply_sprite_pak_splice` runs at the end of `serialize_all`: iterates `_dirty_sprite_paks` in descending ROM-offset order so each splice's pre-snapshot offsets stay valid as later containers shift, calls `pak.to_bytes()` to rebuild, then `fat.find_container` + `fat.splice_range` + `fat.resize_fat_entry`. Mirrors `_apply_msgpak_resize` and shares the same ROM-level mechanics. | 0.5 d |
+| **F — ROM-level FAT shifting** ✅ **Done** | Folded into Phase E above — `_apply_sprite_pak_splice` already routes through `digimon_core/fat.py`. Multi-pak grow ordering verified by `test_sprite_ncer.SpritePakGrowSpliceTests.test_multi_pak_grow_handles_descending_order` and downstream FAT shift by `test_single_pak_grow_shifts_downstream_fat`. Also lifts the per-pak FAT-slot cap that limited Phase E in isolation. | shared with E |
+| **G — Categorisation / metadata pass** ✅ **Done (partial)** | NCER OAM overlay shipped: toggleable per-cell tile-range highlight on the preview via `_paint_oam_overlay`, using `ncer.cell_tile_ranges`. Index labels now carry structural metadata (bpp + bbox + cell count) instead of pure numeric IDs. Default preview width estimated from `sprite_bbox` via the empirical bbox→tiles heuristic. **Named-category labels** ("portraits / UI / battle minis / habitat previews") were deliberately **deferred** per `feedback_no_fabricated_game_mechanics.md` — picking a name requires asserting game meaning the editor can't structurally verify; left for the user to filter via the existing search box. Revisit if/when the research notes repo grows a sprite-ID → role table. | 0.5 d |
 
-Phases A–D are independently shippable as a v0.1 sprite editor (same-size replacement only). E–F unlock arbitrary edits. G is polish.
+C–D shipped a v0.1 sprite editor (same-tile-count replacement, in-pak shifts). E added per-pak rebuild on save; F shared E's machinery to lift the per-pak FAT-slot cap. G shipped the metadata pass and overlay; named-category labels deferred per the structural-honesty rule (see G row).
+
+Project-format ergonomics for sprite edits live separately: the `.romproj` v3 `sprite_edits` channel (see §12.4-F) snapshots per-entry replacements rather than letting a grown sprite fat-shift bloat the byte diff. Save runs `serialize_all(skip_sprite_splice=True)` so the diff stays small; Open calls `apply_sprite_pak_edits` to replay them.
+
+### 11.4.1 Why two import/export formats
+
+Both are first-class because they serve different users:
+
+- **PNG** is for content editing — recolours, edits in GIMP/Aseprite, fan art. Users don't want to know what an NCGR is. The trade-off is some metadata round-trip loss (RAHC+0x12 is preserved by template, but width-padding pitfalls exist).
+- **NCGR + NCLR** is for asset transplants — pulling a sprite from another DWDD dump, moving an edit between projects, or working with datamined files. No quantisation, no template inference, no chance of PNG-codec colour drift. Round-trip is byte-stable as long as the pak entry's compressed size doesn't change.
+
+Both paths share validation (`min_tiles_required`, palette compatibility for 4bpp) and the same `ReplaceSpriteCommand` undo wiring. Only the **input parser** differs — PNG → `encode_tiles → build_ncgr_from_template`, NCGR+NCLR → direct decompressed-bytes substitution.
 
 ### 11.5 Risks
 
-- **Tile-count drift.** A PNG of different dimensions than the original silently produces a different tile count, which breaks NCER OAMs that reference high-index tiles. Mitigation: import-time validation that rejects PNGs whose `(tw × th)` doesn't match the original; surface as a clear error, not a silent breakage. Long term, add a "view OAMs" overlay on the preview so the user can see which tile ranges are load-bearing.
-- **PAK-pair heuristic.** "CHR[N] pairs with PAL[N]" is unverified across the full 1627 entries. If it doesn't hold universally, the asset list builder needs a fallback (probably index ranges learned from the research repo). Mitigation: Phase A's round-trip test surfaces any miss because the rendered PNG will be wrong-colored.
-- **Cold-load cost.** Decompressing 1627 entries on PAK open is ~tens of MB of RLE-30 work. If naive Python is too slow, the decompressor moves to a C extension or we keep PAK entries compressed in memory and decompress on demand. Bench in Phase B before optimising.
-- **Save-side compression speed.** Saving a PAK after edits re-encodes touched entries. The greedy RLE-30 encoder is fast on typical sprite payloads (~few hundred bytes each); a full PAK save touches all entries only when the directory shifts. Keep an LRU of `(payload bytes → compressed bytes)` keyed by hash to avoid re-compressing unchanged entries.
-- **Undo blast radius.** Replacing a sprite changes a PAK entry, which changes the PAK's compressed size, which (post-Phase E) shifts every downstream PAK entry's directory offset. The `ReplaceSpriteCommand` should hold the *PAK payload bytes* not just the entry bytes, so undo restores the directory state exactly.
-- **No NCER-aware editing yet.** Users can't see OAM boxes on the preview — they have to trust dimensions match. If this proves error-prone in practice, add an "overlay OAMs" toggle on the preview using `rom_files/dump_ncer.py`'s parser ported to `digimon_core/sprite.py`.
+- **Tile-count drift on PNG import.** A PNG of different dimensions than the original silently produces a different tile count, breaking OAMs that reference high-index tiles. Mitigation: warn if the new tile count drops below `min_tiles_required`; show the user the OAM tile ranges that would be stranded. Memory `feedback_msgpak_editable.md` style — warn, don't block; user knows their use case.
+- **RAHC+0x12 drift on NCGR import.** A user-supplied NCGR may have a different `RAHC+0x12` than the original. Mitigation: warn at import. Don't auto-rewrite, since the user might be intentionally swapping in an asset whose header is correct for its own tile layout.
+- **8bpp + 16-color-bank rendering.** Vanilla pairs 8bpp NCGRs with 16-color NCLR banks (entries 943, 944). Naive single-bank lookup crashes with `IndexError`. **Fixed in Phase B** — `render_rgba` clamps oversize indices to transparent, browser flattens banks for 8bpp NCGRs. Retain regression test if behaviour ever needs to change.
+- **NCER tile-step quirks.** The 8bpp+2D slot-stride detail (32B/slot regardless of bpp → tile index `/2`) is non-obvious and isn't documented in the older `rom_files/dump_ncer.py`. **Fixed in Phase A** via the byte-math formula. Risk: if a future ROM uses a non-DWDD mapping bit (e.g. bit 8 of `mapping`), the current code falls through to the 2D path; revisit if a non-DWDD pak ever needs supporting.
+- **PAK-pair heuristic edge cases.** Holds for `SPR_*.PAK` (verified). `MCHR_*.PAK` is out of scope until empirically verified; if the user opens an MCHR entry the browser will still render the CHR side, but the paired PAL/CEL may be wrong. Phase G is the place to either add an MCHR-specific pairing table or hide MCHR from the browser entirely.
+- **Save-side compression speed.** Saving a PAK after edits re-encodes touched entries only — `PakFile` keeps original bytes for untouched entries. Greedy RLE-30 is fast on typical sprite payloads (~few KB each). Cache by hash if profiling shows a hot spot.
+- **Undo blast radius.** Replacing a sprite changes a PAK entry, which changes the PAK's compressed size, which (post-Phase E) shifts every downstream entry's directory offset. `ReplaceSpriteCommand` snapshots the *pre-replace* entry bytes per pak so undo is local to the entry — `PakFile.to_bytes` re-derives offsets on demand, so we never need to snapshot the full directory.
 
 ### 11.6 Acceptance criteria
 
-- Opening the Graphics → Portraits page on Dusk shows a thumbnail grid of every portrait in `SPR_CHR.PAK` within 2 s of nav click.
-- Selecting Julia's portrait (index 1566) and clicking "Export PNG…" produces a PNG identical to `rom_files/ncgr_to_png.py one` on the same NCGR.
-- Replacing that PNG with an unedited copy of itself, saving the ROM, and loading in DeSmuME shows the portrait byte-for-byte unchanged (no row shift — i.e. RAHC+0x12 preserved).
-- Replacing with an edited PNG (Julia hair recoloured) shows the new colors in-game.
-- Ctrl+Z after a replacement restores the previous payload; saving after undo produces a ROM byte-identical to a save with no replacement at all.
-- Save → reopen → the replacement persists (PAK directory was rewritten correctly).
+- **Phase A/B (met).** Opening Sprites → Sprite Sheets renders any of the 1627 Dusk entries without crashing. `min_tiles_required` matches the CHR tile count for all 1627 entries. Entries 0006, 0230, 1566 (the user's reference set) preview correctly in their respective 2D / 1D-128 / 1D-128 mapping modes. Entries 0943, 0944 (8bpp + 16-color-bank NCLR) render via the concatenated palette path.
+- **Phase C (met).** PNG export ships; NCGR+NCLR export ships and round-trips byte-identically through the matching import path (verified by `SpritePakReplaceRoundtripTests.test_replace_with_self_is_byte_identical`).
+- **Phase D (met).** Three import paths shipped (PNG match-palette / PNG new-palette / NCGR+NCLR), all wired through `ReplaceSpriteCommand` for undo. `test_sprite_ncer.SpritePakReplaceRoundtripTests` covers the no-op replace producing byte-identical paks.
+- **Phase E (met).** `_apply_sprite_pak_splice` rebuilds dirty paks and splices them back. Replacement persists across Save → reopen via the `.romproj` v3 sprite_edits channel (verified by `test_project_sprite_edits.test_chr_entry_replacement_round_trips`).
+- **Phase F (met).** Multi-pak grow correctness verified by `test_sprite_ncer.SpritePakGrowSpliceTests` (descending-order shift, downstream FAT shift, byte-content equality).
+- **Phase G (met — structural).** OAM overlay + structural metadata labels shipped. Named-category labels deferred per the row's note — acceptance for that piece is on hold until the research notes repo grows a sprite-ID → role table.
 
 ---
 
@@ -505,9 +509,9 @@ Editing the same pak entry multiple times in one session collapses to a single r
 | **A — Port FAT helpers** ✅ **Done** | `digimon_core/fat.py` ships `find_container`, `signed_align`, `splice_range`, `resize_fat_entry`. `digimon_core/tests/test_fat.py` covers `signed_align` edge cases, synthetic splice growth/shrink/same-size, vanilla-ROM `find_container` (Dusk + Dawn) including cross-file-range rejection, the `header[0x80] == max(FAT.end)` invariant, and byte-exact equivalence with an in-test port of `inject_test.py`'s arithmetic across same-size / growth / shrink / no-op injections. Notable design choice: `resize_fat_entry` recomputes `header[0x80]` as `max(FAT.end)` rather than `len(rom)` (which is what `inject_test.py` did); the latter would inflate by the trailing cart-FF padding and break §12.3's trim boundary. | 0.5 d |
 | **B — `replace_pak_entry` + MSG.PAK** ✅ **Done** | `digimon_core/pak.py` ships `PakFile` (parse / `replace_entry` / `to_bytes` with 4-byte inter-entry alignment preserved) plus MSG.PAK sub-format helpers `parse_msgpak_entry_groups` + `rebuild_msgpak_entry`. `editor/session.py` adds `_apply_msgpak_grow`: it groups over-budget MSG.PAK strings by `(entry_idx, group_idx)`, rebuilds only the affected groups (re-encoding every string in each via the new `GameString.encoded_bytes_for_grow()`, which keeps the original FF FF / FE FF terminator so group structure is preserved), then calls `fat.find_container` + `splice_range` + `resize_fat_entry` to ripple the size delta through the FAT and header. `serialize_all` skips over-budget MSG.PAK strings (their in-place writes would corrupt neighbours); `over_budget_strings()` filters MSG.PAK so the Save gate no longer blocks. `digimon_core/tests/test_pak.py` (9 tests) covers parse / round-trip / replace / grow shift / `entry_index_at` / group parse + rebuild. `digimon_core/tests/test_msgpak_grow.py` (5 × Dusk + Dawn = 10 tests) covers vanilla-save FAT preservation, vanilla-save trim invariant, single-string grow with downstream FAT shift + content equality, multi-entry grow round-trip via text-set comparison, and gate exclusion. | 0.5 d |
 | **C — Trailing FF trim** ✅ **Done** | `RomSession._trim_trailing_padding` runs at the end of `serialize_all_with_qol`: reads `header[0x80]`, deletes bytes past it, and raises `RuntimeError` if any non-`0xFF` byte sits in the trimmed range (the §12.5 safety check — ensures the trim never silently swallows real data). Verified by `test_msgpak_grow.test_vanilla_save_trims_to_max_fat_end`: `len(out) == header[0x80] == max(FAT.end)` on a no-edit save of both Dusk and Dawn. | 0.25 d |
-| **D — Sprite save path** | Hook §11 phases E–F into the same `RomSession.replace_pak_entry` helper so the sprite editor doesn't need its own ROM-level FAT-shifting code. | shared with §11 |
+| **D — Sprite save path** ✅ **Done** | `editor/session.py`'s `_apply_sprite_pak_splice` runs the same `fat.splice_range` + `fat.resize_fat_entry` flow MSG.PAK uses. Shared multi-pak ordering (highest-offset first) verified by `test_sprite_ncer.SpritePakGrowSpliceTests.test_multi_pak_grow_handles_descending_order`. | shared with §11 |
 | **E — Dawn US verification** ✅ **Done** | `test_msgpak_grow.DawnUsMsgpakGrow` runs the full Phase B/C suite against Dawn US (vanilla trim, FAT preservation on no-edit save, single-string grow with downstream FAT shift + content equality, multi-entry grow). User confirmed empirically that Dawn behaves identically to Dusk through the grow path; the §12 save path is unblocked for both regions. | 0.25 d |
-| **F — `.romproj` string_edits channel** ✅ **Done** | `.romproj` bumped to `format_version=2` (v1 still loads, with empty string_edits). `RomSession.msgpak_string_edits()` snapshots over-budget MSG.PAK strings as `(region, vanilla_offset, text)` triples on Save Project; `apply_string_edits()` replays them on Open Project after the byte diff + reparse. Rationale: `serialize_all` skips over-budget MSG.PAK strings (an in-place write would corrupt neighbours), so they don't appear in the equal-length byte diff — without this channel, Save Project silently dropped them. Compaction is still ROM-save-only; the project file stays offset-agnostic. `digimon_core/tests/test_project_msgpak_grow.py` (5 × Dusk + Dawn = 10 tests) covers v1 backward-compat load, over-budget round-trip (save project → reload → serialize_all_with_qol byte-equal to original session), in-budget edits riding the byte diff with empty string_edits, and `apply_string_edits` rejecting unknown region / offset. | 0.25 d |
+| **F — `.romproj` string_edits + sprite_edits channels** ✅ **Done** | `.romproj` bumped to `format_version=2` for `string_edits`, then `=3` for `sprite_edits` (older versions still load, with their newer channels empty). `RomSession.msgpak_string_edits()` snapshots over-budget MSG.PAK strings as `(region, vanilla_offset, text)` triples; `sprite_pak_edits()` snapshots replaced sprite pak entries as `(pak_name, entry_idx, bytes)` triples compared against a freshly-parsed vanilla PakFile. On open, `apply_string_edits()` and `apply_sprite_pak_edits()` replay them after the byte diff + reparse. Rationale: `serialize_all` skips over-budget MSG.PAK strings (in-place write would corrupt neighbours), and `serialize_all(skip_sprite_splice=True)` is used at save-project time so a grown sprite doesn't fat-shift every later file into the byte diff (which would bloat the .romproj — most users save/share via project files). Compaction is still ROM-save-only; the project file stays offset-agnostic. `digimon_core/tests/test_project_msgpak_grow.py` (10 tests) and `test_project_sprite_edits.py` (8 tests) cover backward-compat load, round-trip byte-equivalence vs. original session, no-op skip, and rejection of unknown region / out-of-range entry index. | 0.5 d |
 
 ### 12.5 Risks
 

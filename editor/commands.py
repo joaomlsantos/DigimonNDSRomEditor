@@ -7,7 +7,7 @@ of changing a single scalar field on a model object; more specialized commands
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from PySide6.QtGui import QUndoCommand
 
@@ -97,3 +97,53 @@ class ReskinFixedEnemyCommand(QUndoCommand):
         self._sprite_entry.main_sprite = self._old_main
         self._sprite_entry.upperscreen_sprites = self._old_upper
         self._str_entry.value = self._old_str
+
+
+class ReplaceSpriteCommand(QUndoCommand):
+    """Atomic replace of one or more SPR_*.PAK entries.
+
+    A sprite import touches one (CHR-only PNG path) or two (CHR + PAL
+    NCGR+NCLR path) pak entries that must succeed or roll back together —
+    a half-applied CHR with a stale palette would render garbage. Each
+    ``(pak_name, entry_idx, new_bytes)`` tuple captures the pre-mutation
+    bytes from the live PakFile so redo/undo flip them all atomically.
+
+    Marks each touched pak dirty on redo so :meth:`RomSession.serialize_all`
+    knows to splice it back onto the ROM at save time. ``on_change`` is
+    invoked after every flip so the browser can re-render its preview.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        replacements: List[Tuple[str, int, bytes]],
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._on_change = on_change
+        # Snapshot in __init__ (before push() triggers redo) so old_bytes
+        # reflects the live state — could be vanilla or a prior edit.
+        self._ops: List[Tuple[str, int, bytes, bytes]] = []
+        for pak_name, idx, new_bytes in replacements:
+            pak_obj = session.sprite_pak(pak_name)
+            old_bytes = pak_obj.entries[idx]
+            self._ops.append((pak_name, idx, old_bytes, bytes(new_bytes)))
+
+    def redo(self) -> None:
+        for pak_name, idx, _old, new in self._ops:
+            self._session.sprite_pak(pak_name).replace_entry(idx, new)
+            self._session.mark_sprite_pak_dirty(pak_name)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        for pak_name, idx, old, _new in self._ops:
+            self._session.sprite_pak(pak_name).replace_entry(idx, old)
+            # Keep dirty flag set — undo to vanilla still means the pak's
+            # serialization may differ from a fresh PakFile, and the splice
+            # is cheap (a no-op when bytes match).
+            self._session.mark_sprite_pak_dirty(pak_name)
+        if self._on_change is not None:
+            self._on_change()

@@ -28,13 +28,16 @@ from digimon_core import qol as qol_module
 
 # v1: diffs + qol only.
 # v2: adds string_edits channel for over-budget MSG.PAK strings.
-# Loader accepts both; saver always writes the current version.
-FORMAT_VERSION = 2
-_ACCEPTED_VERSIONS = (1, 2)
+# v3: adds sprite_edits channel for per-entry sprite PAK replacements
+#     (keeps the byte diff small even when a sprite grows past its FAT slot).
+# Loader accepts every prior version; saver always writes the current version.
+FORMAT_VERSION = 3
+_ACCEPTED_VERSIONS = (1, 2, 3)
 EDITOR_VERSION = "0.1.0"
 
 
 StringEdit = Tuple[str, int, str]  # (region_id, vanilla_offset, new_text)
+SpriteEdit = Tuple[str, int, bytes]  # (pak_name, entry_idx, new_entry_bytes)
 
 
 def vanilla_sha256(rom_bytes: bytes) -> str:
@@ -95,12 +98,16 @@ def save_project(
     edited_rom_data: bytes,
     qol: qol_module.QolSettings,
     string_edits: List[StringEdit] = (),
+    sprite_edits: List[SpriteEdit] = (),
 ) -> None:
     """Write a .romproj at `path`.
 
-    `edited_rom_data` should be `session.serialize_all()` — i.e. without QoL
-    patches applied — so QoL state lives only in the `qol` field and the byte
-    diff captures only deliberate model edits.
+    `edited_rom_data` should be `session.serialize_all(skip_sprite_splice=True)`
+    — i.e. without QoL patches and without sprite PAK splices applied — so QoL
+    state lives only in the `qol` field, sprite changes live only in
+    `sprite_edits`, and the byte diff captures only deliberate model edits.
+    Skipping the sprite splice keeps the diff small even when a grown sprite
+    would otherwise trigger a fat-shift across every later file.
 
     `string_edits` carries over-budget MSG.PAK strings as
     ``(region_id, vanilla_offset, new_text)`` triples. ``serialize_all`` skips
@@ -108,6 +115,12 @@ def save_project(
     corrupting neighbours), so they wouldn't otherwise appear in the byte
     diff. On reopen they're applied to the reparsed model after the byte diff
     lands, and the next ROM save runs them through the §12 grow path.
+
+    `sprite_edits` carries replaced sprite PAK entries as
+    ``(pak_name, entry_idx, new_entry_bytes)`` triples. On reopen they're
+    applied to the session via ``apply_sprite_pak_edits`` after the byte diff
+    and string edits land; the next ROM save runs them through the normal
+    sprite splice path.
     """
     diffs = compute_byte_diff(vanilla_rom_data, edited_rom_data)
     payload = {
@@ -124,15 +137,21 @@ def save_project(
             {"region": region, "offset": off, "text": text}
             for region, off, text in string_edits
         ],
+        "sprite_edits": [
+            {"pak": pak, "idx": idx, "bytes": base64.b64encode(data).decode("ascii")}
+            for pak, idx, data in sprite_edits
+        ],
     }
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def load_project(path: str) -> dict:
     """Read the project JSON. Returns a dict with diffs decoded into bytes,
-    qol parsed into a QolSettings instance, and string_edits as a list of
-    ``(region_id, vanilla_offset, new_text)`` tuples (empty for v1 projects).
-    Caller resolves the vanilla ROM and verifies the hash separately."""
+    qol parsed into a QolSettings instance, string_edits as a list of
+    ``(region_id, vanilla_offset, new_text)`` tuples (empty for v1 projects),
+    and sprite_edits as a list of ``(pak_name, entry_idx, new_entry_bytes)``
+    tuples (empty for v1/v2 projects). Caller resolves the vanilla ROM and
+    verifies the hash separately."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     fmt = data.get("format_version")
     if fmt not in _ACCEPTED_VERSIONS:
@@ -148,5 +167,9 @@ def load_project(path: str) -> dict:
     data["string_edits"] = [
         (entry["region"], entry["offset"], entry["text"])
         for entry in data.get("string_edits", [])
+    ]
+    data["sprite_edits"] = [
+        (entry["pak"], entry["idx"], base64.b64decode(entry["bytes"]))
+        for entry in data.get("sprite_edits", [])
     ]
     return data

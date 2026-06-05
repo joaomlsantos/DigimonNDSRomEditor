@@ -16,7 +16,7 @@ PKG_PARENT = os.path.abspath(os.path.join(HERE, "..", ".."))
 if PKG_PARENT not in sys.path:
     sys.path.insert(0, PKG_PARENT)
 
-from digimon_core import fnt, pak, rom  # noqa: E402
+from digimon_core import fnt, msgpak, pak, rom  # noqa: E402
 
 
 ROM_DIR = r"C:\Workspace\digimon_stuffs\rom_files"
@@ -118,7 +118,7 @@ class MsgpakEntryFormatTests(unittest.TestCase):
 
     def test_parse_entry_0_groups(self):
         # Entry 0: sub-header at offset 0, first u32 = 0x11C => 71 groups.
-        groups = pak.parse_msgpak_entry_groups(self.pak.original_entry(0))
+        groups = msgpak.parse_entry_groups(self.pak.original_entry(0))
         self.assertEqual(len(groups), 71)
         # First group starts at the sub-header end (0x11C).
         self.assertEqual(groups[0][0], 0x11C)
@@ -130,7 +130,7 @@ class MsgpakEntryFormatTests(unittest.TestCase):
 
     def test_groups_end_in_ff_ff(self):
         # Each group's last 2 bytes should be FF FF.
-        groups = pak.parse_msgpak_entry_groups(self.pak.original_entry(0))
+        groups = msgpak.parse_entry_groups(self.pak.original_entry(0))
         e = self.pak.original_entry(0)
         for s, end in groups:
             self.assertEqual(e[end - 2:end], b"\xFF\xFF",
@@ -139,22 +139,22 @@ class MsgpakEntryFormatTests(unittest.TestCase):
     def test_rebuild_entry_byte_identical_when_groups_unchanged(self):
         # Take entry 0's groups verbatim, rebuild, expect byte-identical.
         e = self.pak.original_entry(0)
-        groups = pak.parse_msgpak_entry_groups(e)
+        groups = msgpak.parse_entry_groups(e)
         payloads = [e[s:end] for s, end in groups]
-        rebuilt = pak.rebuild_msgpak_entry(payloads)
+        rebuilt = msgpak.rebuild_entry(payloads)
         self.assertEqual(rebuilt, e)
 
     def test_rebuild_entry_grows_one_group(self):
         e = self.pak.original_entry(0)
-        groups = pak.parse_msgpak_entry_groups(e)
+        groups = msgpak.parse_entry_groups(e)
         payloads = [e[s:end] for s, end in groups]
         # Grow group 2 by 8 bytes (just append FF FF padding before the
         # original terminator and replace its terminator — we don't actually
         # need a valid string, just a longer payload).
         grown = b"\xFF\xFF" * 4 + payloads[2]
         payloads[2] = grown
-        rebuilt = pak.rebuild_msgpak_entry(payloads)
-        new_groups = pak.parse_msgpak_entry_groups(rebuilt)
+        rebuilt = msgpak.rebuild_entry(payloads)
+        new_groups = msgpak.parse_entry_groups(rebuilt)
         # Same group count, group 2 is 8 bytes longer, downstream offsets shifted.
         self.assertEqual(len(new_groups), len(groups))
         old_s2, old_e2 = groups[2]

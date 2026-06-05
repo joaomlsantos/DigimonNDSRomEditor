@@ -62,6 +62,7 @@ from .widgets.habitats_editor import HabitatsWorldmapEditor
 from .widgets.move_editor import MoveEditor, move_issues
 from .widgets.qol_editor import QolEditor
 from .widgets.quest_editor import QuestEditor
+from .widgets.sprite_browser import SpriteBrowser
 from .widgets.standard_digivolution_editor import (
     StandardDigivolutionEditor,
     std_digivolution_issues,
@@ -126,6 +127,9 @@ NAV_GROUPS = [
         ("ARM9", "strings_bucket:arm9"),
         ("Overlays", "strings_bucket:overlay"),
         ("MSG.PAK", "strings_bucket:msgpak"),
+    ]),
+    ("Sprites", [
+        ("Sprite Sheets", "sprite_browser"),
     ]),
     ("Settings", [
         ("QoL Toggles", "qol_settings"),
@@ -639,6 +643,10 @@ class MainWindow(QMainWindow):
             # diff — replay them onto the reparsed model so the editor sees
             # the user's text and the next ROM save runs the grow path.
             session.apply_string_edits(project["string_edits"])
+            # Sprite PAK replacements live in their own channel so a grown
+            # sprite doesn't fat-shift every later file into the byte diff.
+            # Replay them so the next save splices them back in.
+            session.apply_sprite_pak_edits(project["sprite_edits"])
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Failed to load project", str(exc))
             return
@@ -678,9 +686,12 @@ class MainWindow(QMainWindow):
                 path,
                 rom_version=self.session.version,
                 vanilla_rom_data=self.session.original_rom_data,
-                edited_rom_data=bytes(self.session.serialize_all()),
+                edited_rom_data=bytes(
+                    self.session.serialize_all(skip_sprite_splice=True)
+                ),
                 qol=self.session.qol,
                 string_edits=self.session.msgpak_string_edits(),
+                sprite_edits=self.session.sprite_pak_edits(),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Failed to save project", str(exc))
@@ -992,6 +1003,8 @@ class MainWindow(QMainWindow):
             return FarmItemEditor(self.session.farm_items, self.undo_stack)
         if key == "qol_settings":
             return QolEditor(self.session.qol, self.undo_stack)
+        if key == "sprite_browser":
+            return SpriteBrowser(self.session, self.undo_stack)
         if key.startswith("strings_bucket:"):
             bucket = key.split(":", 1)[1]
             prefix = _STRING_BUCKET_PREFIXES.get(bucket)

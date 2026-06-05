@@ -104,7 +104,7 @@ class _ProjectMsgpakBase:
             )
             loaded = project_file.load_project(proj_path)
 
-        self.assertEqual(loaded["format_version"], 2)
+        self.assertEqual(loaded["format_version"], project_file.FORMAT_VERSION)
         # string_edits must survive the JSON round-trip verbatim.
         self.assertIn(
             ("msgpak_all", original_offset, new_text), loaded["string_edits"],
