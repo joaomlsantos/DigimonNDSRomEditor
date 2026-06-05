@@ -33,10 +33,23 @@ _PREVIEW_MAX = 60  # chars shown in the list preview
 
 
 def _preview(text: str) -> str:
-    flat = text.replace("[BR]", " ").replace("[END]", " / ")
+    flat = text.replace("[BR]", " ").replace("\n", " ").replace("[END]", " / ")
     if len(flat) > _PREVIEW_MAX:
         return flat[:_PREVIEW_MAX - 1] + "…"
     return flat
+
+
+def _to_display(text: str) -> str:
+    """Model → text-edit form: `[BR]` becomes a real newline so the user
+    sees one line per visual break."""
+    return text.replace("[BR]", "\n")
+
+
+def _to_canonical(text: str) -> str:
+    """Text-edit → model form: real newlines (and CR/LF combos) become
+    `[BR]` so the model stays in one canonical form regardless of how the
+    line break was entered (typed `[BR]`, pressed Enter, pasted with \r\n)."""
+    return text.replace("\r\n", "[BR]").replace("\r", "[BR]").replace("\n", "[BR]")
 
 
 class StringEditor(QWidget):
@@ -46,10 +59,13 @@ class StringEditor(QWidget):
         self,
         strings_in_region: List[model.GameString],
         undo_stack: QUndoStack,
+        *,
+        growable: bool = False,
     ):
         super().__init__()
         self._strings = strings_in_region
         self._undo_stack = undo_stack
+        self._growable = growable
         self._current: Optional[model.GameString] = None
 
         # Debounce the undo-stack push so each keystroke doesn't trigger a
@@ -185,11 +201,21 @@ class StringEditor(QWidget):
             self._text_edit.setEnabled(False)
             return
         self._text_edit.setEnabled(True)
-        self._offset_label.setText(
-            f"Offset 0x{s.offset:08X} — budget {s.original_byte_length} bytes"
-        )
+        # ARM9/overlay strings have a per-string byte budget baked into the
+        # ROM (their pointers are hardcoded). MSG.PAK strings have an
+        # empirical 1024-byte per-string engine cap (textbox renderer
+        # corrupts past it); the original byte budget no longer applies
+        # because the entry is rebuilt at save time.
+        if self._growable:
+            self._offset_label.setText(
+                f"Offset 0x{s.offset:08X} — MSG.PAK string (cap {model.MSGPAK_STRING_CAP} bytes)"
+            )
+        else:
+            self._offset_label.setText(
+                f"Offset 0x{s.offset:08X} — budget {s.original_byte_length} bytes"
+            )
         with QSignalBlocker(self._text_edit):
-            self._text_edit.setPlainText(s.text)
+            self._text_edit.setPlainText(_to_display(s.text))
         self._refresh_budget_for(s.text)
 
     def _on_text_changed(self) -> None:
@@ -205,7 +231,7 @@ class StringEditor(QWidget):
         self._commit_timer.stop()
         if self._current is None:
             return
-        new_text = self._text_edit.toPlainText()
+        new_text = _to_canonical(self._text_edit.toPlainText())
         if new_text == self._current.text:
             return
         cmd = SetAttrCommand(
@@ -221,9 +247,11 @@ class StringEditor(QWidget):
         if self._current is None:
             return
         # Sync the editor field in case undo/redo changed it from outside.
-        if self._text_edit.toPlainText() != self._current.text:
+        # Model is canonical (`[BR]`), edit shows display form (`\n`).
+        display = _to_display(self._current.text)
+        if self._text_edit.toPlainText() != display:
             with QSignalBlocker(self._text_edit):
-                self._text_edit.setPlainText(self._current.text)
+                self._text_edit.setPlainText(display)
         # Refresh the list preview for the current row.
         row = self._string_list.currentRow()
         if row >= 0:
@@ -239,11 +267,35 @@ class StringEditor(QWidget):
         self._refresh_budget_for(self._current.text)
 
     def _refresh_budget_for(self, text: str) -> None:
-        """Update the budget meter from a raw text value (no model lookup)."""
+        """Update the budget meter from a raw text value (no model lookup).
+
+        For MSG.PAK strings the meter tracks the live encoded size against
+        the 1024-byte per-string engine cap. For ARM9/overlay strings the
+        meter tracks the per-string byte budget as before.
+        """
         if self._current is None:
             self._budget_label.setText("")
             return
-        budget = self._current.original_byte_length
+        s = self._current
+        if self._growable:
+            try:
+                # +2 for the terminator encoded_bytes_for_grow would append.
+                used = core_strings.byte_length(text, terminator=None) + 2
+            except core_strings.UnknownCharError as exc:
+                self._budget_label.setText(f"Encode error: {exc}")
+                self._budget_label.setStyleSheet("color: #b00; font-weight: bold;")
+                return
+            cap = model.MSGPAK_STRING_CAP
+            free = cap - used
+            label = f"{used} / {cap} bytes — {free} free"
+            if used > cap:
+                self._budget_label.setStyleSheet("color: #b00; font-weight: bold;")
+                label = f"{used} / {cap} bytes — OVER CAP by {-free}"
+            else:
+                self._budget_label.setStyleSheet("color: gray;")
+            self._budget_label.setText(label)
+            return
+        budget = s.original_byte_length
         try:
             # +2 for the terminator we'll write back (either original or [END]).
             used = core_strings.byte_length(text, terminator=None) + 2
@@ -300,11 +352,13 @@ def string_issues(
 ) -> List[ValidationIssue]:
     """Footer-level issues for in-game text.
 
-    Reports any string whose encoded bytes exceed its original byte budget.
-    Pointers to each string's offset are baked into the ROM and aren't
-    repointed by the editor, so an over-budget write would clobber the next
-    field on disk. The save guard refuses to write while any of these exist;
-    surfacing them in the footer lets the user find and shorten them.
+    ARM9 / overlay strings: reports any string whose encoded bytes exceed
+    their original byte budget (hardcoded pointers, so an over-budget
+    write would clobber the next field on disk).
+
+    MSG.PAK strings: reports any string whose encoded size exceeds the
+    empirical 1024-byte per-string engine cap (the textbox renderer
+    corrupts past it, regardless of content).
     """
     issues: List[ValidationIssue] = []
     for region_id, strings in string_regions.items():
@@ -313,6 +367,28 @@ def string_issues(
             continue
         section_label, _ = _BUCKET_LABELS[bucket]
         editor_key = f"strings_bucket:{bucket}"
+        if bucket == "msgpak":
+            cap = model.MSGPAK_STRING_CAP
+            for s in strings:
+                # Fast skip: unmodified strings fit by vanilla construction.
+                if s.text is s._initial_text or s.text == s._initial_text:
+                    continue
+                if len(s.text) * 2 + 2 <= cap:
+                    continue
+                size = len(s.encoded_bytes_for_grow())
+                if size <= cap:
+                    continue
+                preview = _preview(s.text)
+                issues.append(ValidationIssue(
+                    section=section_label,
+                    category="Over cap",
+                    message=(
+                        f"0x{s.offset:08X}: {size} / {cap} bytes — {preview}"
+                    ),
+                    editor_key=editor_key,
+                    record_id=s.offset,
+                ))
+            continue
         for s in strings:
             # This collector runs on every undo-stack tick (every keystroke
             # editor-wide), so the per-string check must stay cheap. Parsed

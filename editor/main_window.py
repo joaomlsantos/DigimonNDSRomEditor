@@ -635,6 +635,10 @@ class MainWindow(QMainWindow):
                 patched_data=bytes(patched),
                 qol_settings=project["qol"],
             )
+            # Over-budget MSG.PAK edits weren't representable in the byte
+            # diff — replay them onto the reparsed model so the editor sees
+            # the user's text and the next ROM save runs the grow path.
+            session.apply_string_edits(project["string_edits"])
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Failed to load project", str(exc))
             return
@@ -676,6 +680,7 @@ class MainWindow(QMainWindow):
                 vanilla_rom_data=self.session.original_rom_data,
                 edited_rom_data=bytes(self.session.serialize_all()),
                 qol=self.session.qol,
+                string_edits=self.session.msgpak_string_edits(),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Failed to save project", str(exc))
@@ -807,32 +812,60 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _save_guard_ok(self) -> bool:
-        """Block save when any string is over its byte budget.
+        """Block save when an ARM9/overlay string overruns its byte budget
+        OR a MSG.PAK string exceeds the 1024-byte engine cap.
 
-        Pointers to each string's offset are fixed in the ROM; an over-budget
-        encoded string would overflow into the next field on disk. Returns
+        ARM9 / overlay strings have hardcoded code pointers, so an
+        over-budget encoded string would overflow into the next field on
+        disk — checked via ``over_budget_strings()``. MSG.PAK strings ride
+        the §12 grow path so per-slot budgets don't apply, but the
+        empirical 1024-byte engine cap (textbox renderer corrupts past it)
+        still does — checked via ``over_cap_msgpak_strings()``. Returns
         True if save can proceed.
         """
         if self.session is None:
             return False
         bad = self.session.over_budget_strings()
-        if not bad:
-            return True
-        sample_lines = []
-        for s in bad[:5]:
-            preview = s.text.replace("[BR]", " ")[:60]
-            sample_lines.append(
-                f"  • 0x{s.offset:08X}: {s.encoded_length()} / {s.original_byte_length} bytes — {preview!r}"
+        if bad:
+            sample_lines = []
+            for s in bad[:5]:
+                preview = s.text.replace("[BR]", " ")[:60]
+                sample_lines.append(
+                    f"  • 0x{s.offset:08X}: {s.encoded_length()} / {s.original_byte_length} bytes — {preview!r}"
+                )
+            more = f"\n  …and {len(bad) - 5} more" if len(bad) > 5 else ""
+            QMessageBox.critical(
+                self,
+                "Cannot save: strings over budget",
+                f"{len(bad)} string(s) exceed their original byte budget and can't be saved "
+                f"without misaligning ROM pointers.\n\n" + "\n".join(sample_lines) + more +
+                "\n\nShorten or rewrite the offending strings, then save again.",
             )
-        more = f"\n  …and {len(bad) - 5} more" if len(bad) > 5 else ""
-        QMessageBox.critical(
-            self,
-            "Cannot save: strings over budget",
-            f"{len(bad)} string(s) exceed their original byte budget and can't be saved "
-            f"without misaligning ROM pointers.\n\n" + "\n".join(sample_lines) + more +
-            "\n\nShorten or rewrite the offending strings, then save again.",
-        )
-        return False
+            return False
+        over_cap = self.session.over_cap_msgpak_strings()
+        if over_cap:
+            from digimon_core.model import MSGPAK_STRING_CAP
+            sample_lines = []
+            for s in over_cap[:5]:
+                size = len(s.encoded_bytes_for_grow())
+                preview = s.text.replace("[BR]", " ")[:60]
+                sample_lines.append(
+                    f"  • 0x{s.offset:08X}: {size} / {MSGPAK_STRING_CAP} bytes — {preview!r}"
+                )
+            more = (
+                f"\n  …and {len(over_cap) - 5} more"
+                if len(over_cap) > 5 else ""
+            )
+            QMessageBox.critical(
+                self,
+                "Cannot save: MSG.PAK string over engine cap",
+                f"{len(over_cap)} MSG.PAK string(s) exceed the 1024-byte engine "
+                f"cap. The in-game textbox renderer corrupts past this size "
+                f"regardless of content.\n\n" + "\n".join(sample_lines) + more +
+                "\n\nShorten the offending strings, then save again.",
+            )
+            return False
+        return True
 
     def _on_save(self) -> None:
         if self.session is None:
@@ -969,7 +1002,10 @@ class MainWindow(QMainWindow):
                 if region_id.startswith(prefix):
                     merged.extend(region_strings)
             merged.sort(key=lambda s: s.offset)
-            return StringEditor(merged, self.undo_stack)
+            # MSG.PAK rides the §12 grow path on save, so over-budget edits
+            # aren't an error here — let the editor show informational text
+            # rather than a red warning.
+            return StringEditor(merged, self.undo_stack, growable=(bucket == "msgpak"))
         return None
 
     # ---- cross-reference navigation --------------------------------------

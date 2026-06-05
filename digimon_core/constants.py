@@ -100,6 +100,16 @@ STRING_BATTLE_TABLE_OFFSET = {
 # same offsets after a save.
 #
 # Offsets sourced from research_docs/data locations_*.txt; Dawn map is TBD.
+# MSG.PAK FAT-listed file start, used to translate the hardcoded msgpak_*
+# entries in STRING_REGIONS into file-relative offsets at load time. The
+# per-version dimension goes away once a region is keyed by file path +
+# within-file offset rather than ROM-absolute; see digimon_core/loaders.py.
+MSGPAK_FILE_START = {
+    "DUSK_US": 0x0117E400,
+    "DAWN_US": 0x0117E200,
+}
+
+
 STRING_REGIONS = {
     "DUSK_US": [
         ("arm9_wild_battle_locations", 0x000F3434, 0x000F34A4, "Wild battle locations"),

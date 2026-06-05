@@ -11,9 +11,9 @@ from __future__ import annotations
 import os
 import shutil
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from digimon_core import constants, loaders, model, qol as qol_module, rom
+from digimon_core import constants, fat, fnt, loaders, model, pak, qol as qol_module, rom
 
 
 @dataclass
@@ -113,12 +113,16 @@ class RomSession:
             version=version,
             original_rom_data=vanilla_data,
         )
-        session.base_digimon = loaders.loadBaseDigimonInfo(version, parse_data)
-        session.enemy_digimon = loaders.loadEnemyDigimonInfo(version, parse_data)
+        # Parse FNT/FAT once per session and pass through to every FAT-listed
+        # loader (dm/, en/, ec/, eq/, sk/, MSG.PAK). Saves ~6 redundant FAT
+        # walks. ARM9 / overlay loaders ignore it.
+        file_table = fnt.FileTable.from_rom(bytes(parse_data))
+        session.base_digimon = loaders.loadBaseDigimonInfo(version, parse_data, file_table=file_table)
+        session.enemy_digimon = loaders.loadEnemyDigimonInfo(version, parse_data, file_table=file_table)
         session.moves = loaders.loadMoveData(version, parse_data)
         session.quests = loaders.loadQuestData(version, parse_data)
-        session.encounter_rewards = loaders.loadEncounterRewardData(version, parse_data)
-        session.standard_digivolutions = loaders.loadStandardDigivolutions(version, parse_data)
+        session.encounter_rewards = loaders.loadEncounterRewardData(version, parse_data, file_table=file_table)
+        session.standard_digivolutions = loaders.loadStandardDigivolutions(version, parse_data, file_table=file_table)
         session.armor_digivolutions = loaders.loadArmorDigivolutions(version, parse_data)
         session.dna_digivolutions, _ = loaders.loadDnaDigivolutions(version, parse_data)
         session.sprite_map = loaders.loadSpriteMapTable(version, parse_data)
@@ -126,11 +130,11 @@ class RomSession:
         session.habitats_worldmap = loaders.loadHabitatsWorldmap(version, parse_data)
         session.farm_terrains = loaders.loadFarmTerrains(version, parse_data)
         session.starters = loaders.loadStarters(version, parse_data)
-        session.wild_encounter_areas = loaders.loadWildEncounterAreas(version, parse_data)
-        session.equipment = loaders.loadEquipment(version, parse_data)
+        session.wild_encounter_areas = loaders.loadWildEncounterAreas(version, parse_data, file_table=file_table)
+        session.equipment = loaders.loadEquipment(version, parse_data, file_table=file_table)
         session.consumables = loaders.loadConsumables(version, parse_data)
         session.farm_items = loaders.loadFarmItems(version, parse_data)
-        session.string_regions = loaders.loadAllStringRegions(version, parse_data)
+        session.string_regions = loaders.loadAllStringRegions(version, parse_data, file_table=file_table)
         # Seed QoL parameter defaults from the actual bytes at their ARM-imm
         # offsets so the editor displays the current value (vanilla on a fresh
         # ROM, the user's previously-patched value otherwise). from_project()
@@ -176,8 +180,21 @@ class RomSession:
             obj.writeToRom(out)
         for obj in self.farm_items:
             obj.writeToRom(out)
-        for region_strings in self.string_regions.values():
+        for region_id, region_strings in self.string_regions.items():
+            is_msgpak = region_id.startswith("msgpak_")
             for s in region_strings:
+                # MSG.PAK strings never go through in-place writeToRom: that
+                # path pads the slot with `\x00` to fill `original_byte_length`,
+                # and `00 00` decodes to `@SP@`. Within a MSG.PAK group there's
+                # no per-string offset, so the engine reads the padding as
+                # leading spaces on the *next* string. The §12 resize path
+                # rebuilds affected entries below using
+                # ``encoded_bytes_for_grow`` (no padding, original terminator)
+                # so the bytes flow cleanly into the next string. Unedited
+                # MSG.PAK strings keep their vanilla bytes from the initial
+                # ``bytearray(original_rom_data)`` copy.
+                if is_msgpak:
+                    continue
                 s.writeToRom(out)
         return out
 
@@ -190,21 +207,223 @@ class RomSession:
         """
         out = self.serialize_all()
         qol_module.apply_qol_patches(out, self.version, self.qol)
+        self._apply_msgpak_resize(out)
+        self._trim_trailing_padding(out)
         return out
 
     def over_budget_strings(self) -> List[model.GameString]:
-        """Strings whose encoded length exceeds their original byte budget.
+        """Non-MSG.PAK strings whose encoded length exceeds their byte budget.
 
-        Pointers to each string's offset are baked into the ROM and aren't
-        repointed by the editor, so writing an over-budget encoded string
-        would clobber whatever follows it. Save paths gate on this list.
+        ARM9 / overlay string regions have pointers hardcoded in code; an
+        over-budget write would clobber the next field on disk. MSG.PAK
+        strings, by contrast, sit in a pak whose entries can be resized
+        in-place (§12), so they're excluded here — the grow path handles
+        them at save time without a user-visible gate.
         """
         bad: List[model.GameString] = []
-        for region_strings in self.string_regions.values():
+        for region_id, region_strings in self.string_regions.items():
+            if region_id.startswith("msgpak_"):
+                continue
             for s in region_strings:
                 if not s.fits():
                     bad.append(s)
         return bad
+
+    def over_cap_msgpak_strings(self) -> List[model.GameString]:
+        """MSG.PAK strings whose encoded size exceeds the empirical 1024-byte
+        engine cap.
+
+        Vanilla strings top out at ~1004 bytes; past 1024 the DWDD textbox
+        renderer corrupts the box regardless of content. The cap is per
+        *string* (per dialogue textbox), not per pak entry — vanilla entries
+        routinely run tens of KB across many strings. The save gate refuses
+        to write while any string crosses 1024.
+        """
+        bad: List[model.GameString] = []
+        for region_id, region_strings in self.string_regions.items():
+            if not region_id.startswith("msgpak_"):
+                continue
+            for s in region_strings:
+                if len(s.encoded_bytes_for_grow()) > model.MSGPAK_STRING_CAP:
+                    bad.append(s)
+        return bad
+
+    def msgpak_string_edits(self) -> List[Tuple[str, int, str]]:
+        """Snapshot every edited MSG.PAK string for the .romproj string_edits
+        channel.
+
+        ``serialize_all`` no longer writes any MSG.PAK string in-place — the
+        in-place writer pads slots with `\x00` and that padding leaks into
+        the next string in the group as `@SP@`. The §12 resize path rebuilds
+        affected entries on ROM save, but project save returns the
+        vanilla-MSG.PAK pre-resize buffer, so MSG.PAK edits don't appear in
+        the byte diff at all. The string_edits channel carries them as
+        logical edits for Open Project to replay after reparse.
+        """
+        out: List[Tuple[str, int, str]] = []
+        for region_id, region_strings in self.string_regions.items():
+            if not region_id.startswith("msgpak_"):
+                continue
+            for s in region_strings:
+                if s.text != s._initial_text:
+                    out.append((region_id, s.offset, s.text))
+        return out
+
+    def apply_string_edits(self, edits: List[Tuple[str, int, str]]) -> None:
+        """Replay logical string edits from a .romproj onto the parsed model.
+
+        Each tuple is ``(region_id, vanilla_offset, new_text)``. The byte
+        diff has already restored in-budget edits via reparse; this fills in
+        the over-budget MSG.PAK strings the byte diff couldn't carry. Raises
+        ``KeyError`` if a region is gone or no string sits at ``offset``
+        (signals project/ROM version drift, not a recoverable state).
+        """
+        for region_id, off, text in edits:
+            region = self.string_regions.get(region_id)
+            if region is None:
+                raise KeyError(f"region {region_id!r} not present in this ROM")
+            match = next((s for s in region if s.offset == off), None)
+            if match is None:
+                raise KeyError(
+                    f"no string at offset 0x{off:x} in region {region_id!r}"
+                )
+            match.text = text
+
+    # --- §12 save-path helpers ---------------------------------------------
+
+    def _apply_msgpak_resize(self, out: bytearray) -> None:
+        """Rebuild MSG.PAK entries that contain *edited* strings (grow or
+        shrink), then splice the new MSG.PAK over its original FAT range.
+
+        Triggered for every edit, not just over-budget ones. In-place
+        ``writeToRom`` would pad shrunk slots with `\x00`, and `00 00`
+        decodes to `@SP@` — within a MSG.PAK group there's no per-string
+        offset, so the engine reads that padding as leading spaces on the
+        next string. Rebuilding the affected entry via
+        ``encoded_bytes_for_grow`` (no padding, original terminator) keeps
+        the next string's bytes flush against the previous string's
+        terminator. ``fat.resize_fat_entry`` then ripples the net size
+        delta through the FAT, which may be zero (pure rename), positive
+        (grow), or negative (shrink).
+        """
+        msgpak_strings: List[model.GameString] = []
+        for rid, ss in self.string_regions.items():
+            if rid.startswith("msgpak_"):
+                msgpak_strings.extend(ss)
+        if not msgpak_strings:
+            return
+        if all(s.text == s._initial_text for s in msgpak_strings):
+            return
+
+        file_table = fnt.FileTable.from_rom(bytes(out))
+        pak_start, pak_end = file_table.resolve("DAT/MSG.PAK")
+        msgpak_bytes = bytes(out[pak_start:pak_end])
+        p = pak.PakFile(msgpak_bytes)
+
+        # entry_idx -> set of group_idx that need a fresh rebuild
+        affected: Dict[int, set] = {}
+        # For each edited string, locate (entry, group) inside MSG.PAK.
+        # msgpak_all spans the whole file, so a small number of "strings"
+        # land in pak entry sub-headers or in the dev-tail past the last
+        # pak entry — those have no group to rebuild and edits to them
+        # can't be persisted via the resize path; skip silently.
+        for s in msgpak_strings:
+            if s.text == s._initial_text:
+                continue
+            file_off = s.offset - pak_start
+            try:
+                entry_idx = p.entry_index_at(file_off)
+            except ValueError:
+                continue
+            entry_start_in_pak, _ = p.original_entry_range(entry_idx)
+            off_in_entry = file_off - entry_start_in_pak
+            entry_bytes = p.original_entry(entry_idx)
+            groups = pak.parse_msgpak_entry_groups(entry_bytes)
+            g_idx = next(
+                (i for i, (gs, ge) in enumerate(groups)
+                 if gs <= off_in_entry < ge),
+                None,
+            )
+            if g_idx is None:
+                continue
+            affected.setdefault(entry_idx, set()).add(g_idx)
+
+        # Build a fast lookup: absolute ROM offset -> GameString.
+        by_offset = {s.offset: s for s in msgpak_strings}
+
+        for entry_idx, group_idxs in affected.items():
+            entry_bytes = p.original_entry(entry_idx)
+            entry_start_in_pak, _ = p.original_entry_range(entry_idx)
+            groups = pak.parse_msgpak_entry_groups(entry_bytes)
+            payloads: List[bytes] = []
+            for g_idx, (gs, ge) in enumerate(groups):
+                if g_idx not in group_idxs:
+                    payloads.append(entry_bytes[gs:ge])
+                    continue
+                # Re-encode every string in this group from its model.
+                group_start_abs = pak_start + entry_start_in_pak + gs
+                group_end_abs = pak_start + entry_start_in_pak + ge
+                new_payload = bytearray()
+                for off in range(group_start_abs, group_end_abs):
+                    s = by_offset.get(off)
+                    if s is None:
+                        continue
+                    new_payload.extend(s.encoded_bytes_for_grow())
+                payloads.append(bytes(new_payload))
+            p.replace_entry(entry_idx, pak.rebuild_msgpak_entry(payloads))
+
+        new_pak_bytes = p.to_bytes()
+        idx, _cs, ce = fat.find_container(out, pak_start, pak_end)
+        content_delta = len(new_pak_bytes) - (pak_end - pak_start)
+        aligned_shift = fat.splice_range(
+            out, pak_start, pak_end, ce, new_pak_bytes
+        )
+        fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
+
+    # Vanilla DWDD cart size. Saves pad/trim back to this whenever content
+    # genuinely fits, so the ROM image matches the physical cart layout that
+    # flashcarts and emulators expect.
+    _VANILLA_ROM_SIZE = 0x4000000
+
+    def _trim_trailing_padding(self, out: bytearray) -> None:
+        """Restore the ROM to its vanilla 0x4000000-byte cart size.
+
+        Vanilla DWDD ships as a 64 MiB cart with ~6.5 MB of trailing 0xFF
+        padding between the last used byte (``header[0x80]``) and EOF.
+        After model edits + the §12 resize the buffer may be shorter (pure
+        shrink dropped trailing padding) or longer (a grow pushed bytes
+        past 0x4000000). Either way we want the on-disk image to look like
+        the vanilla cart whenever content fits — pad up with 0xFF when
+        short, trim back when long, and only let the file genuinely exceed
+        0x4000000 when ``header[0x80]`` itself crosses that line.
+
+        Safety: any byte we'd trim away or write 0xFF over must already be
+        0xFF — otherwise some writer extended the ROM past its FAT bound
+        with real data and we'd silently drop it. Bail loudly in that case.
+        """
+        import struct as _struct
+        used = _struct.unpack_from("<I", out, 0x80)[0]
+        target = max(self._VANILLA_ROM_SIZE, used)
+        if len(out) > target:
+            tail = out[target:]
+            if any(b != 0xFF for b in tail):
+                raise RuntimeError(
+                    f"refusing to trim: non-0xFF bytes between target=0x{target:08x} "
+                    f"and EOF=0x{len(out):08x} — a writer extended the ROM past max(FAT.end)"
+                )
+            del out[target:]
+        elif len(out) < target:
+            out.extend(b"\xff" * (target - len(out)))
+        # Region between header[0x80] and target must be 0xFF (it's the
+        # cart-padding the engine expects). Sanity-check rather than
+        # blindly overwrite — anything else here is a writer bug.
+        if used < target:
+            gap = out[used:target]
+            if any(b != 0xFF for b in gap):
+                raise RuntimeError(
+                    f"refusing to pad: non-0xFF bytes between header[0x80]=0x{used:08x} "
+                    f"and target=0x{target:08x} — a writer extended the ROM past max(FAT.end)"
+                )
 
     def save(self, path: Optional[str] = None) -> str:
         target = path or self.source_path

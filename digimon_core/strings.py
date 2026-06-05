@@ -317,9 +317,14 @@ def encode_string(text: str, *, terminator: Optional[int] = TERMINATOR) -> bytes
     encode just the chars (for nested encoding, length probes, etc.).
 
     Multi-char tokens (e.g. [PLAYER_NAME], [?ABCD]) are matched greedily
-    when they start with '['. Single chars are looked up directly.
+    when they start with '['. Single chars are looked up directly. Any
+    literal CR / LF (the QPlainTextEdit emits ``\n`` when the user presses
+    Enter; pasted text may carry ``\r\n``) is folded to ``[BR]`` here so
+    the editor doesn't surface a phantom encode error for what's clearly
+    a line break.
     Raises UnknownCharError if a char/token isn't in the table.
     """
+    text = text.replace("\r\n", "[BR]").replace("\r", "[BR]").replace("\n", "[BR]")
     out = bytearray()
     i = 0
     n = len(text)

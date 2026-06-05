@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from . import constants
 from . import strings as _strings
@@ -133,6 +133,14 @@ class BattleStringEntry:
         rom_data[self.offset:self.offset + self.SIZE] = self.getByteArray()
 
 
+# Empirical per-string cap inside MSG.PAK: the DWDD textbox renderer
+# corrupts when a single dialogue entry exceeds 1024 bytes (encoded text +
+# its FE FF / FF FF terminator), regardless of content. Vanilla strings
+# top out at ~1004 bytes — never crossed. Applied as the budget ceiling
+# for any MSG.PAK string in the editor's save guard and budget meter.
+MSGPAK_STRING_CAP: int = 1024
+
+
 class GameString:
     """A single in-game string at a fixed ROM offset.
 
@@ -188,6 +196,19 @@ class GameString:
     def encoded_length(self) -> int:
         """Byte length of `text` re-encoded with its trailing terminator."""
         return _strings.byte_length(self.text, terminator=self._resolved_terminator())
+
+    def encoded_bytes_for_grow(self) -> bytes:
+        """Encoded text + original terminator, no NUL padding.
+
+        For use by paths that resize the string's container (e.g. the
+        MSG.PAK grow path in §12) — those don't need or want budget
+        padding, and they must preserve the original group terminator
+        (FF FF / FE FF) so the engine still sees correct group boundaries
+        after a rebuild. ``_resolved_terminator`` is intentionally bypassed:
+        its FE-on-shrink rule is meant for the fixed-slot writer, where
+        the trailing gap inside the slot needs an in-engine stop.
+        """
+        return _strings.encode_string(self.text, terminator=self.original_terminator)
 
     def fits(self) -> bool:
         return self.encoded_length() <= self.original_byte_length
@@ -1150,12 +1171,19 @@ class WildEncounter:
 
 
 class WildEncounterArea:
-    """A 0x200-byte wild-encounter region.
+    """A wild-encounter region — one per area.
 
     Layout: 16-byte header (num_encounters, rate_lower, rate_upper, 10 bytes of
     filler) followed by up to ~20 WildEncounter records terminated by a record
     whose digimon_id == 0. Bytes after the terminator are filler / unused but
     preserved verbatim for round-trip equality.
+
+    `SIZE` is the legacy 0x200-padded slab size used by the hardcoded-offset
+    loader (`AREA_ENCOUNTER_OFFSETS`-driven walk). Under FNT-driven loading
+    each area is its own self-contained file with no padding, so the instance
+    width comes from `len(_raw)` set at construction. The legacy slab and the
+    FNT-trimmed file produce equivalent parsed state — the trimmed file
+    excludes only 0xFFFF padding bytes the loader/writer never touched.
     """
     SIZE = 0x200
     HEADER_SIZE = 0x10
@@ -1169,14 +1197,14 @@ class WildEncounterArea:
 
     def __init__(self, data: bytearray, offset: int):
         self.offset = offset
-        self._raw = bytearray(data[:self.SIZE])
+        self._raw = bytearray(data)
         self.num_encounters = int.from_bytes(self._raw[0:2], byteorder="little")
         self.rate_lower = int.from_bytes(self._raw[2:4], byteorder="little")
         self.rate_upper = int.from_bytes(self._raw[4:6], byteorder="little")
 
         self.encounters = []
         cur = self.HEADER_SIZE
-        while cur + WildEncounter.SIZE <= self.SIZE:
+        while cur + WildEncounter.SIZE <= len(self._raw):
             dig_id = int.from_bytes(self._raw[cur:cur + 2], byteorder="little")
             if dig_id == 0:
                 break
@@ -1196,7 +1224,8 @@ class WildEncounterArea:
         return out
 
     def writeToRom(self, rom_data: bytearray):
-        rom_data[self.offset:self.offset + self.SIZE] = self.getByteArray()
+        data = self.getByteArray()
+        rom_data[self.offset:self.offset + len(data)] = data
 
 
 class Equipment:

@@ -146,6 +146,22 @@ class RoundtripTestBase:
             obj.writeToRom(target)
         self._assert_region_equal(target, "FarmTerrain")
 
+    def test_equipment(self):
+        target = bytearray(self.vanilla)
+        objs = loaders.loadEquipment(self.VERSION, self.vanilla)
+        self.assertGreater(len(objs), 0, "no equipment parsed")
+        for obj in objs.values():
+            obj.writeToRom(target)
+        self._assert_region_equal(target, "Equipment")
+
+    def test_wild_encounter_areas(self):
+        target = bytearray(self.vanilla)
+        objs = loaders.loadWildEncounterAreas(self.VERSION, self.vanilla)
+        self.assertGreater(len(objs), 0, "no wild encounter areas parsed")
+        for obj in objs:
+            obj.writeToRom(target)
+        self._assert_region_equal(target, "WildEncounterArea")
+
     def test_strings(self):
         regions = constants.STRING_REGIONS.get(self.VERSION, [])
         if not regions:
