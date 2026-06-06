@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QUndoStack, qRgba
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -116,6 +117,12 @@ class BtchrBrowser(QWidget):
         # when the tile bank is stored screen-row-major and the slab
         # layout is purely a viewing convenience.
         self._sheet_fill_ltr_overrides: dict[int, bool] = {}
+        # Per-group view-mode memory. "cells" composes each NCER cell via
+        # OAM (assembled character per slab — much easier to edit), "tiles"
+        # shows raw 8×8 tile data (legacy slab grid). Cells mode is the
+        # default because users almost always want to see the assembled
+        # character, not the underlying tile layout.
+        self._view_mode_overrides: dict[int, str] = {}
 
         # Cached cell QPixmaps for the *current* digimon. Cleared on
         # selection change.
@@ -189,6 +196,19 @@ class BtchrBrowser(QWidget):
         self._sheet_scroll.setWidget(self._sheet_preview)
         self._sheet_scroll.setWidgetResizable(True)
         self._sheet_scroll.setAlignment(Qt.AlignCenter)
+
+        # View mode: cells (OAM-composed) vs tiles (raw 8×8 grid). Cells
+        # mode pulls each NCER cell through `render_cell_rgba` so each
+        # "slab" is a fully-assembled character/frame — what users
+        # actually want to edit. Tiles mode keeps the raw-tile slab view
+        # for sprite-format inspection and edge cases where OAM doesn't
+        # cover every tile.
+        self._view_mode_combo = QComboBox()
+        self._view_mode_combo.addItem("Cells (OAM)", "cells")
+        self._view_mode_combo.addItem("Raw tiles", "tiles")
+        self._view_mode_combo.currentIndexChanged.connect(
+            self._on_view_mode_changed
+        )
 
         self._sheet_cols_spin = QSpinBox()
         self._sheet_cols_spin.setRange(1, SHEET_COLS_MAX)
@@ -296,6 +316,7 @@ class BtchrBrowser(QWidget):
         sheet_layout.setContentsMargins(8, 8, 8, 8)
         sheet_layout.addWidget(self._sheet_scroll, 1)
         sheet_form = QFormLayout()
+        sheet_form.addRow("View", self._view_mode_combo)
         sheet_form.addRow("Width (tiles)", self._sheet_cols_spin)
         sheet_form.addRow("Columns", self._sheet_columns_spin)
         sheet_form.addRow("", self._sheet_fill_ltr_cb)
@@ -432,6 +453,15 @@ class BtchrBrowser(QWidget):
         self._sheet_fill_ltr_cb.blockSignals(True)
         self._sheet_fill_ltr_cb.setChecked(fill_ltr)
         self._sheet_fill_ltr_cb.blockSignals(False)
+        # View mode: default to cells (OAM-composed) so the assembled
+        # character shows up on first selection.
+        view_mode = self._view_mode_overrides.get(g, "cells")
+        self._view_mode_combo.blockSignals(True)
+        self._view_mode_combo.setCurrentIndex(
+            0 if view_mode == "cells" else 1
+        )
+        self._view_mode_combo.blockSignals(False)
+        self._update_view_mode_controls()
 
         self._sheet_dirty = True
         self._refresh_preview()
@@ -568,16 +598,116 @@ class BtchrBrowser(QWidget):
                     img.setPixel(tx0 + px, ty0 + py, tile[py * 8 + px])
         return img
 
+    def _cell_layout(self) -> Optional[Tuple[List[Tuple[int, int, int, int]], int, int]]:
+        """Cell-mode layout: list of ``(xmin, ymin, w, h)`` per cell + the
+        per-slot ``(max_w, max_h)`` used for uniform placement.
+
+        Returns ``None`` when the current digimon has no cells or every
+        cell's bbox collapses to zero (sentinel groups, decode error).
+        Centralised because export, preview, and import all need the
+        same numbers to agree.
+        """
+        if self._current_decoded is None:
+            return None
+        d = self._current_decoded
+        if not d.ncer.cells:
+            return None
+        rects: List[Tuple[int, int, int, int]] = []
+        max_w = max_h = 0
+        for cell in d.ncer.cells:
+            xmin, ymin, xmax, ymax = btchr.cell_bbox(cell)
+            w = xmax - xmin
+            h = ymax - ymin
+            rects.append((xmin, ymin, w, h))
+            if w > max_w:
+                max_w = w
+            if h > max_h:
+                max_h = h
+        if max_w <= 0 or max_h <= 0:
+            return None
+        return rects, max_w, max_h
+
+    def _render_cells_qimage(self, columns: int) -> Optional[QImage]:
+        """Compose each NCER cell into one Indexed8 slot, ``columns`` slots
+        per row. Slot size = ``(max_cell_w, max_cell_h)`` so the grid is
+        uniform and round-trip slicing on import is deterministic. Each
+        cell sits at the top-left of its slot (origin = its xmin/ymin)
+        — fixes the cell's pixel positions to a known offset.
+
+        Indexed8 + 256-colour table mirrors the raw-tiles export, so PNG
+        round-trips through Aseprite/GIMP without losing the palette.
+        """
+        if self._current_decoded is None:
+            return None
+        d = self._current_decoded
+        layout = self._cell_layout()
+        if layout is None:
+            return None
+        rects, max_w, max_h = layout
+        n_cells = len(d.ncer.cells)
+        columns = max(1, min(columns, n_cells))
+        rows = (n_cells + columns - 1) // columns
+
+        img = QImage(max_w * columns, max_h * rows, QImage.Format_Indexed8)
+        ctable = []
+        for pi, (r, g, b) in enumerate(d.palette):
+            ctable.append(qRgba(r, g, b, 0 if pi == 0 else 255))
+        img.setColorTable(ctable)
+        img.fill(0)
+
+        tile_mult = d.ncer.boundary_bytes // btchr.BYTES_PER_TILE_8BPP
+        n_tiles = d.n_tiles
+        img_w = img.width()
+        img_h = img.height()
+
+        for ci, cell in enumerate(d.ncer.cells):
+            col = ci % columns
+            row = ci // columns
+            slot_x = col * max_w
+            slot_y = row * max_h
+            xmin, ymin, _, _ = rects[ci]
+            for o in cell.oams:
+                first_tile = o.tile * tile_mult
+                ox = o.x - xmin
+                oy = o.y - ymin
+                ntw = o.w // 8
+                nth = o.h // 8
+                for ty in range(nth):
+                    for tx in range(ntw):
+                        idx = first_tile + ty * ntw + tx
+                        if idx >= n_tiles:
+                            continue
+                        tile_off = idx * btchr.BYTES_PER_TILE_8BPP
+                        for r in range(8):
+                            sr = (7 - r) if o.vflip else r
+                            src_row = tile_off + sr * 8
+                            dst_y = slot_y + oy + ty * 8 + r
+                            if not (0 <= dst_y < img_h):
+                                continue
+                            for c in range(8):
+                                sc = (7 - c) if o.hflip else c
+                                pi = d.tile_bytes[src_row + sc]
+                                if pi == 0:
+                                    continue
+                                dst_x = slot_x + ox + tx * 8 + c
+                                if not (0 <= dst_x < img_w):
+                                    continue
+                                img.setPixel(dst_x, dst_y, pi)
+        return img
+
     def _refresh_sheet_preview(self) -> None:
         if self._current_decoded is None:
             self._sheet_preview.setText("Select a digimon.")
             self._sheet_src_qimage = None
             return
-        img = self._render_sheet_qimage(
-            self._sheet_cols_spin.value(),
-            self._sheet_columns_spin.value(),
-            fill_ltr=self._sheet_fill_ltr_cb.isChecked(),
-        )
+        if self._view_mode_combo.currentData() == "cells":
+            img = self._render_cells_qimage(self._sheet_columns_spin.value())
+        else:
+            img = self._render_sheet_qimage(
+                self._sheet_cols_spin.value(),
+                self._sheet_columns_spin.value(),
+                fill_ltr=self._sheet_fill_ltr_cb.isChecked(),
+            )
         if img is None:
             self._sheet_preview.setText("(empty)")
             self._sheet_src_qimage = None
@@ -619,6 +749,22 @@ class BtchrBrowser(QWidget):
         self._refresh_sheet_preview()
         self._sheet_dirty = False
 
+    def _on_view_mode_changed(self, _idx: int) -> None:
+        mode = self._view_mode_combo.currentData()
+        if self._current_group is not None:
+            self._view_mode_overrides[self._current_group] = mode
+        self._update_view_mode_controls()
+        self._refresh_sheet_preview()
+        self._sheet_dirty = False
+
+    def _update_view_mode_controls(self) -> None:
+        """Grey out tile-layout knobs in cells mode — they don't apply
+        when each slab is a fully-composed cell instead of a raw tile run.
+        Columns still applies (cells per row), so it stays enabled."""
+        is_cells = self._view_mode_combo.currentData() == "cells"
+        self._sheet_cols_spin.setEnabled(not is_cells)
+        self._sheet_fill_ltr_cb.setEnabled(not is_cells)
+
     def _on_tab_changed(self, idx: int) -> None:
         if idx == 1 and self._sheet_dirty:
             self._refresh_sheet_preview()
@@ -639,22 +785,37 @@ class BtchrBrowser(QWidget):
         )
         if not path:
             return
-        # Export uses the preview's current width, columns AND fill
-        # direction so the file the user sees in their image editor
-        # matches the on-screen layout. All three embed in PNG tEXt
-        # chunks so re-import recovers the original tile order
-        # regardless of the editor's spinner / checkbox state
-        # (which is per-session only).
-        cols_val = self._sheet_cols_spin.value()
+        # Export uses the preview's current view mode + layout knobs so
+        # the file the user sees in their image editor matches the on-
+        # screen layout. All embed in PNG tEXt chunks so re-import
+        # recovers the original layout regardless of the editor's
+        # current widget state (which is per-session only).
+        mode = self._view_mode_combo.currentData()
         columns_val = self._sheet_columns_spin.value()
-        fill_ltr = self._sheet_fill_ltr_cb.isChecked()
-        img = self._render_sheet_qimage(cols_val, columns_val, fill_ltr=fill_ltr)
-        if img is None:
-            QMessageBox.critical(self, "Export failed", f"Could not write {path}.")
-            return
-        img.setText("btchr_cols", str(cols_val))
-        img.setText("btchr_columns", str(columns_val))
-        img.setText("btchr_fill", "ltr" if fill_ltr else "ttb")
+        if mode == "cells":
+            img = self._render_cells_qimage(columns_val)
+            if img is None:
+                QMessageBox.critical(
+                    self, "Export failed", f"Could not write {path}.",
+                )
+                return
+            img.setText("btchr_mode", "cells")
+            img.setText("btchr_columns", str(columns_val))
+        else:
+            cols_val = self._sheet_cols_spin.value()
+            fill_ltr = self._sheet_fill_ltr_cb.isChecked()
+            img = self._render_sheet_qimage(
+                cols_val, columns_val, fill_ltr=fill_ltr,
+            )
+            if img is None:
+                QMessageBox.critical(
+                    self, "Export failed", f"Could not write {path}.",
+                )
+                return
+            img.setText("btchr_mode", "tiles")
+            img.setText("btchr_cols", str(cols_val))
+            img.setText("btchr_columns", str(columns_val))
+            img.setText("btchr_fill", "ltr" if fill_ltr else "ttb")
         if not img.save(path, "PNG"):
             QMessageBox.critical(self, "Export failed", f"Could not write {path}.")
 
@@ -671,6 +832,17 @@ class BtchrBrowser(QWidget):
         img = QImage(path)
         if img.isNull():
             QMessageBox.critical(self, "Import failed", f"Could not read {path}.")
+            return
+        # Branch on embedded mode tag — cells mode lays the bank out by
+        # OAM rectangles (uniform per-cell grid), not 8×8 tiles, so the
+        # size + tile-walk logic below doesn't apply. Falls back to the
+        # live combo for PNGs made externally (no metadata).
+        embedded_mode = img.text("btchr_mode")
+        if embedded_mode == "cells" or (
+            not embedded_mode
+            and self._view_mode_combo.currentData() == "cells"
+        ):
+            self._import_cells_png(img, d)
             return
         if img.width() % 8 != 0 or img.height() % 8 != 0:
             QMessageBox.critical(
@@ -823,6 +995,162 @@ class BtchrBrowser(QWidget):
             desc = f"Import BTCHR tile sheet + palette {group:04d}"
         else:
             desc = f"Import BTCHR tile sheet {group:04d}"
+
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            replacements,
+            description=desc,
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+
+    def _import_cells_png(self, img: QImage, d: btchr.BtchrDigimon) -> None:
+        """Round-trip a cells-mode PNG back into the tile bank.
+
+        The PNG is sliced into the same uniform grid the cell exporter
+        produced (slot size = max bbox over all cells), and for each cell
+        every OAM's pixel rectangle is decoded straight into its target
+        tile range using the inverse of render_cell_rgba's flip + tile
+        formulas.
+
+        Tiles not referenced by any OAM are preserved from the live tile
+        bytes so editing one cell doesn't accidentally wipe storage that
+        only other (possibly never-visualised) sub-bank tiles use. Tiles
+        referenced by multiple OAMs are last-write-wins — matching the
+        engine's behaviour where shared tiles render identically wherever
+        they're sampled.
+        """
+        layout = self._cell_layout()
+        if layout is None:
+            QMessageBox.critical(
+                self, "Import failed",
+                "Current digimon has no cells — nothing to import.",
+            )
+            return
+        rects, max_w, max_h = layout
+        n_cells = len(d.ncer.cells)
+
+        # Columns comes from the PNG when available, else the live spinner.
+        # Cap at n_cells so an over-large value doesn't produce 0 rows.
+        embedded_columns = img.text("btchr_columns")
+        if embedded_columns:
+            try:
+                columns = max(1, min(n_cells, int(embedded_columns)))
+            except ValueError:
+                columns = max(1, min(n_cells, self._sheet_columns_spin.value()))
+        else:
+            columns = max(1, min(n_cells, self._sheet_columns_spin.value()))
+        rows = (n_cells + columns - 1) // columns
+        expected_w = max_w * columns
+        expected_h = max_h * rows
+        if img.width() != expected_w or img.height() != expected_h:
+            QMessageBox.critical(
+                self, "Bad image size",
+                f"Cells PNG should be {expected_w}×{expected_h} for "
+                f"{n_cells} cells in {columns} columns; got "
+                f"{img.width()}×{img.height()}.",
+            )
+            return
+
+        use_indexed = img.format() == QImage.Format_Indexed8
+        if not use_indexed:
+            img = img.convertToFormat(QImage.Format_RGBA8888)
+
+        # Same palette-source decision as the raw-tiles importer — see
+        # the comment block there for the full rationale.
+        checkbox_on = self._import_pal_with_sheet_cb.isChecked()
+        pal_from_plte = (
+            use_indexed and checkbox_on and len(img.colorTable()) >= 2
+        )
+        pal_from_quant = (not use_indexed) and checkbox_on
+        rebuild_palette = pal_from_plte or pal_from_quant
+        if rebuild_palette:
+            built = build_palette_from_png(img, total_slots=256)
+            if built is None:
+                QMessageBox.critical(
+                    self, "PNG is fully transparent",
+                    "Cannot rebuild a palette from a PNG with no opaque pixels.",
+                )
+                return
+            new_palette: List[Tuple[int, int, int]] = list(built)
+        else:
+            new_palette = list(d.palette)
+
+        # Start from the existing tile bytes so cells with overlapping
+        # tiles and any tiles outside every OAM keep their old contents.
+        new_tiles = bytearray(d.tile_bytes)
+        n_tiles = d.n_tiles
+        tile_mult = d.ncer.boundary_bytes // btchr.BYTES_PER_TILE_8BPP
+
+        for ci, cell in enumerate(d.ncer.cells):
+            col = ci % columns
+            row = ci // columns
+            slot_x = col * max_w
+            slot_y = row * max_h
+            xmin, ymin, _, _ = rects[ci]
+            for o in cell.oams:
+                first_tile = o.tile * tile_mult
+                ox = o.x - xmin
+                oy = o.y - ymin
+                ntw = o.w // 8
+                nth = o.h // 8
+                for ty in range(nth):
+                    for tx in range(ntw):
+                        tile_idx = first_tile + ty * ntw + tx
+                        if tile_idx >= n_tiles:
+                            continue
+                        tile_off = tile_idx * btchr.BYTES_PER_TILE_8BPP
+                        for r in range(8):
+                            sr = (7 - r) if o.vflip else r
+                            dst_y = slot_y + oy + ty * 8 + r
+                            if not (0 <= dst_y < img.height()):
+                                continue
+                            for c in range(8):
+                                sc = (7 - c) if o.hflip else c
+                                dst_x = slot_x + ox + tx * 8 + c
+                                if not (0 <= dst_x < img.width()):
+                                    continue
+                                if use_indexed:
+                                    idx = img.pixelIndex(dst_x, dst_y)
+                                else:
+                                    color = img.pixelColor(dst_x, dst_y)
+                                    if color.alpha() < 128:
+                                        idx = 0
+                                    else:
+                                        idx = nearest_idx_opaque(
+                                            color.red(), color.green(),
+                                            color.blue(), new_palette,
+                                        )
+                                new_tiles[tile_off + sr * 8 + sc] = idx & 0xFF
+
+        group = self._current_group
+        orig_ncgr_raw = sprite.decompress_rle30(
+            self._pak.entries[self._ncgr_entry_idx(group)]
+        )
+        new_ncgr = sprite.build_ncgr_from_template(
+            bytes(new_tiles), orig_ncgr_raw,
+        )
+        compressed = sprite.compress_rle30(new_ncgr)
+        replacements = [(BTCHR_PAK, self._ncgr_entry_idx(group), compressed)]
+
+        if rebuild_palette:
+            nclr_raw = sprite.decompress_rle30(
+                self._pak.entries[self._nclr_entry_idx(group)]
+            )
+            new_nclr = sprite.build_nclr_from_template(
+                nclr_raw, {0: new_palette},
+            )
+            replacements.append((
+                BTCHR_PAK,
+                self._nclr_entry_idx(group),
+                sprite.compress_rle30(new_nclr),
+            ))
+            desc = f"Import BTCHR cells + palette {group:04d}"
+        else:
+            desc = f"Import BTCHR cells {group:04d}"
 
         cmd = ReplaceSpriteCommand(
             self._session,
