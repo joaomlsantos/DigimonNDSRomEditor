@@ -16,11 +16,20 @@ from typing import Dict, List, Optional, Set, Tuple
 from digimon_core import constants, fat, fnt, loaders, model, msgpak, pak, qol as qol_module, rom
 
 
-# Every sprite trio the editor knows how to splice on save. Used by
+# Every sprite pak the editor knows how to splice on save. Used by
 # from_project to pre-load any pak that diverges from vanilla (so a
 # project's sprite edits survive a re-save even if the user never opens
 # the sprite browser) and by _apply_sprite_pak_splice to iterate.
-SPRITE_PAK_PATHS = ("DAT/SPR_CHR.PAK", "DAT/SPR_PAL.PAK", "DAT/SPR_CEL.PAK")
+#
+# SPR_*: battle/UI sprites (NCGR/NCLR/NCER triplets, project memory
+#   ``project_sprite_pak_pair_heuristic`` — pair by index).
+# MCHR_*: overworld sprites (custom multi-frame format, no NCGR wrapper;
+#   see :mod:`digimon_core.mchr`). Save/load rides the exact same channel.
+SPRITE_PAK_PATHS = (
+    "DAT/SPR_CHR.PAK", "DAT/SPR_PAL.PAK", "DAT/SPR_CEL.PAK",
+    "DAT/MCHR_CHR.PAK", "DAT/MCHR_PAL.PAK",
+    "DAT/BTCHR.PAK",
+)
 
 
 @dataclass

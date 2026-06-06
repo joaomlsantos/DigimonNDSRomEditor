@@ -62,6 +62,8 @@ from .widgets.habitats_editor import HabitatsWorldmapEditor
 from .widgets.move_editor import MoveEditor, move_issues
 from .widgets.qol_editor import QolEditor
 from .widgets.quest_editor import QuestEditor
+from .widgets.btchr_browser import BtchrBrowser
+from .widgets.mchr_browser import MchrBrowser
 from .widgets.sprite_browser import SpriteBrowser
 from .widgets.standard_digivolution_editor import (
     StandardDigivolutionEditor,
@@ -129,7 +131,9 @@ NAV_GROUPS = [
         ("MSG.PAK", "strings_bucket:msgpak"),
     ]),
     ("Sprites", [
-        ("Sprite Sheets", "sprite_browser"),
+        ("Icons/Portraits/UI", "sprite_browser"),
+        ("Overworld", "mchr_browser"),
+        ("Battle", "btchr_browser"),
     ]),
     ("Settings", [
         ("QoL Toggles", "qol_settings"),
@@ -1005,6 +1009,10 @@ class MainWindow(QMainWindow):
             return QolEditor(self.session.qol, self.undo_stack)
         if key == "sprite_browser":
             return SpriteBrowser(self.session, self.undo_stack)
+        if key == "mchr_browser":
+            return MchrBrowser(self.session, self.undo_stack)
+        if key == "btchr_browser":
+            return BtchrBrowser(self.session, self.undo_stack)
         if key.startswith("strings_bucket:"):
             bucket = key.split(":", 1)[1]
             prefix = _STRING_BUCKET_PREFIXES.get(bucket)

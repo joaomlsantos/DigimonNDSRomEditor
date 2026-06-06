@@ -81,6 +81,10 @@ class SpriteBrowser(QWidget):
         self._current_idx: Optional[int] = None
         self._current_palette_bank: int = 0
         self._current_width_tiles: int = 4
+        # Per-sprite width overrides. Lives in memory only — switching
+        # away from a sprite and back uses the user's last width pick
+        # instead of resnapping to the heuristic. Cleared on re-load.
+        self._width_overrides: dict[int, int] = {}
         # Pick-from-image mode state. _preview_src_size is the unscaled
         # render dimensions so we can map a label-coordinate click back to
         # the source pixel (the QLabel may render at 1x or 2x scale).
@@ -262,32 +266,36 @@ class SpriteBrowser(QWidget):
         self._export_png_btn.clicked.connect(self._on_export_png)
         self._export_native_btn = QPushButton("Export NCGR+NCLR…")
         self._export_native_btn.clicked.connect(self._on_export_native)
-        # Two PNG paths: "match palette" snaps PNG pixels to the existing
-        # palette (CHR-only edit, posterizes off-palette colors); "new
-        # palette" runs median-cut on the PNG and rebuilds the displayed
-        # bank too (CHR + PAL edit, swaps colors for sibling sprites that
-        # share the bank).
-        self._replace_png_btn = QPushButton("Import from PNG (match palette)…")
-        self._replace_png_btn.clicked.connect(self._on_replace_png)
-        self._replace_png_new_pal_btn = QPushButton(
-            "Import from PNG (new palette)…"
-        )
-        self._replace_png_new_pal_btn.clicked.connect(
-            self._on_replace_png_new_palette
+        # Single PNG import button; the checkbox below picks between the
+        # two underlying paths.
+        # - off → match the existing palette (CHR-only edit, posterizes
+        #   off-palette colours).
+        # - on  → run median-cut on the PNG and rebuild the displayed
+        #   bank too (CHR + PAL edit; siblings sharing the bank pick up
+        #   the new colours).
+        self._replace_png_btn = QPushButton("Import from PNG…")
+        self._replace_png_btn.clicked.connect(self._on_replace_png_dispatch)
+        self._import_pal_with_sheet_cb = QCheckBox("Also import palette from PNG")
+        self._import_pal_with_sheet_cb.setChecked(True)
+        self._import_pal_with_sheet_cb.setToolTip(
+            "On: median-cut a fresh palette from the PNG's opaque pixels "
+            "and rebuild the displayed bank (siblings sharing the bank "
+            "pick up the new colours too).\n"
+            "Off: index against the existing palette (off-palette "
+            "colours posterize)."
         )
         self._replace_native_btn = QPushButton("Import from NCGR+NCLR…")
         self._replace_native_btn.clicked.connect(self._on_replace_native)
         for btn in (
             self._export_png_btn, self._export_native_btn,
-            self._replace_png_btn, self._replace_png_new_pal_btn,
-            self._replace_native_btn,
+            self._replace_png_btn, self._replace_native_btn,
         ):
             btn.setEnabled(False)
         # Replace requires an undo stack to push onto; without one the
         # widget runs in read-only mode (e.g. embedded in a viewer).
         if self._undo_stack is None:
             self._replace_png_btn.setVisible(False)
-            self._replace_png_new_pal_btn.setVisible(False)
+            self._import_pal_with_sheet_cb.setVisible(False)
             self._replace_native_btn.setVisible(False)
 
         right = QWidget()
@@ -303,7 +311,7 @@ class SpriteBrowser(QWidget):
         png_col.setSpacing(4)
         png_col.addWidget(self._export_png_btn)
         png_col.addWidget(self._replace_png_btn)
-        png_col.addWidget(self._replace_png_new_pal_btn)
+        png_col.addWidget(self._import_pal_with_sheet_cb)
         png_col.addStretch(1)
         native_col = QVBoxLayout()
         native_col.setSpacing(4)
@@ -339,7 +347,6 @@ class SpriteBrowser(QWidget):
         self._export_native_btn.setEnabled(True)
         if self._undo_stack is not None:
             self._replace_png_btn.setEnabled(True)
-            self._replace_png_new_pal_btn.setEnabled(True)
             self._replace_native_btn.setEnabled(True)
         self._refresh_palette_combo()
         self._refresh_meta_and_preview()
@@ -352,6 +359,8 @@ class SpriteBrowser(QWidget):
 
     def _on_width_changed(self, w: int) -> None:
         self._current_width_tiles = w
+        if self._current_idx is not None:
+            self._width_overrides[self._current_idx] = w
         self._refresh_preview_only()
 
     def _refresh_palette_combo(self) -> None:
@@ -412,7 +421,11 @@ class SpriteBrowser(QWidget):
         # Default width-tiles per entry: prefer the RAHC hint when present,
         # otherwise pick a layout from the cell bbox (most DWDD sprites
         # store 0xFFFF in RAHC, so the bbox path is the common case).
-        if hint_w:
+        # A user pick on this sprite wins over both — revisiting the same
+        # sprite keeps the width they chose last time.
+        if self._current_idx in self._width_overrides:
+            default_w = self._width_overrides[self._current_idx]
+        elif hint_w:
             default_w = hint_w
         else:
             bbox_w, _ = ncer_mod.sprite_bbox(parsed_ncer)
@@ -941,6 +954,15 @@ class SpriteBrowser(QWidget):
             if d < best_d:
                 best_d, best_i = d, i
         return best_i
+
+    def _on_replace_png_dispatch(self) -> None:
+        """Pick the import path from the checkbox state.
+        Off → quantize against the existing palette; on → rebuild the
+        bank from the PNG via median-cut."""
+        if self._import_pal_with_sheet_cb.isChecked():
+            self._on_replace_png_new_palette()
+        else:
+            self._on_replace_png()
 
     def _on_replace_png(self) -> None:
         if self._current_idx is None or self._undo_stack is None:
