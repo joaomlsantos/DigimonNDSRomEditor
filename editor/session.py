@@ -32,6 +32,24 @@ SPRITE_PAK_PATHS = (
     "DAT/BTCHR.PAK",
 )
 
+# SPR_CHR.PAK entry indices for the 8 elemental icons used by the in-game
+# move HUD. Order in the pak is fixed:
+#   0xa1 fire · 0xa2 thunder · 0xa3 wind · 0xa4 water
+#   0xa5 steel · 0xa6 light · 0xa7 dark · 0xa8 earth
+# Keyed by ``model.Element`` enum value so the move editor and the
+# base/enemy move-row inline summaries can resolve a sprite without
+# touching the icons/portraits/ui directory structure directly.
+ELEMENT_SPR_INDEX: Dict[int, int] = {
+    2: 0xa1,  # FIRE
+    7: 0xa2,  # THUNDER
+    4: 0xa3,  # WIND
+    6: 0xa4,  # WATER
+    5: 0xa5,  # STEEL
+    0: 0xa6,  # LIGHT
+    1: 0xa7,  # DARK
+    3: 0xa8,  # EARTH
+}
+
 # BTCHR sidecars: fixed-size 1660B each (415 × u32). Edits ride the byte
 # diff channel — no FAT resize needed because per-group writes are u32
 # in-place. Resolution happens against the post-sprite-splice ROM in
@@ -114,6 +132,98 @@ class RomSession:
     # build, so the cache avoids the per-call dict rebuild.
     _digimon_name_cache: Dict[int, str] = field(default_factory=dict)
     _digimon_name_cache_valid: bool = False
+
+    # Lazy QIcon cache for the digimon portrait sprite (SPR_CHR entry pointed
+    # at by SpriteMapEntry.upperscreen_low). Populated on demand by
+    # ``digimon_portrait_icon``; misses (out-of-range id, parse failure,
+    # empty render) cache as ``None`` so the parse work isn't redone for
+    # every popup repaint. Form-helper combos read through the registry in
+    # ``form_helpers.set_details_providers``.
+    _digimon_portrait_icon_cache: Dict[int, object] = field(default_factory=dict)
+
+    # Lazy QPixmap cache for the BTCHR battle-sprite preview (cell 0 of the
+    # group pointed at by SpriteMapEntry.main_sprite). Built on demand by
+    # ``battle_sprite_pixmap``; misses cache as ``None``. Invalidated alongside
+    # the sprite label caches whenever BTCHR.PAK is mutated.
+    _battle_sprite_pixmap_cache: Dict[int, object] = field(default_factory=dict)
+
+    # Lazy QPixmap caches for the SPR_* and MCHR sprite-map row previews
+    # (portrait, battle-mini, party-follower overworld). Keyed by
+    # ``(entry_idx, max_size)`` so editors that render at different sizes
+    # don't trample each other. Misses cache as ``None`` and are dropped
+    # by ``invalidate_sprite_label_caches`` when the underlying pak changes.
+    _spr_pixmap_cache: Dict[Tuple[int, int], object] = field(default_factory=dict)
+    _mchr_pixmap_cache: Dict[Tuple[int, int], object] = field(default_factory=dict)
+
+    # Lazy label caches for the SPR / MCHR / BTCHR sprite pickers used by
+    # SpriteMapRow (Display/Reskin section of base + enemy editors).
+    # compute_spr_labels parses 1627 NCGR+NCER entries (~370ms),
+    # compute_mchr_labels parses every MCHR group (~220ms), and
+    # compute_btchr_group_labels resolves 415+ groups (~50ms). Shared at
+    # the session so opening multiple editors only pays the cost once.
+    # Invalidated by ``invalidate_sprite_label_caches`` after sprite_map
+    # edits (cross-refs change) or sprite-pak splices (pak length / bytes
+    # change).
+    _spr_labels_cache: Optional[List[str]] = None
+    _mchr_labels_cache: Optional[List[str]] = None
+    _btchr_group_labels_cache: Optional[List[str]] = None
+
+    # Frozen sprite-idx → owning digimon_id snapshot. Captured from the
+    # sprite_map at first access (during the eager label pre-warm in
+    # `_build`), then never re-derived — so reassigning a digimon's
+    # sprite later doesn't steal the original sprite's label. Editor
+    # labels behave as if sourced from a fixed string array. Four maps,
+    # one per sprite_map field that addresses a sprite pak.
+    _sprite_attribution_snapshot: Optional[Dict[str, Dict[int, int]]] = None
+
+    # Lazy shared QStandardItemModel registry for combo pickers. Each
+    # "kind" (moves, traits, spr, mchr, btchr, battle_strings) has one
+    # model that every combo of that kind sets via ``setModel``, so the
+    # ~50-130ms per-editor addItem cost collapses to a one-shot build at
+    # ROM load. QComboBox.currentIndex is per-combo view state, not part
+    # of the model, so combos sharing a model can show different
+    # selections. Built by ``picker_model``; invalidated via
+    # ``invalidate_picker_model`` after edits that change row count or
+    # label text. Object-typed to keep the headless ``RomSession``
+    # import path Qt-free.
+    _picker_models: Dict[str, object] = field(default_factory=dict)
+
+    # Cursor for the idle-tick portrait-icon prewarm chain. Walks the
+    # shared "digimon" / "digimon_evo" picker models in ~50-item chunks
+    # so the ~1s of total icon decode work spreads across the event loop
+    # without blocking the UI. See ``prewarm_digimon_icons``.
+    _icon_prewarm_cursor: int = 0
+
+    # Pooled sprite-picker widgets — built once at ROM load, reparented
+    # into the active SpriteMapRow on editor open, and detached back to
+    # the ``_picker_pool_holder`` on editor teardown. Constructing a
+    # _SpriteListPicker pays ~46ms (setEditable creates a QLineEdit,
+    # QCompleter wraps a 1627-item model); pooling collapses 4×46ms per
+    # editor open to a one-shot ROM-load cost. Only one editor is open
+    # at a time, so 4 instances (mchr, btchr, spr, spr) suffice. The
+    # holder is a permanently-hidden parent widget so pool members never
+    # become top-level windows (which would pop up as stray frames) and
+    # never get the "explicitly hidden" flag that setParent(None) sets.
+    # Object-typed to keep the headless ``RomSession`` import path Qt-free.
+    _pooled_sprite_pickers: Optional[List[object]] = None
+    _picker_pool_holder: Optional[object] = None
+    # Monotonic ownership token. _build_editor_for constructs the NEW
+    # editor *before* set_content tears down the OLD one, so when both
+    # editors use SpriteMapRow the old editor's release would otherwise
+    # steal the pickers away from the new editor. Each acquire bumps the
+    # token; release only reparks to the holder when its captured token
+    # still matches — the old editor's stale token no-ops.
+    _picker_pool_generation: int = 0
+
+    # Pooled BoundIdCombo / BoundIdComboRow widgets, keyed by pool name
+    # ("moves" today; traits / battle_str candidates for later). Same
+    # rationale as the sprite-picker pool: each widget pays ~9ms for
+    # ``setEditable`` + ``QCompleter`` setup at construction; pooling
+    # collapses that to a one-shot ROM-load cost. Per-kind generation
+    # tokens so unrelated pools don't interfere with each other's
+    # acquire/release races.
+    _combo_pools: Dict[str, List[object]] = field(default_factory=dict)
+    _combo_pool_generations: Dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_file(cls, path: str) -> "RomSession":
@@ -242,6 +352,36 @@ class RomSession:
         # then replaces the whole `qol` field with the project's saved state.
         session.qol.movement_speed = parse_data[constants.MOVEMENT_SPEED_OFFSET[version]]
         session.qol.scan_rate = parse_data[constants.BASE_SCAN_RATE_OFFSET[version]]
+        # Pre-warm the SPR / MCHR / BTCHR picker labels so the very first
+        # base/enemy editor open already shows labeled sprite values
+        # instead of bare hex (~700ms one-shot, paid here so editor opens
+        # stay snappy and users can read the existing values without
+        # toggling Customize).
+        session.get_spr_labels()
+        session.get_mchr_labels()
+        session.get_btchr_group_labels()
+        # Pre-warm shared picker models. Front-loading the QStandardItem
+        # creation here (one-shot ~150-200ms) saves ~80-130ms per
+        # subsequent editor open since each combo just does
+        # ``setModel(model)`` instead of N ``addItem`` calls.
+        for kind in (
+            "moves", "traits_byte", "traits_word",
+            "spr", "mchr", "btchr", "battle_strings",
+            "digimon", "digimon_evo", "item_reward",
+        ):
+            session.picker_model(kind)
+        # Spread the ~1s of portrait-icon decode work across idle ticks
+        # so dropdowns show icons immediately on first open instead of
+        # waiting for the showPopup fill loop. No-op in headless tests.
+        session.prewarm_digimon_icons()
+        # Pre-build the 4 pooled sprite pickers (~185ms one-shot). Front-
+        # loaded here so SpriteMapRow.__init__ just reparents instead of
+        # paying setEditable + QCompleter setup on every editor open.
+        session._build_sprite_picker_pool()
+        # Same trick for the moves picker rows (~47ms saved per editor
+        # open). Depends on the sprite-picker pool's holder, so order
+        # matters — holder is created in _build_sprite_picker_pool.
+        session._build_combo_pools()
         return session
 
     def serialize_all(self, *, skip_sprite_splice: bool = False) -> bytearray:
@@ -551,6 +691,710 @@ class RomSession:
         held for the lifetime of the session.
         """
         self._digimon_name_cache_valid = False
+
+    def invalidate_portrait_icon_cache(self) -> None:
+        """Drop the cached portrait QIcons.
+
+        Call after a sprite_map edit (changes which SPR entry a digimon
+        points at) or after a SPR_*.PAK splice (changes the entry's
+        bytes). Misses are recomputed lazily on the next combo popup.
+        """
+        self._digimon_portrait_icon_cache.clear()
+
+    def invalidate_battle_sprite_pixmap_cache(self) -> None:
+        """Drop the cached BTCHR preview pixmaps.
+
+        Call after a BTCHR.PAK edit (entry bytes change) or after a group
+        append (count changes). Misses recomputed lazily on next preview.
+        """
+        self._battle_sprite_pixmap_cache.clear()
+
+    def invalidate_spr_pixmap_cache(self) -> None:
+        """Drop the cached SPR_* preview pixmaps (portrait + battle-mini)."""
+        self._spr_pixmap_cache.clear()
+
+    def invalidate_mchr_pixmap_cache(self) -> None:
+        """Drop the cached MCHR preview pixmaps (overworld follower)."""
+        self._mchr_pixmap_cache.clear()
+
+    def battle_sprite_pixmap(self, group_idx: int, max_size: int = 96):
+        """Lazy QPixmap of BTCHR group ``group_idx``'s idle stance, or ``None``.
+
+        Decodes the 5 BTCHR entries (header/NCGR/NCLR/NCER), renders the
+        first non-empty cell into RGBA, and scales to fit ``max_size``
+        (keeping aspect ratio). Returns ``None`` for out-of-range ids,
+        parse failures, or groups with no renderable cell — those negative
+        results cache too so preview repaints don't redo the work.
+        """
+        cache_key = (group_idx, max_size)
+        cached = self._battle_sprite_pixmap_cache.get(cache_key)
+        if cache_key in self._battle_sprite_pixmap_cache:
+            return cached
+        pixmap = self._build_battle_sprite_pixmap(group_idx, max_size)
+        self._battle_sprite_pixmap_cache[cache_key] = pixmap
+        return pixmap
+
+    def _build_battle_sprite_pixmap(self, group_idx: int, max_size: int):
+        from digimon_core import btchr
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage, QPixmap
+
+        try:
+            pak_file = self.sprite_pak("DAT/BTCHR.PAK")
+        except KeyError:
+            return None
+        if not (0 <= group_idx * btchr.GROUP_SIZE + btchr.GROUP_SIZE <= pak_file.count):
+            return None
+        try:
+            d = btchr.decode_digimon(pak_file, group_idx)
+        except (ValueError, IndexError):
+            return None
+        # Pick the first cell whose OAM bbox is non-trivial — cell 0 is the
+        # idle stance for most digimon but a handful use it for an empty /
+        # transition frame, in which case render_cell_rgba returns an 8x8
+        # placeholder we don't want to show.
+        chosen = None
+        for cell in d.ncer.cells:
+            if cell.oams:
+                chosen = cell
+                break
+        if chosen is None:
+            return None
+        try:
+            rgba, w, h = btchr.render_cell_rgba(
+                chosen, d.tile_bytes, d.palette,
+                boundary_bytes=d.ncer.boundary_bytes,
+            )
+        except (ValueError, IndexError):
+            return None
+        if w == 0 or h == 0:
+            return None
+        img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888).copy()
+        pix = QPixmap.fromImage(img)
+        if pix.width() > max_size or pix.height() > max_size:
+            pix = pix.scaled(
+                max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+        return pix
+
+    def spr_sprite_pixmap(self, spr_idx: int, max_size: int = 80):
+        """Lazy QPixmap of SPR_*[spr_idx], or ``None`` on miss / parse failure.
+
+        Used by the sprite-map row's portrait + battle-mini previews.
+        Caches the negative result so empty / unparseable entries don't
+        redo the parse on every refresh.
+        """
+        cache_key = (spr_idx, max_size)
+        if cache_key in self._spr_pixmap_cache:
+            return self._spr_pixmap_cache[cache_key]
+        pix = self._build_spr_pixmap(spr_idx, max_size)
+        self._spr_pixmap_cache[cache_key] = pix
+        return pix
+
+    def _build_spr_pixmap(self, spr_idx: int, max_size: int):
+        from digimon_core import ncer as ncer_mod, sprite
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage, QPixmap
+
+        try:
+            chr_pak = self.sprite_pak("DAT/SPR_CHR.PAK")
+            pal_pak = self.sprite_pak("DAT/SPR_PAL.PAK")
+            cel_pak = self.sprite_pak("DAT/SPR_CEL.PAK")
+        except KeyError:
+            return None
+        if not (0 <= spr_idx < min(chr_pak.count, pal_pak.count, cel_pak.count)):
+            return None
+        try:
+            chr_dec = sprite.maybe_decompress(chr_pak.entries[spr_idx])
+            tile_bytes, bit_depth, hint_w, _hint_h, is_bitmap = sprite.parse_ncgr(chr_dec)
+            palettes, _ = sprite.parse_nclr(sprite.maybe_decompress(pal_pak.entries[spr_idx]))
+            parsed_ncer = ncer_mod.parse_ncer(cel_pak.entries[spr_idx])
+        except (ValueError, IndexError):
+            return None
+        if not palettes:
+            return None
+        # Width heuristic mirrors _build_portrait_icon / SpriteBrowser.
+        if hint_w:
+            width_tiles = hint_w
+        else:
+            bbox_w, _ = ncer_mod.sprite_bbox(parsed_ncer)
+            if bbox_w <= 0:
+                width_tiles = 4
+            elif bbox_w <= 16:
+                width_tiles = 2
+            elif bbox_w < 64:
+                width_tiles = 4
+            else:
+                width_tiles = 8
+        if bit_depth == 4 and len(palettes[0]) == 16:
+            palette = [c for bank in palettes for c in bank]
+        else:
+            palette = palettes[0]
+        rgba, w, h = sprite.render_rgba(
+            tile_bytes, bit_depth, palette, width_tiles, is_bitmap,
+        )
+        if w == 0 or h == 0:
+            return None
+        img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888).copy()
+        pix = QPixmap.fromImage(img)
+        if pix.width() > max_size or pix.height() > max_size:
+            pix = pix.scaled(
+                max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+        return pix
+
+    def element_icon_pixmap(self, element_value: int, max_size: int = 24):
+        """Lazy QPixmap of the SPR_CHR element icon, or ``None`` on miss.
+
+        Shares ``_spr_pixmap_cache`` with ``spr_sprite_pixmap`` so a
+        SPR_*.PAK edit invalidates both via the existing
+        ``invalidate_spr_pixmap_cache`` hook.
+        """
+        spr_idx = ELEMENT_SPR_INDEX.get(element_value)
+        if spr_idx is None:
+            return None
+        return self.spr_sprite_pixmap(spr_idx, max_size=max_size)
+
+    def mchr_sprite_pixmap(self, mchr_idx: int, max_size: int = 80):
+        """Lazy QPixmap of MCHR[mchr_idx] frame 0, or ``None`` on miss.
+
+        Used by the sprite-map row's party-follower overworld preview.
+        Palette index tracks the entry index (the MCHR browser uses the
+        same default: ``min(ix, pal_count - 1)``).
+        """
+        cache_key = (mchr_idx, max_size)
+        if cache_key in self._mchr_pixmap_cache:
+            return self._mchr_pixmap_cache[cache_key]
+        pix = self._build_mchr_pixmap(mchr_idx, max_size)
+        self._mchr_pixmap_cache[cache_key] = pix
+        return pix
+
+    def _build_mchr_pixmap(self, mchr_idx: int, max_size: int):
+        from digimon_core import mchr as mchr_mod, sprite
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage, QPixmap
+
+        try:
+            chr_pak = self.sprite_pak("DAT/MCHR_CHR.PAK")
+            pal_pak = self.sprite_pak("DAT/MCHR_PAL.PAK")
+        except KeyError:
+            return None
+        if not (0 <= mchr_idx < chr_pak.count):
+            return None
+        try:
+            entry = mchr_mod.parse_mchr_chr_entry(sprite.decompress_rle30(chr_pak.entries[mchr_idx]))
+        except (ValueError, IndexError):
+            return None
+        if entry.frame_count == 0:
+            return None
+        pal_idx = min(mchr_idx, pal_pak.count - 1)
+        if pal_idx < 0:
+            return None
+        try:
+            palette = mchr_mod.parse_palette_bgr555(sprite.decompress_rle30(pal_pak.entries[pal_idx]))
+        except (ValueError, IndexError):
+            return None
+        # Frame 3 is the canonical front-facing pose for most MCHR entries
+        # (matches the in-game digivolution menu); fall back to frame 0 for
+        # short animations that don't have a frame 3.
+        frame_idx = 3 if entry.frame_count > 3 else 0
+        try:
+            rgba, w, h = mchr_mod.render_frame_rgba(entry.frames[frame_idx], palette)
+        except (ValueError, IndexError):
+            return None
+        if w == 0 or h == 0:
+            return None
+        img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888).copy()
+        pix = QPixmap.fromImage(img)
+        if pix.width() > max_size or pix.height() > max_size:
+            pix = pix.scaled(
+                max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+        return pix
+
+    def prewarm_digimon_icons(self) -> None:
+        """Idle-tick background population of digimon portrait icons on
+        the shared "digimon" / "digimon_evo" picker models.
+
+        Each portrait costs ~2-3ms to decode (SPR_CHR/PAL/CEL parse +
+        RGBA composite + QIcon wrap), so doing ~400 entries up-front
+        would stall the UI for ~1s. Spread across ~50-item ticks the
+        wall-time cost is invisible and icons are typically in place by
+        the time the user opens an editor that uses these dropdowns.
+
+        After completion, marks each model's ``icons_loaded`` property
+        True so the form-helper ``showPopup`` icon-fill loop becomes a
+        no-op.
+        """
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QTimer, Qt
+        if QApplication.instance() is None:
+            return
+
+        targets: List[Tuple[object, int]] = []
+        for kind in ("digimon", "digimon_evo"):
+            model = self._picker_models.get(kind)
+            if model is None:
+                continue
+            for i in range(model.rowCount()):
+                item = model.item(i)
+                if item is None:
+                    continue
+                did = item.data(Qt.UserRole)
+                if not isinstance(did, int) or did == 0xFFFFFFFF:
+                    continue
+                targets.append((item, did))
+
+        if not targets:
+            return
+
+        chunk_size = 50
+        self._icon_prewarm_cursor = 0
+
+        def process_chunk() -> None:
+            end = min(self._icon_prewarm_cursor + chunk_size, len(targets))
+            for ix in range(self._icon_prewarm_cursor, end):
+                item, did = targets[ix]
+                icon = self.digimon_portrait_icon(did)
+                if icon is not None:
+                    item.setIcon(icon)
+            self._icon_prewarm_cursor = end
+            if end < len(targets):
+                QTimer.singleShot(0, process_chunk)
+            else:
+                for kind in ("digimon", "digimon_evo"):
+                    m = self._picker_models.get(kind)
+                    if m is not None:
+                        m.setProperty("icons_loaded", True)
+
+        QTimer.singleShot(0, process_chunk)
+
+    def digimon_portrait_icon(self, digimon_id: int):
+        """Lazy QIcon for the digimon's portrait sprite, or ``None``.
+
+        Resolves ``sprite_map[digimon_id].upperscreen_low`` to an SPR_CHR
+        entry, parses CHR/PAL/CEL, and renders a small RGBA bitmap wrapped
+        in a QIcon. Returns ``None`` for ids without a sprite_map slot,
+        parse failures, or empty renders — those negative results cache
+        too so popup repaints don't redo the work.
+
+        Imports Qt lazily so headless code paths that touch RomSession
+        (CLI loaders, tests) don't pull in PySide6.
+        """
+        cached = self._digimon_portrait_icon_cache.get(digimon_id)
+        if digimon_id in self._digimon_portrait_icon_cache:
+            return cached
+        icon = self._build_portrait_icon(digimon_id)
+        self._digimon_portrait_icon_cache[digimon_id] = icon
+        return icon
+
+    def _build_portrait_icon(self, digimon_id: int):
+        from digimon_core import ncer as ncer_mod, sprite
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QIcon, QImage, QPixmap
+
+        if not (0 <= digimon_id < len(self.sprite_map)):
+            return None
+        spr_idx = self.sprite_map[digimon_id].upperscreen_low
+        try:
+            chr_pak = self.sprite_pak("DAT/SPR_CHR.PAK")
+            pal_pak = self.sprite_pak("DAT/SPR_PAL.PAK")
+            cel_pak = self.sprite_pak("DAT/SPR_CEL.PAK")
+        except KeyError:
+            return None
+        if not (0 <= spr_idx < min(chr_pak.count, pal_pak.count, cel_pak.count)):
+            return None
+        try:
+            chr_dec = sprite.maybe_decompress(chr_pak.entries[spr_idx])
+            tile_bytes, bit_depth, hint_w, _hint_h, is_bitmap = sprite.parse_ncgr(chr_dec)
+            palettes, _ = sprite.parse_nclr(sprite.maybe_decompress(pal_pak.entries[spr_idx]))
+            parsed_ncer = ncer_mod.parse_ncer(cel_pak.entries[spr_idx])
+        except (ValueError, IndexError):
+            return None
+        if not palettes:
+            return None
+        # Width heuristic mirrors SpriteBrowser._default_width_tiles_for_bbox.
+        if hint_w:
+            width_tiles = hint_w
+        else:
+            bbox_w, _ = ncer_mod.sprite_bbox(parsed_ncer)
+            if bbox_w <= 0:
+                width_tiles = 4
+            elif bbox_w <= 16:
+                width_tiles = 2
+            elif bbox_w < 64:
+                width_tiles = 4
+            else:
+                width_tiles = 8
+        # Engine concatenates 4bpp banks for an 8bpp NCGR; match it so
+        # portraits don't render with a wrong-bank palette.
+        if bit_depth == 4 and len(palettes[0]) == 16:
+            palette = [c for bank in palettes for c in bank]
+        else:
+            palette = palettes[0]
+        rgba, w, h = sprite.render_rgba(
+            tile_bytes, bit_depth, palette, width_tiles, is_bitmap,
+        )
+        if w == 0 or h == 0:
+            return None
+        img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888).copy()
+        pix = QPixmap.fromImage(img).scaled(
+            32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        return QIcon(pix)
+
+    def sprite_attribution(self) -> Dict[str, Dict[int, int]]:
+        """Frozen sprite-idx → owning digimon_id snapshot.
+
+        Captured on first call from the current ``sprite_map`` state,
+        then served as-is forever. Used by every ``compute_*_labels``
+        helper so reassigning a digimon's sprite later in the session
+        does NOT relabel the original sprite — labels behave as if
+        sourced from a fixed string array. NPC slots (sprite_map
+        0x30e..0x363) get attributed the same way as digimon since
+        ``digimon_display_name`` already covers both.
+
+        Returns a dict with four sub-maps, one per sprite_map field:
+        ``main_sprite`` (BTCHR), ``unknown_0x4`` (MCHR overworld),
+        ``upperscreen_low`` (SPR portrait), ``upperscreen_high`` (SPR
+        battle preview).
+        """
+        if self._sprite_attribution_snapshot is None:
+            snap: Dict[str, Dict[int, int]] = {
+                "main_sprite": {},
+                "unknown_0x4": {},
+                "upperscreen_low": {},
+                "upperscreen_high": {},
+            }
+            for base_id, entry in enumerate(getattr(self, "sprite_map", [])):
+                snap["main_sprite"].setdefault(entry.main_sprite, base_id)
+                snap["unknown_0x4"].setdefault(entry.unknown_0x4, base_id)
+                snap["upperscreen_low"].setdefault(entry.upperscreen_low, base_id)
+                snap["upperscreen_high"].setdefault(entry.upperscreen_high, base_id)
+            self._sprite_attribution_snapshot = snap
+        return self._sprite_attribution_snapshot
+
+    def get_spr_labels(self) -> List[str]:
+        """Shared SPR_* picker labels. Computed lazily, then cached.
+
+        Returns the same list object until ``invalidate_sprite_label_caches``
+        is called, so identity-keyed combo populators (see
+        ``_SpriteListPicker._populate``) can skip the 1627-item rebuild on
+        warm selection switches.
+        """
+        if self._spr_labels_cache is None:
+            from .widgets.sprite_browser import compute_spr_labels
+            self._spr_labels_cache = compute_spr_labels(self)
+        return self._spr_labels_cache
+
+    def get_mchr_labels(self) -> List[str]:
+        """Shared MCHR_* picker labels (overworld sprites)."""
+        if self._mchr_labels_cache is None:
+            from .widgets.mchr_browser import compute_mchr_labels
+            self._mchr_labels_cache = compute_mchr_labels(self)
+        return self._mchr_labels_cache
+
+    def get_btchr_group_labels(self) -> List[str]:
+        """Shared BTCHR group picker labels (main battle sprite)."""
+        if self._btchr_group_labels_cache is None:
+            from .widgets.btchr_browser import compute_btchr_group_labels
+            self._btchr_group_labels_cache = compute_btchr_group_labels(self)
+        return self._btchr_group_labels_cache
+
+    def invalidate_sprite_label_caches(self) -> None:
+        """Drop SPR / MCHR / BTCHR label caches and their picker models.
+
+        Call after a sprite_map edit (changes cross-ref names embedded in
+        SPR labels) or after a sprite-pak splice / BTCHR append (changes
+        pak length). Next ``get_*_labels`` / ``picker_model`` rebuilds
+        from scratch. Pooled sprite pickers get re-linked to the fresh
+        models so they don't show stale labels on next acquire.
+        """
+        self._spr_labels_cache = None
+        self._mchr_labels_cache = None
+        self._btchr_group_labels_cache = None
+        for kind in ("spr", "mchr", "btchr"):
+            self.invalidate_picker_model(kind)
+        self._relink_pooled_picker_models()
+        self.invalidate_battle_sprite_pixmap_cache()
+        self.invalidate_spr_pixmap_cache()
+        self.invalidate_mchr_pixmap_cache()
+
+    def _relink_pooled_picker_models(self) -> None:
+        """Re-attach pooled pickers to the current SPR/MCHR/BTCHR models.
+
+        Called after ``invalidate_sprite_label_caches`` so the long-lived
+        pool reflects the post-edit labels. Quietly no-ops when the pool
+        wasn't built (e.g. headless test sessions).
+        """
+        if self._pooled_sprite_pickers is None:
+            return
+        # Same slot order as _build_sprite_picker_pool: mchr, btchr, spr, spr.
+        kinds = ("mchr", "btchr", "spr", "spr")
+        for ix, kind in enumerate(kinds):
+            picker = self._pooled_sprite_pickers[ix]
+            model = self.picker_model(kind)
+            if model is None:
+                continue
+            # Silence currentIndexChanged: setModel emits when the new
+            # model's currentIndex differs, which would cascade into a
+            # spurious SetAttrCommand(slot, attr, 0) for every bound row.
+            # The picker's real index is restored by picker.refresh() in
+            # sprite_map_row.refresh() immediately after.
+            picker.blockSignals(True)
+            try:
+                picker.setModel(model)
+                completer = picker.completer()
+                if completer is not None:
+                    completer.setModel(model)
+            finally:
+                picker.blockSignals(False)
+            picker._shared_model = model
+
+    def picker_model(self, kind: str):
+        """Shared QStandardItemModel for combos of ``kind``, or ``None``.
+
+        Lazy: built on first request and cached. Every combo opting in
+        via ``setModel`` reuses the same model so the per-combo
+        ``addItem`` loop collapses to a single bulk build. Each row
+        carries ``UserRole = int_value`` so existing value-lookup paths
+        (``_ensure_index_for``) keep working unchanged.
+
+        Kinds with a ``(none)`` sentinel bake it into row 0 — callers
+        still pass ``none_value`` so they can recognize / skip the
+        sentinel, but they don't need to add the row themselves.
+        Imports Qt lazily so the headless ``RomSession`` import stays
+        Qt-free.
+        """
+        cached = self._picker_models.get(kind)
+        if cached is not None:
+            return cached
+        from PySide6.QtCore import Qt as _Qt
+        from PySide6.QtGui import QStandardItem, QStandardItemModel
+
+        rows: List[Tuple[int, str]] = []
+        if kind == "moves":
+            rows.append((0xFFFF, "(none)"))
+            rows.extend(
+                (i, f"0x{i:03x}  {name}")
+                for i, name in enumerate(constants.MOVE_ARRAY_STR)
+            )
+        elif kind == "traits_byte":
+            # Base digimon trait fields are 1-byte → sentinel 0xFF.
+            rows.append((0xFF, "(none)"))
+            rows.extend(
+                (i, f"0x{i:03x}  {name}")
+                for i, name in enumerate(constants.TRAIT_ARRAY_STR)
+            )
+        elif kind == "traits_word":
+            # Enemy digimon trait fields are 2-byte → sentinel 0xFFFF.
+            rows.append((0xFFFF, "(none)"))
+            rows.extend(
+                (i, f"0x{i:03x}  {name}")
+                for i, name in enumerate(constants.TRAIT_ARRAY_STR)
+            )
+        elif kind == "battle_strings":
+            base = constants.STRING_BATTLE_TABLE_OFFSET[self.version][0]
+            for g in self.string_regions.get("arm9_digiegg_enemy_names", []):
+                rel = g.offset - base
+                rows.append((rel, f"0x{rel:03x}  {g.text}"))
+        elif kind == "spr":
+            rows.extend(enumerate(self.get_spr_labels()))
+        elif kind == "mchr":
+            rows.extend(enumerate(self.get_mchr_labels()))
+        elif kind == "btchr":
+            rows.extend(enumerate(self.get_btchr_group_labels()))
+        elif kind == "digimon":
+            rows.extend(
+                (did, f"0x{did:03x}  {name}")
+                for did, name in sorted(
+                    constants.DIGIMON_ID_TO_STR.items(), key=lambda kv: kv[0]
+                )
+            )
+        elif kind == "digimon_evo":
+            # Standard-digivolution evo/degen target picker: NO_EVO_SENTINEL
+            # = 0xFFFFFFFF marks an empty slot, rendered as a "(none)" row at
+            # the top of the dropdown. Same digimon list otherwise.
+            rows.append((0xFFFFFFFF, "(none)"))
+            rows.extend(
+                (did, f"0x{did:03x}  {name}")
+                for did, name in sorted(
+                    constants.DIGIMON_ID_TO_STR.items(), key=lambda kv: kv[0]
+                )
+            )
+        elif kind == "item_reward":
+            # Encounter-reward slots: item id 0 is filtered out because the
+            # slot encoding can't represent it (raw=0 means "empty slot"),
+            # so a Scale reward would silently re-encode as empty.
+            rows.extend(
+                (iid, f"0x{iid:03x}  {name}")
+                for iid, name in sorted(
+                    constants.ITEM_ID_TO_STR.items(), key=lambda kv: kv[0]
+                )
+                if iid != 0
+            )
+        else:
+            return None
+
+        model = QStandardItemModel()
+        for value, label in rows:
+            item = QStandardItem(label)
+            item.setData(value, _Qt.UserRole)
+            item.setEditable(False)
+            model.appendRow(item)
+        self._picker_models[kind] = model
+        return model
+
+    def invalidate_picker_model(self, kind: str) -> None:
+        """Drop the cached shared model for ``kind``.
+
+        Next ``picker_model(kind)`` rebuilds. Combos currently bound to
+        the old model continue showing its rows until they're
+        re-constructed or explicitly rebound to the new model — fine
+        for our usage since editors are torn down on every navigation.
+        """
+        self._picker_models.pop(kind, None)
+
+    def _build_sprite_picker_pool(self) -> None:
+        """Build the 4 pooled _SpriteListPicker widgets (mchr/btchr/spr/spr).
+
+        Called at the end of ``_build`` so the ~185ms construction cost
+        rides the ROM-load tick instead of the first editor open. Pickers
+        are parented to a permanently-hidden holder widget until
+        acquired; this keeps Qt's visibility/window machinery quiet and
+        avoids the setParent(None)-induced top-level pop-up that would
+        otherwise flash every editor swap. Silently skips when no
+        QApplication is running (headless save tests).
+        """
+        from PySide6.QtWidgets import QApplication, QWidget
+        if QApplication.instance() is None:
+            return
+        from .widgets.sprite_map_row import _SpriteListPicker
+        self._picker_pool_holder = QWidget()
+        # Holder is a top-level widget that we never show — anything
+        # parented to it inherits the hidden state without acquiring
+        # the "explicitly hidden" flag, so re-parenting into a visible
+        # layout later just works.
+        holder = self._picker_pool_holder
+        self._pooled_sprite_pickers = [
+            _SpriteListPicker(self.get_mchr_labels, shared_kind="mchr"),
+            _SpriteListPicker(self.get_btchr_group_labels, shared_kind="btchr"),
+            _SpriteListPicker(self.get_spr_labels, shared_kind="spr"),
+            _SpriteListPicker(self.get_spr_labels, shared_kind="spr"),
+        ]
+        for picker in self._pooled_sprite_pickers:
+            picker.setParent(holder)
+
+    def acquire_sprite_pickers(self) -> Tuple[List[object], int]:
+        """Hand the pooled pickers to the active SpriteMapRow.
+
+        Returns ``(pickers, generation)``: the 4 pickers in fixed order
+        ([mchr, btchr, spr_low, spr_high]) and an ownership token. Caller
+        must pass that token back to ``release_sprite_pickers`` from its
+        teardown hook — only the *current* owner's release reparks the
+        pickers; stale releases (from an editor that's already been
+        succeeded by a new SpriteMapRow) no-op.
+        """
+        if self._pooled_sprite_pickers is None:
+            # Defensive: pool wasn't built (e.g. session built outside _build).
+            self._build_sprite_picker_pool()
+        self._picker_pool_generation += 1
+        return list(self._pooled_sprite_pickers or []), self._picker_pool_generation
+
+    def _build_combo_pools(self) -> None:
+        """Build the session-shared BoundIdCombo / BoundIdComboRow pools.
+
+        Currently just "moves" — 5 ``BoundIdComboRow`` widgets shared
+        between base + enemy digimon editors. Each row pays ~9ms in
+        ``setEditable`` + ``QCompleter`` setup; pooling collapses
+        5 × 9ms per editor open to a one-shot ROM-load cost. Seeds
+        them against ``base_digimon``'s first entry (any object with
+        ``move_signature, move_1..move_4`` works; the host editor
+        overrides via ``rebind`` on acquire).
+        """
+        from PySide6.QtWidgets import QApplication
+        if QApplication.instance() is None:
+            return
+        if not self.base_digimon:
+            # Defensive: no entries to seed with (partial/test sessions).
+            return
+        # BoundIdCombo's shared-model path reads from form_helpers'
+        # _SESSION_DATA registry, but main_window doesn't call
+        # set_details_providers until *after* _build returns. Register
+        # the picker_model lookup eagerly so the pool widgets pick up
+        # the shared "moves" model (skipping per-instance addItem +
+        # _apply_item_tooltips O(rows) work). main_window's later
+        # set_details_providers call is idempotent — clears and
+        # re-registers the same provider.
+        from .widgets import form_helpers
+        form_helpers._SESSION_DATA["picker_model"] = self.picker_model
+        from .widgets.form_helpers import BoundIdComboRow, move_choices
+        seed = next(iter(self.base_digimon.values()))
+        move_attrs = ["move_signature", "move_1", "move_2", "move_3", "move_4"]
+        holder = self._picker_pool_holder
+        rows: List[object] = []
+        for attr in move_attrs:
+            row = BoundIdComboRow(
+                seed, attr, move_choices(), undo_stack=None,
+                details_kind="move",
+                none_value=0xFFFF, none_label="(none)",
+                shared_kind="moves",
+            )
+            row.setParent(holder)
+            rows.append(row)
+        self._combo_pools["moves"] = rows
+        self._combo_pool_generations["moves"] = 0
+
+    def acquire_combo_pool(self, kind: str) -> Tuple[List[object], int]:
+        """Hand the named combo pool to the active editor.
+
+        Same ownership-token contract as ``acquire_sprite_pickers``: each
+        acquire bumps the generation for ``kind``; the host editor passes
+        that token back to ``release_combo_pool`` from its
+        ``aboutToTeardown`` so a stale release (when a newer editor has
+        already taken the pool) no-ops.
+        """
+        pool = self._combo_pools.get(kind)
+        if pool is None:
+            return [], 0
+        self._combo_pool_generations[kind] = self._combo_pool_generations.get(kind, 0) + 1
+        return list(pool), self._combo_pool_generations[kind]
+
+    def release_combo_pool(self, kind: str, generation: int) -> None:
+        """Park the named combo pool back on the hidden holder."""
+        if generation != self._combo_pool_generations.get(kind, 0):
+            return
+        pool = self._combo_pools.get(kind)
+        if pool is None or self._picker_pool_holder is None:
+            return
+        holder = self._picker_pool_holder
+        for widget in pool:
+            try:
+                widget.setParent(holder)
+            except RuntimeError:
+                pass
+
+    def release_sprite_pickers(self, generation: int) -> None:
+        """Park pooled pickers back on the hidden holder before teardown.
+
+        Reparenting to the holder (rather than ``None``) keeps the
+        widgets out of top-level state — setParent(None) would make
+        each picker a hidden top-level window that flashes briefly on
+        screen during the swap. No-ops when ``generation`` is stale: a
+        newer SpriteMapRow has already acquired the pool, so the calling
+        editor's teardown must not steal the pickers back.
+        """
+        if generation != self._picker_pool_generation:
+            return
+        if self._pooled_sprite_pickers is None or self._picker_pool_holder is None:
+            return
+        holder = self._picker_pool_holder
+        for picker in self._pooled_sprite_pickers:
+            try:
+                picker.setParent(holder)
+            except RuntimeError:
+                # Widget already destroyed (e.g. session being torn down).
+                pass
 
     def _build_digimon_name_cache(self) -> None:
         cache: Dict[int, str] = {}

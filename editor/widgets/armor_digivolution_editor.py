@@ -64,6 +64,8 @@ class _ConditionRow(QWidget):
         self._value_digi = BoundIdComboRow(
             target, value_attr, digimon_choices(), undo_stack,
             nav_kind="standard_digivolution",
+            shared_kind="digimon",
+            show_portrait_icons=False,
         )
         self._value_stack = QStackedWidget()
         self._value_stack.addWidget(self._value_spin)
@@ -139,6 +141,7 @@ class ArmorDigivolutionEditor(QWidget):
         self._digimon_row = BoundIdComboRow(
             first, "digimon_id", digimon_choices(), self._undo_stack,
             nav_kind="standard_digivolution",
+            shared_kind="digimon",
         )
         self._item_row = BoundIdCombo(
             first, "item_id", item_choices(), self._undo_stack, details_kind="item"
@@ -146,6 +149,7 @@ class ArmorDigivolutionEditor(QWidget):
         self._evo_row = BoundIdComboRow(
             first, "evolution_id", digimon_choices(), self._undo_stack,
             nav_kind="standard_digivolution",
+            shared_kind="digimon_evo",
         )
         identity_form.addRow("Digimon", self._digimon_row)
         identity_form.addRow("Item", with_open_button(self._item_row))

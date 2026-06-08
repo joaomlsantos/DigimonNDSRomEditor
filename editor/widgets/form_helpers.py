@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple, Type
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics, QRegularExpressionValidator, QUndoStack
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtWidgets import (
@@ -682,6 +682,8 @@ class BoundIdCombo(NoWheelComboBox):
         details_kind: Optional[str] = None,
         show_item_tooltips: bool = True,
         nav_kind: Optional[str] = None,
+        shared_kind: Optional[str] = None,
+        show_portrait_icons: bool = True,
     ):
         super().__init__()
         self._target = target
@@ -690,6 +692,13 @@ class BoundIdCombo(NoWheelComboBox):
         self._undo_stack = undo_stack
         self._none_value = none_value
         self._none_label = none_label
+        # When set, ``setModel`` swaps in a session-level QStandardItemModel
+        # shared by every combo of the same kind — saves the per-combo
+        # addItem loop (~5ms × N per editor open). The choices argument is
+        # ignored in that case; the model already carries every row,
+        # ``(none)`` sentinel included.
+        self._shared_kind = shared_kind
+        self._shared_model: Optional[object] = None
         # `details_kind` drives tooltip / inline-summary content; `nav_kind`
         # picks which "Open in …" handler the inline button uses. Defaults to
         # `details_kind` so the common case stays implicit — the wild-encounters
@@ -698,6 +707,12 @@ class BoundIdCombo(NoWheelComboBox):
         self._details_kind = details_kind
         self._nav_kind = nav_kind if nav_kind is not None else details_kind
         self._show_item_tooltips = show_item_tooltips
+        # Per-combo opt-out for portrait icons. Standard-digivolution condition
+        # value combos share the "digimon" model (so prewarm + the Target combos
+        # benefit) but suppress icons so the row height stays compact — a tall
+        # 32-px sprite in the value column made the condition row look uneven.
+        # Setting iconSize to (0, 0) blanks any icon the shared model carries.
+        self._show_portrait_icons = show_portrait_icons
         # Soft warn state — see `set_warn_state`. Stored separately from the
         # details-kind tooltip so toggling the warning doesn't permanently
         # clobber whatever the picker shows on hover.
@@ -707,6 +722,24 @@ class BoundIdCombo(NoWheelComboBox):
         # Wide enough for "0x1ff  Some Long Move Name" without expanding to
         # fill the entire form column.
         self.setMaximumWidth(280)
+        # Digimon pickers attach portrait QIcons to popup rows; they're
+        # loaded on first popup show (lazy — eager loading would stall
+        # editor open across ~400 sprites). The combo itself stays editable,
+        # so the closed QLineEdit never renders an icon — exactly what the
+        # user asked for (icons in dropdown only, not in the input).
+        self._icons_loaded: bool = False
+        if details_kind == "digimon":
+            if show_portrait_icons:
+                # Bump the icon up from the style default (~16px) so portraits
+                # read clearly, but cap the closed-combo max height to the
+                # natural text-row size — the larger icon then "peeks" above
+                # and below the row instead of pushing the form layout taller.
+                self.setIconSize(QSize(32, 32))
+                self.setMaximumHeight(self.fontMetrics().height() + 8)
+            else:
+                # Shared "digimon" model has icons attached; zero size hides
+                # them on combos that opted out (e.g. condition value).
+                self.setIconSize(QSize(0, 0))
 
         # Editable + NoInsert lets the user type to filter without ever adding
         # new rows to the model. The completer does substring matching so the
@@ -731,6 +764,27 @@ class BoundIdCombo(NoWheelComboBox):
             line_edit.editingFinished.connect(self._reset_text_to_selection)
 
     def _populate(self) -> None:
+        # Shared-model path: every combo of the same kind points at one
+        # session-owned QStandardItemModel that was pre-built at ROM
+        # load (see RomSession.picker_model). No per-instance addItem
+        # loop, no `(none)` row to add (already baked in at row 0).
+        # The (undefined …) fallback path still appends idempotently to
+        # the shared model — useful since unknown values are rare and
+        # other combos sharing the model benefit from the same row.
+        if self._shared_kind is not None:
+            shared = get_picker_model(self._shared_kind)
+            if shared is not None:
+                self._shared_model = shared
+                self.setModel(shared)
+                if self._completer is not None:
+                    self._completer.setModel(shared)
+                self._base_count = shared.rowCount()
+                self._icons_loaded = False
+                self._apply_item_tooltips()
+                return
+            # Session not registered yet — fall through to per-instance
+            # population so the combo still works in headless / test
+            # contexts.
         self.clear()
         if self._none_value is not None:
             self.addItem(self._none_label, userData=self._none_value)
@@ -743,7 +797,40 @@ class BoundIdCombo(NoWheelComboBox):
         # later by `_ensure_index_for`. We track it so rebind/refresh can drop
         # the prior session's fallback without rebuilding the entire choice list.
         self._base_count = self.count()
+        # Re-arm the lazy icon loader — a clear() drops every QIcon that was
+        # already attached, so the next popup needs to refill them.
+        self._icons_loaded = False
         self._apply_item_tooltips()
+
+    def showPopup(self) -> None:
+        # Populate digimon portrait icons on first popup show. The QIcons
+        # themselves are session-cached, so subsequent combos (and reopens
+        # of the same combo) only pay the per-item lookup cost. On a
+        # shared model the icons live on the model items, so the first
+        # combo to fill them covers every other combo of the same kind
+        # — guard via a model property to skip the loop entirely.
+        if (
+            self._details_kind == "digimon"
+            and self._show_portrait_icons
+            and not self._icons_loaded
+        ):
+            shared = self._shared_model
+            if shared is not None and shared.property("icons_loaded"):
+                self._icons_loaded = True
+            else:
+                for i in range(self.count()):
+                    value = self.itemData(i)
+                    if not isinstance(value, int):
+                        continue
+                    if self._none_value is not None and value == self._none_value:
+                        continue
+                    icon = get_digimon_portrait_icon(value)
+                    if icon is not None:
+                        self.setItemIcon(i, icon)
+                self._icons_loaded = True
+                if shared is not None:
+                    shared.setProperty("icons_loaded", True)
+        super().showPopup()
 
     def _trim_fallback_rows(self) -> None:
         """Remove any "(undefined …)" rows tacked on by prior selections.
@@ -751,7 +838,15 @@ class BoundIdCombo(NoWheelComboBox):
         Keeps the cost of `rebind`/`refresh` roughly O(1) instead of O(choices)
         — important for move/digimon combos with hundreds of items selected
         across many entries.
+
+        No-op on shared-model combos: fallback rows live on the
+        session-owned model and can be useful to *other* combos showing
+        the same unknown value. Letting them accumulate is fine —
+        bounded by the number of distinct unknown values in the dataset,
+        which is small in practice.
         """
+        if self._shared_model is not None:
+            return
         while self.count() > self._base_count:
             self.removeItem(self.count() - 1)
 
@@ -761,17 +856,41 @@ class BoundIdCombo(NoWheelComboBox):
                 return i
         self.addItem(f"(undefined 0x{value:x})", userData=value)
         # Newly-appended fallback row needs the same tooltip treatment.
-        self._set_item_tooltip(self.count() - 1, value)
-        return self.count() - 1
+        new_ix = self.count() - 1
+        self._set_item_tooltip(new_ix, value)
+        # Fallback row for an NPC / un-named slot can still resolve to a
+        # real portrait (sprite_map covers ids past DIGIMON_ID_TO_STR);
+        # only fill the icon if the rest of the popup has already loaded
+        # — otherwise showPopup will catch this row on its next pass.
+        if (
+            self._details_kind == "digimon"
+            and self._show_portrait_icons
+            and self._icons_loaded
+            and (self._none_value is None or value != self._none_value)
+        ):
+            icon = get_digimon_portrait_icon(value)
+            if icon is not None:
+                self.setItemIcon(new_ix, icon)
+        return new_ix
 
     def _apply_item_tooltips(self) -> None:
         if not self._details_kind or not self._show_item_tooltips:
             return
+        # Shared models: tooltips live on the model items themselves, so
+        # the first combo to populate them covers every other combo
+        # sharing the model. Subsequent calls are no-ops guarded by a
+        # model property — saves O(rows) work per editor open.
+        if self._shared_model is not None:
+            marker = self._shared_model.property("tooltips_kind")
+            if marker == self._details_kind:
+                return
         for i in range(self.count()):
             value = self.itemData(i)
             if not isinstance(value, int):
                 continue
             self._set_item_tooltip(i, value)
+        if self._shared_model is not None:
+            self._shared_model.setProperty("tooltips_kind", self._details_kind)
 
     def _set_item_tooltip(self, index: int, value: int) -> None:
         if not self._details_kind or not self._show_item_tooltips:
@@ -875,9 +994,18 @@ class BoundIdCombo(NoWheelComboBox):
         if new_value is None:
             return
         self._refresh_widget_tooltip()
+        # Pooled combos sit on the session's holder with no host editor —
+        # ignore selection changes there. Real edits land via the host
+        # editor's pool acquire (which injects target + undo_stack).
+        if self._target is None or self._undo_stack is None:
+            return
         if getattr(self._target, self._attr) == new_value:
             return
         self._undo_stack.push(SetAttrCommand(self._target, self._attr, new_value))
+
+    def set_undo_stack(self, undo_stack: QUndoStack) -> None:
+        """Inject the host editor's QUndoStack on pool acquire."""
+        self._undo_stack = undo_stack
 
 
 class BoundIdComboRow(QWidget):
@@ -906,6 +1034,8 @@ class BoundIdComboRow(QWidget):
         none_label: str = "(none)",
         max_visible: int = 20,
         nav_kind: Optional[str] = None,
+        shared_kind: Optional[str] = None,
+        show_portrait_icons: bool = True,
     ):
         super().__init__()
         # Inline label replaces the hover tooltip in these editors, so the
@@ -921,17 +1051,29 @@ class BoundIdComboRow(QWidget):
             details_kind=details_kind,
             show_item_tooltips=False,
             nav_kind=nav_kind,
+            shared_kind=shared_kind,
+            show_portrait_icons=show_portrait_icons,
         )
         self._details_kind = details_kind
         self._include_level = include_level
         self._label = QLabel()
         self._label.setStyleSheet("color: palette(mid);")
         self._open_btn = _make_combo_open_button(self.combo)
+        # Element icon shown next to the inline summary for move pickers.
+        # Empty pixmap on construction; ``_refresh_label`` fills it once the
+        # selected move resolves (and clears it on the (none) sentinel).
+        self._icon_label: Optional[QLabel] = None
+        if details_kind == "move":
+            self._icon_label = QLabel()
+            self._icon_label.setFixedSize(24, 24)
+            self._icon_label.setAlignment(Qt.AlignCenter)
 
         h = QHBoxLayout(self)
         h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(self.combo)
         h.addWidget(self._open_btn)
+        if self._icon_label is not None:
+            h.addWidget(self._icon_label)
         h.addWidget(self._label, 1)
 
         self.combo.currentIndexChanged.connect(lambda _i: self._refresh_label())
@@ -946,6 +1088,10 @@ class BoundIdComboRow(QWidget):
         self.combo.refresh()
         self._refresh_label()
 
+    def set_undo_stack(self, undo_stack: QUndoStack) -> None:
+        """Forward the host editor's stack to the inner combo on pool acquire."""
+        self.combo.set_undo_stack(undo_stack)
+
     def set_warn_state(self, triggered: bool, message: str = "") -> None:
         self.combo.set_warn_state(triggered, message)
 
@@ -954,6 +1100,8 @@ class BoundIdComboRow(QWidget):
         value = self.combo.itemData(ix) if ix >= 0 else None
         if not isinstance(value, int) or value == self.combo._none_value:
             self._label.setText("")
+            if self._icon_label is not None:
+                self._icon_label.clear()
             return
         if self._details_kind == "digimon":
             self._label.setText(
@@ -961,6 +1109,13 @@ class BoundIdComboRow(QWidget):
             )
         elif self._details_kind == "move":
             self._label.setText(move_inline_summary(value))
+            if self._icon_label is not None:
+                element = get_move_element(value)
+                pix = get_element_icon_pixmap(element) if element is not None else None
+                if pix is not None:
+                    self._icon_label.setPixmap(pix)
+                else:
+                    self._icon_label.clear()
         else:
             self._label.setText("")
 
@@ -1058,10 +1213,74 @@ def set_details_providers(session) -> None:
     _SESSION_DATA["moves"] = list(session.moves)
     _SESSION_DATA["encounter_rewards"] = session.encounter_rewards
     _SESSION_DATA["original_rom_data"] = session.original_rom_data
+    # Callable rather than a dict snapshot: the QIcons are built lazily on
+    # first popup, and storing the bound method lets the cache live on the
+    # session itself (cleared via `invalidate_portrait_icon_cache` after a
+    # sprite-map or SPR_*.PAK edit).
+    _SESSION_DATA["digimon_portrait_icon"] = session.digimon_portrait_icon
+    # Same lazy-pixmap contract as the portrait icons, but for the eight
+    # element sprites the move HUD uses. Combos with ``details_kind="move"``
+    # and the moves editor's Element row call this to surface the icon.
+    _SESSION_DATA["element_icon_pixmap"] = session.element_icon_pixmap
+    # Shared QStandardItemModel registry — combos opting in via
+    # ``shared_kind=...`` fetch the pre-built model here and skip their
+    # per-instance addItem loops. See RomSession.picker_model for the
+    # supported kinds.
+    _SESSION_DATA["picker_model"] = session.picker_model
 
 
 def clear_details_providers() -> None:
     _SESSION_DATA.clear()
+
+
+def get_picker_model(kind: str):
+    """Return the session's shared QStandardItemModel for ``kind``, or None.
+
+    Combos that opt in via ``shared_kind=`` call this to fetch the
+    pre-built model. ``None`` means no session is registered yet (e.g.
+    tests, headless tools, or first-frame races) — callers should fall
+    back to per-instance population.
+    """
+    provider = _SESSION_DATA.get("picker_model")
+    if provider is None:
+        return None
+    return provider(kind)
+
+
+def get_digimon_portrait_icon(digimon_id: int):
+    """Return the cached portrait QIcon for `digimon_id`, or None.
+
+    Returns None when no session is registered, the id has no sprite_map
+    slot, or the portrait sprite fails to parse — combos that consume this
+    just skip the icon argument in those cases.
+    """
+    provider = _SESSION_DATA.get("digimon_portrait_icon")
+    if provider is None:
+        return None
+    return provider(digimon_id)
+
+
+def get_element_icon_pixmap(element_value: int, max_size: int = 24):
+    """Return the cached element-icon QPixmap, or None.
+
+    Returns None when no session is registered, the element value is out of
+    range, or the SPR_CHR entry fails to parse.
+    """
+    provider = _SESSION_DATA.get("element_icon_pixmap")
+    if provider is None:
+        return None
+    return provider(element_value, max_size)
+
+
+def get_move_element(move_id: int) -> Optional[int]:
+    """Return the move's element enum value, or None on miss."""
+    moves = _SESSION_DATA.get("moves")
+    if not moves or not (0 <= move_id < len(moves)):
+        return None
+    element = getattr(moves[move_id], "element", None)
+    if element is None:
+        return None
+    return getattr(element, "value", element)
 
 
 def get_base_digimon(digimon_id: int):

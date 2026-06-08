@@ -94,11 +94,12 @@ def compute_spr_labels(session) -> List[str]:
     chr_pak = session.sprite_pak(SPR_CHR)
     cel_pak = session.sprite_pak(SPR_CEL)
     count = min(chr_pak.count, cel_pak.count, session.sprite_pak(SPR_PAL).count)
-    portrait_to_base: dict[int, int] = {}
-    preview_to_base: dict[int, int] = {}
-    for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
-        portrait_to_base.setdefault(entry.upperscreen_low, base_id)
-        preview_to_base.setdefault(entry.upperscreen_high, base_id)
+    # Frozen at session load — see RomSession.sprite_attribution. Means
+    # reassigning a digimon's portrait / battle-preview sprite later
+    # doesn't relabel the original sprite.
+    attribution = session.sprite_attribution()
+    portrait_to_base = attribution["upperscreen_low"]
+    preview_to_base = attribution["upperscreen_high"]
 
     out: List[str] = []
     for ix in range(count):

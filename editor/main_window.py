@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import project_file
+from ._perf import report_and_clear, span
 from .auto_updater import UpdateChecker
 from .changelog import changelog_dir, changelog_root, record_save, rom_hash
 from .prefs import prefs
@@ -310,11 +311,20 @@ class MainWindow(QMainWindow):
 
     def set_content(self, widget: QWidget) -> None:
         splitter: QSplitter = self.centralWidget()  # type: ignore[assignment]
-        old = splitter.widget(1)
-        old.setParent(None)
-        old.deleteLater()
-        splitter.addWidget(widget)
-        splitter.setSizes([180, 1100])
+        with span("teardown_old"):
+            old = splitter.widget(1)
+            # Editors that own pooled resources (e.g. SpriteMapRow's
+            # pooled sprite pickers) detach them here so Qt's
+            # parent-deletes-children rule doesn't drag pooled widgets
+            # down with the editor.
+            teardown = getattr(old, "aboutToTeardown", None)
+            if callable(teardown):
+                teardown()
+            old.setParent(None)
+            old.deleteLater()
+        with span("addWidget_new"):
+            splitter.addWidget(widget)
+            splitter.setSizes([180, 1100])
 
     def _refresh_status(self) -> None:
         if self.session is None:
@@ -949,15 +959,19 @@ class MainWindow(QMainWindow):
         label = index.data(Qt.DisplayRole)
         if self.session is None or key is None:
             return
-        widget = self._build_editor_for(key)
-        if widget is None:
-            collection = getattr(self.session, key)
-            count = len(collection)
-            placeholder = QLabel(f"{label}\n\n{count} records parsed.\n\nEditor coming soon.")
-            placeholder.setAlignment(Qt.AlignCenter)
-            widget = placeholder
-        self.set_content(widget)
-        self._last_nav_key = key
+        with span(f"nav {key}"):
+            with span("build_editor"):
+                widget = self._build_editor_for(key)
+            if widget is None:
+                collection = getattr(self.session, key)
+                count = len(collection)
+                placeholder = QLabel(f"{label}\n\n{count} records parsed.\n\nEditor coming soon.")
+                placeholder.setAlignment(Qt.AlignCenter)
+                widget = placeholder
+            with span("set_content"):
+                self.set_content(widget)
+            self._last_nav_key = key
+        report_and_clear()
 
     def _build_editor_for(self, key: str) -> Optional[QWidget]:
         """Construct the editor widget for `key`, or None if unmapped.
@@ -990,7 +1004,7 @@ class MainWindow(QMainWindow):
             widget.treeRequested.connect(self.navigate_to_digivolution_tree)
             return widget
         if key == "digivolution_trees":
-            widget = DigivolutionTreeEditor(self.session.standard_digivolutions)
+            widget = DigivolutionTreeEditor(self.session.standard_digivolutions, self.session)
             widget.digimonActivated.connect(
                 lambda did: self._navigate_to_issue("standard_digivolutions", did)
             )

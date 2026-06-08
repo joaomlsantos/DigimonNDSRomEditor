@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
+from .._perf import span
 from .digimon_list_panel import DigimonListPanel
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
@@ -131,38 +132,53 @@ class EnemyDigimonEditor(QWidget):
         self._session = session
         self._current_id: int = -1
 
-        self._list_panel = DigimonListPanel(
-            entries, label_for=self._list_label_for, dirty_aware=True,
-        )
-        self._list_panel.digimonSelected.connect(self._on_selection)
+        with span("EnemyDigimonEditor.__init__"):
+            with span("DigimonListPanel"):
+                self._list_panel = DigimonListPanel(
+                    entries, label_for=self._list_label_for, dirty_aware=True,
+                )
+            self._list_panel.digimonSelected.connect(self._on_selection)
 
-        # _build_detail_container() creates _sprite_row, which the label
-        # callback depends on for the reverse sprite-to-base lookup. The list
-        # was built before that existed, so re-render every row now.
-        self._detail = self._build_detail_container()
-        self._list_panel.refresh_all_labels()
+            # _build_detail_container() creates _sprite_row, which the label
+            # callback depends on for the reverse sprite-to-base lookup. The
+            # list was built before that existed, so re-render every row now.
+            with span("_build_detail_container"):
+                self._detail = self._build_detail_container()
+            with span("refresh_all_labels"):
+                self._list_panel.refresh_all_labels()
 
-        splitter = QSplitter(Qt.Horizontal, self)
-        splitter.addWidget(self._list_panel)
-        splitter.addWidget(self._detail)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 740])
+            with span("splitter+layout"):
+                splitter = QSplitter(Qt.Horizontal, self)
+                splitter.addWidget(self._list_panel)
+                splitter.addWidget(self._detail)
+                splitter.setStretchFactor(0, 0)
+                splitter.setStretchFactor(1, 1)
+                splitter.setSizes([260, 740])
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(splitter)
+                layout = QVBoxLayout(self)
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.addWidget(splitter)
 
-        undo_stack.indexChanged.connect(self._refresh_form)
-        # Reskin commands mutate sprite_map (not the enemy itself), so the
-        # list label has to be re-rendered explicitly whenever the undo state
-        # advances — _refresh_form only updates the right-hand form.
-        undo_stack.indexChanged.connect(self._refresh_list_label_for_current)
-        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
-        self._list_panel.select_first()
+            undo_stack.indexChanged.connect(self._refresh_form)
+            # Reskin commands mutate sprite_map (not the enemy itself), so
+            # the list label has to be re-rendered explicitly whenever the
+            # undo state advances — _refresh_form only updates the right form.
+            undo_stack.indexChanged.connect(self._refresh_list_label_for_current)
+            undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
+            with span("select_first"):
+                self._list_panel.select_first()
 
     def select_by_id(self, digimon_id: int) -> bool:
         return self._list_panel.select_by_id(digimon_id)
+
+    def aboutToTeardown(self) -> None:
+        """Called by main_window.set_content before this editor is destroyed.
+
+        Hands every pooled widget back to the session — otherwise Qt
+        deletes them along with this widget tree, defeating the pool.
+        """
+        self._sprite_row.release_pickers()
+        self._session.release_combo_pool("moves", self._moves_pool_generation)
 
     def _build_detail_container(self) -> QWidget:
         first = next(iter(self._entries.values()))
@@ -181,9 +197,10 @@ class EnemyDigimonEditor(QWidget):
         identity_form.addRow("ID", self._id_spin)
         identity_form.addRow("Species", self._species_combo)
 
-        self._sprite_row = SpriteMapRow(
-            self._sprite_map, self._battle_strings, self._undo_stack, self._session,
-        )
+        with span("SpriteMapRow"):
+            self._sprite_row = SpriteMapRow(
+                self._sprite_map, self._battle_strings, self._undo_stack, self._session,
+            )
 
         self._stat_widgets: Dict[str, BoundSpinBox] = {}
         stats_box = QGroupBox("Stats")
@@ -204,28 +221,31 @@ class EnemyDigimonEditor(QWidget):
             res_grid.addWidget(spin, ix // 4, (ix % 4) * 2 + 1)
 
         # Enemy trait and move fields are both 2 bytes → sentinel 0xFFFF.
-        self._trait_rows: Dict[str, BoundIdCombo] = {}
-        traits_box = QGroupBox("Traits")
-        traits_form = make_form(traits_box)
-        for attr, label in _TRAIT_FIELDS:
-            combo = BoundIdCombo(
-                first, attr, trait_choices(), self._undo_stack,
-                none_value=0xFFFF, none_label="(none)",
-            )
-            self._trait_rows[attr] = combo
-            traits_form.addRow(label, combo)
+        with span("trait_combos"):
+            self._trait_rows: Dict[str, BoundIdCombo] = {}
+            traits_box = QGroupBox("Traits")
+            traits_form = make_form(traits_box)
+            for attr, label in _TRAIT_FIELDS:
+                combo = BoundIdCombo(
+                    first, attr, trait_choices(), self._undo_stack,
+                    none_value=0xFFFF, none_label="(none)",
+                    shared_kind="traits_word",
+                )
+                self._trait_rows[attr] = combo
+                traits_form.addRow(label, combo)
 
-        self._move_rows: Dict[str, BoundIdComboRow] = {}
-        moves_box = QGroupBox("Moves")
-        moves_form = make_form(moves_box)
-        for attr, label in _MOVE_FIELDS:
-            row = BoundIdComboRow(
-                first, attr, move_choices(), self._undo_stack,
-                details_kind="move",
-                none_value=0xFFFF, none_label="(none)",
-            )
-            self._move_rows[attr] = row
-            moves_form.addRow(label, row)
+        with span("move_combos"):
+            # Pooled at the session level — see RomSession._build_combo_pools.
+            # Pool slot order matches _MOVE_FIELDS so attrs line up 1:1.
+            pool_rows, self._moves_pool_generation = self._session.acquire_combo_pool("moves")
+            self._move_rows: Dict[str, BoundIdComboRow] = {}
+            moves_box = QGroupBox("Moves")
+            moves_form = make_form(moves_box)
+            for (attr, label), row in zip(_MOVE_FIELDS, pool_rows):
+                row.set_undo_stack(self._undo_stack)
+                row.rebind(first)
+                self._move_rows[attr] = row
+                moves_form.addRow(label, row)
 
         self._usage_weight_widgets: Dict[str, BoundSpinBox] = {}
         weights_box = QGroupBox("Move Usage Probabilities")
@@ -302,7 +322,8 @@ class EnemyDigimonEditor(QWidget):
         for spin in self._exp_widgets.values():
             spin.valueChanged.connect(lambda _v: self._refresh_exp_total())
 
-        return wrap_in_scroll(content)
+        with span("wrap_in_scroll"):
+            return wrap_in_scroll(content)
 
     # ---- selection / refresh --------------------------------------------
 

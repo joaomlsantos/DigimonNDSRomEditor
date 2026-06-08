@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
     QFormLayout,
+    QGridLayout,
+    QHBoxLayout,
     QLabel,
     QVBoxLayout,
     QWidget,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
+from .._perf import span
 from ..commands import ReskinSlotCommand, SetAttrCommand
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
@@ -49,10 +52,18 @@ class _SpriteListPicker(NoWheelComboBox):
     switches don't pay the 1627-item add cost.
     """
 
-    def __init__(self, labels_provider, undo_stack: QUndoStack):
+    def __init__(
+        self,
+        labels_provider,
+        undo_stack: Optional[QUndoStack] = None,
+        shared_kind: Optional[str] = None,
+    ):
         super().__init__()
         self._labels_provider = labels_provider
-        self._undo_stack = undo_stack
+        # Undo stack may be supplied later via set_undo_stack — the session
+        # builds these pickers up-front (no main_window, no stack yet) and
+        # the host editor injects its stack on acquire.
+        self._undo_stack: Optional[QUndoStack] = undo_stack
         self._target = None
         self._attr: str = ""
         # Identity-key for the labels list we last populated with. The
@@ -60,8 +71,20 @@ class _SpriteListPicker(NoWheelComboBox):
         # costs ~130ms. The provider returns the SAME list object while
         # its cache is valid, so identity is a cheap "needs repopulate?"
         # check that lets the common case (selection switch, no pak
-        # change) skip the full rebuild.
+        # change) skip the full rebuild. Unused in shared-model mode.
         self._last_labels_id: int = -1
+        # Shared model kind ("spr" / "mchr" / "btchr") — when registered,
+        # bind() just setCurrentIndex's against the pre-built model and
+        # skips both labels_provider() and the addItem loop. Falls back
+        # to the labels_provider path if no session is registered.
+        self._shared_kind = shared_kind
+        self._shared_model = None
+        if shared_kind is not None:
+            from .form_helpers import get_picker_model
+            model = get_picker_model(shared_kind)
+            if model is not None:
+                self._shared_model = model
+                self.setModel(model)
 
         self.setMaximumWidth(360)
         self.setEditable(True)
@@ -70,6 +93,8 @@ class _SpriteListPicker(NoWheelComboBox):
         completer.setCaseSensitivity(Qt.CaseInsensitive)
         completer.setFilterMode(Qt.MatchContains)
         completer.setCompletionMode(QCompleter.PopupCompletion)
+        if self._shared_model is not None:
+            completer.setModel(self._shared_model)
         self.setCompleter(completer)
         self._completer = completer
 
@@ -77,6 +102,9 @@ class _SpriteListPicker(NoWheelComboBox):
         line_edit = self.lineEdit()
         if line_edit is not None:
             line_edit.editingFinished.connect(self._snap_text_to_selection)
+
+    def set_undo_stack(self, undo_stack: QUndoStack) -> None:
+        self._undo_stack = undo_stack
 
     def bind(self, target, attr: str) -> None:
         """Snap to ``target.attr``, rebuilding choices only when needed.
@@ -86,13 +114,18 @@ class _SpriteListPicker(NoWheelComboBox):
         which would otherwise push a spurious ``SetAttrCommand`` for
         index 0 on every selection switch.
 
-        Skips the rebuild when the provider returns the same list
-        object as last time (identity check). With 1627-item SPR
-        lists, this drops selection-switch cost from ~130ms to
-        negligible.
+        In shared-model mode the model is already populated at the
+        session level — just setCurrentIndex.
+
+        In labels-provider mode, skips the rebuild when the provider
+        returns the same list object as last time (identity check).
         """
         self._target = target
         self._attr = attr
+        if self._shared_model is not None:
+            with silenced(self):
+                self.setCurrentIndex(self._ensure_index_for(getattr(target, attr)))
+            return
         labels = self._labels_provider()
         with silenced(self):
             if id(labels) != self._last_labels_id:
@@ -123,7 +156,7 @@ class _SpriteListPicker(NoWheelComboBox):
         return self.count() - 1
 
     def _on_index_changed(self, _index: int) -> None:
-        if self._target is None:
+        if self._target is None or self._undo_stack is None:
             return
         value = self.currentData(Qt.UserRole)
         if value is None:
@@ -178,51 +211,83 @@ class SpriteMapRow:
         self._undo_stack = undo_stack
         self._session = session
         self._target_id: int = -1
-        # Computed lazily on first picker bind (compute_spr_labels parses
-        # 1627 NCGR+NCER entries — too slow to do at editor instantiation).
-        # Caching also lets _SpriteListPicker.bind skip its 1627-item
-        # rebuild via identity check on warm selection switches.
-        self._spr_labels_cache: Optional[List[str]] = None
-        self._btchr_labels_cache: Optional[List[str]] = None
-        self._mchr_labels_cache: Optional[List[str]] = None
 
         # Reverse lookup: main_sprite value -> first slot index that uses it.
         # Public so the host editor can decorate list / title labels with a
         # "displayed as" suffix when the slot has been reskinned.
         # Pickable list covers every sprite-map slot.
-        self.sprite_to_base: Dict[int, int] = {}
-        self._pickable: List[Tuple[int, str]] = []
-        for base_id in range(len(sprite_map)):
-            self._pickable.append((base_id, session.digimon_display_name(base_id)))
-            self.sprite_to_base.setdefault(sprite_map[base_id].main_sprite, base_id)
+        with span(f"pickable_build×{len(sprite_map)}"):
+            self.sprite_to_base: Dict[int, int] = {}
+            self._pickable: List[Tuple[int, str]] = []
+            for base_id in range(len(sprite_map)):
+                self._pickable.append((base_id, session.digimon_display_name(base_id)))
+                self.sprite_to_base.setdefault(sprite_map[base_id].main_sprite, base_id)
 
         self.group = QGroupBox("Display / Reskin")
-        outer = QVBoxLayout(self.group)
-        outer.setContentsMargins(8, 8, 8, 4)
+        horizontal = QHBoxLayout(self.group)
+        horizontal.setContentsMargins(8, 8, 8, 4)
+        horizontal.setSpacing(8)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(4)
+        horizontal.addLayout(outer, 1)
+
+        # Right column: 2x2 grid of live sprite previews, one per pak the
+        # sprite_map references. Pixmaps are pulled from session caches so
+        # the first edit pays decode cost (~5-15ms for SPR, ~5ms for MCHR,
+        # ~10-30ms for BTCHR) and subsequent paints are free.
+        #   row 0: Overworld | Battle
+        #   row 1: Portrait  | Mini
+        self._preview_size = 80
+        self._overworld_preview = self._make_preview_label()
+        self._battle_preview = self._make_preview_label()
+        self._portrait_preview = self._make_preview_label()
+        self._mini_preview = self._make_preview_label()
+
+        preview_grid = QGridLayout()
+        preview_grid.setContentsMargins(0, 0, 0, 0)
+        preview_grid.setHorizontalSpacing(8)
+        preview_grid.setVerticalSpacing(6)
+        for col, (caption, label) in enumerate((
+            ("Overworld", self._overworld_preview),
+            ("Battle", self._battle_preview),
+        )):
+            preview_grid.addWidget(self._make_preview_caption(caption), 0, col, Qt.AlignHCenter)
+            preview_grid.addWidget(label, 1, col, Qt.AlignHCenter)
+        for col, (caption, label) in enumerate((
+            ("Portrait", self._portrait_preview),
+            ("Mini", self._mini_preview),
+        )):
+            preview_grid.addWidget(self._make_preview_caption(caption), 2, col, Qt.AlignHCenter)
+            preview_grid.addWidget(label, 3, col, Qt.AlignHCenter)
+        horizontal.addLayout(preview_grid, 0)
+        preview_grid.setAlignment(Qt.AlignTop)
 
         # --- top: Appears-as picker (existing reskin convenience) ---
         top_form = QFormLayout()
         top_form.setContentsMargins(0, 0, 0, 0)
         top_form.setSpacing(4)
-        self._combo = NoWheelComboBox()
-        self._combo.setMaximumWidth(280)
-        # Editable + NoInsert + substring completer mirrors BoundIdCombo: user
-        # can type any name fragment to filter, free-typed text never inserts.
-        self._combo.setEditable(True)
-        self._combo.setInsertPolicy(QComboBox.NoInsert)
-        completer = QCompleter(self._combo)
-        completer.setCaseSensitivity(Qt.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchContains)
-        completer.setCompletionMode(QCompleter.PopupCompletion)
-        self._combo.setCompleter(completer)
-        for base_id, name in self._pickable:
-            self._combo.addItem(f"0x{base_id:03x}  {name}", userData=base_id)
-        completer.setModel(self._combo.model())
-        self._combo.currentIndexChanged.connect(self._on_reskin_changed)
-        line_edit = self._combo.lineEdit()
-        if line_edit is not None:
-            line_edit.editingFinished.connect(self._snap_reskin_text)
+        with span("appears_as_combo"):
+            self._combo = NoWheelComboBox()
+            self._combo.setMaximumWidth(280)
+            # Editable + NoInsert + substring completer mirrors BoundIdCombo: user
+            # can type any name fragment to filter, free-typed text never inserts.
+            self._combo.setEditable(True)
+            self._combo.setInsertPolicy(QComboBox.NoInsert)
+            completer = QCompleter(self._combo)
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchContains)
+            completer.setCompletionMode(QCompleter.PopupCompletion)
+            self._combo.setCompleter(completer)
+            with span(f"appears_as_addItem×{len(self._pickable)}"):
+                for base_id, name in self._pickable:
+                    self._combo.addItem(f"0x{base_id:03x}  {name}", userData=base_id)
+            completer.setModel(self._combo.model())
+            self._combo.currentIndexChanged.connect(self._on_reskin_changed)
+            line_edit = self._combo.lineEdit()
+            if line_edit is not None:
+                line_edit.editingFinished.connect(self._snap_reskin_text)
 
         self._status = QLabel("")
         self._status.setStyleSheet("color: palette(mid);")
@@ -244,27 +309,29 @@ class SpriteMapRow:
         self._id_spin = BoundSpinBox(first_slot, "id", 4, undo_stack, hex_display=True)
         # Party-follower overworld sprite — full MCHR_CHR list, name-filtered
         # via the shared picker (mirrors the BTCHR / SPR pickers below so all
-        # three sprite fields read the same way).
-        self._overworld_combo = _SpriteListPicker(
-            self._mchr_labels_provider, undo_stack,
-        )
-        self._overworld_combo.bind(first_slot, "unknown_0x4")
-        # All three sprite pickers are full searchable lists over the
-        # corresponding pak — not just the digimon-mapped subset. Labels
-        # come from the shared browser helpers so the formatting stays
-        # consistent across the app (e.g. `[ICON] Koromon`).
-        self._main_sprite_combo = _SpriteListPicker(
-            self._btchr_labels_provider, undo_stack,
-        )
-        self._main_sprite_combo.bind(first_slot, "main_sprite")
-        self._upper_sprite_low_combo = _SpriteListPicker(
-            self._spr_labels_provider, undo_stack,
-        )
-        self._upper_sprite_low_combo.bind(first_slot, "upperscreen_low")
-        self._upper_sprite_high_combo = _SpriteListPicker(
-            self._spr_labels_provider, undo_stack,
-        )
-        self._upper_sprite_high_combo.bind(first_slot, "upperscreen_high")
+        # three sprite fields read the same way). All four pickers opt into
+        # session-level shared QStandardItemModels — pre-built at ROM load
+        # (RomSession.picker_model) so editor open just setModels instead of
+        # paying ~280ms of addItem calls per open.
+        # Pickers are pooled at the session level (see
+        # RomSession.acquire_sprite_pickers) — constructed once at ROM
+        # load and reparented into this row's layout on acquire. Skips
+        # the ~46ms-per-picker setEditable + QCompleter setup that
+        # dominated editor open before pooling.
+        with span("sprite_pickers_acquire"):
+            pickers, self._picker_pool_generation = session.acquire_sprite_pickers()
+            self._overworld_combo = pickers[0]
+            self._main_sprite_combo = pickers[1]
+            self._upper_sprite_low_combo = pickers[2]
+            self._upper_sprite_high_combo = pickers[3]
+            # Pool builds pickers with no undo stack (session has none);
+            # inject the host editor's stack now so currentIndexChanged
+            # pushes commands onto the right history.
+            for picker in pickers:
+                picker.set_undo_stack(undo_stack)
+        with span("sprite_pickers_bind"):
+            for picker, attr in self._sprite_picker_bindings(first_slot):
+                picker.bind(first_slot, attr)
         # Battle string `value` is a relative offset into the ARM9 text
         # region: `STRING_BATTLE_TABLE_OFFSET[version][0] + value` lands on
         # a string inside `arm9_digiegg_enemy_names`. Showing the resolved
@@ -275,9 +342,11 @@ class SpriteMapRow:
         bs_choices: List[Tuple[int, str]] = [
             (g.offset - self._battle_str_base, g.text) for g in bs_strings
         ]
-        self._battle_str_combo = BoundIdCombo(
-            first_str, "value", bs_choices, undo_stack,
-        )
+        with span("battle_str_combo"):
+            self._battle_str_combo = BoundIdCombo(
+                first_str, "value", bs_choices, undo_stack,
+                shared_kind="battle_strings",
+            )
 
         manual_form = QFormLayout()
         manual_form.setContentsMargins(0, 0, 0, 0)
@@ -297,40 +366,39 @@ class SpriteMapRow:
         ]
         self._on_customize_toggled(False)
 
+        # Live preview hooks: re-render the matching preview tile whenever
+        # the user picks a different sprite. Stored as bound methods so
+        # release_pickers() can disconnect cleanly — pickers are pooled at
+        # the session level, so leaving the connections live would leak
+        # into the next editor that acquires them.
+        self._main_sprite_combo.currentIndexChanged.connect(self._refresh_battle_preview)
+        self._overworld_combo.currentIndexChanged.connect(self._refresh_overworld_preview)
+        self._upper_sprite_low_combo.currentIndexChanged.connect(self._refresh_portrait_preview)
+        self._upper_sprite_high_combo.currentIndexChanged.connect(self._refresh_mini_preview)
+
+    def _sprite_picker_bindings(self, slot) -> List[Tuple["_SpriteListPicker", str]]:
+        """The four sprite pickers paired with the slot attr they bind to.
+
+        Centralizes the picker/attr list so initial bind and rebind use
+        the same iteration order without duplicating the mapping.
+        """
+        return [
+            (self._overworld_combo, "unknown_0x4"),
+            (self._main_sprite_combo, "main_sprite"),
+            (self._upper_sprite_low_combo, "upperscreen_low"),
+            (self._upper_sprite_high_combo, "upperscreen_high"),
+        ]
+
     def _btchr_labels_provider(self) -> List[str]:
-        # Lazy import keeps editor.widgets.sprite_map_row importable
-        # without the heavier btchr_browser module on its bare-import path
-        # (and avoids a circular import via the parent package).
-        from .btchr_browser import compute_btchr_group_labels
-        # Same caching reasoning as _spr_labels_provider: returning the
-        # same list object lets _SpriteListPicker skip its rebuild on
-        # warm selection switches.
-        if self._btchr_labels_cache is None:
-            self._btchr_labels_cache = compute_btchr_group_labels(self._session)
-        return self._btchr_labels_cache
+        # Delegate to the session-level cache so opening a second editor
+        # (or toggling Customize on another digimon) doesn't recompute.
+        return self._session.get_btchr_group_labels()
 
     def _mchr_labels_provider(self) -> List[str]:
-        from .mchr_browser import compute_mchr_labels
-        # Same caching reasoning as _spr_labels_provider.
-        if self._mchr_labels_cache is None:
-            self._mchr_labels_cache = compute_mchr_labels(self._session)
-        return self._mchr_labels_cache
+        return self._session.get_mchr_labels()
 
     def _spr_labels_provider(self) -> List[str]:
-        from .sprite_browser import compute_spr_labels
-        # Cache the SPR labels until something invalidates them: 1627
-        # NCGR+NCER parses takes a few hundred ms; recomputing on every
-        # bind() would stutter selection switches. Caller invalidates
-        # via _invalidate_label_caches() when sprite_map cross-refs or
-        # pak length might have changed.
-        if self._spr_labels_cache is None:
-            self._spr_labels_cache = compute_spr_labels(self._session)
-        return self._spr_labels_cache
-
-    def _invalidate_label_caches(self) -> None:
-        self._spr_labels_cache = None
-        self._btchr_labels_cache = None
-        self._mchr_labels_cache = None
+        return self._session.get_spr_labels()
 
     def _on_customize_toggled(self, enabled: bool) -> None:
         # Manual widgets stay disabled when there's no slot to bind against
@@ -350,15 +418,35 @@ class SpriteMapRow:
     def widget(self) -> QWidget:
         return self.group
 
+    def release_pickers(self) -> None:
+        """Detach the pooled sprite pickers before this row is destroyed.
+
+        Host editors call this from their ``aboutToTeardown`` hook so
+        Qt's parent-deletes-children rule doesn't drag the pool widgets
+        down with the editor. Passes our generation token so the session
+        no-ops when a newer SpriteMapRow has already taken the pool —
+        otherwise this teardown would steal pickers back from the
+        just-constructed editor.
+        """
+        for combo, slot in (
+            (self._main_sprite_combo, self._refresh_battle_preview),
+            (self._overworld_combo, self._refresh_overworld_preview),
+            (self._upper_sprite_low_combo, self._refresh_portrait_preview),
+            (self._upper_sprite_high_combo, self._refresh_mini_preview),
+        ):
+            try:
+                combo.currentIndexChanged.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        self._session.release_sprite_pickers(self._picker_pool_generation)
+
     def rebind(self, target: Any) -> None:
         self._target_id = target.id
         if self._has_slot_for_target():
             slot = self._sprite_map[target.id]
             self._id_spin.rebind(slot)
-            self._overworld_combo.bind(slot, "unknown_0x4")
-            self._main_sprite_combo.bind(slot, "main_sprite")
-            self._upper_sprite_low_combo.bind(slot, "upperscreen_low")
-            self._upper_sprite_high_combo.bind(slot, "upperscreen_high")
+            for picker, attr in self._sprite_picker_bindings(slot):
+                picker.bind(slot, attr)
             self._battle_str_combo.rebind(self._battle_strings[target.id])
         self._apply_state()
 
@@ -367,10 +455,10 @@ class SpriteMapRow:
             return
         # refresh() runs on external state changes (undo/redo, tab switch).
         # SPR / BTCHR labels embed sprite_map cross-refs and depend on pak
-        # length, so drop the caches here — the next bind() recomputes.
-        # Cheap in-form changes (selection switches) go through rebind()
-        # and keep using the caches.
-        self._invalidate_label_caches()
+        # length, so drop the session-level caches here — the next bind()
+        # recomputes. Cheap in-form changes (selection switches) go through
+        # rebind() and keep using the caches.
+        self._session.invalidate_sprite_label_caches()
         self._apply_state()
         if self._has_slot_for_target():
             self._id_spin.refresh()
@@ -383,6 +471,9 @@ class SpriteMapRow:
     def _apply_state(self) -> None:
         target_id = self._target_id
         self.group.setVisible(True)
+        # Refresh previews first — each one handles its own "no slot / bad
+        # id" case so the early-return branches below don't have to.
+        self._refresh_all_previews()
 
         if target_id < 0:
             self._combo.setEnabled(False)
@@ -425,6 +516,75 @@ class SpriteMapRow:
                     self._combo.setCurrentIndex(i)
                 break
 
+    def _make_preview_label(self) -> QLabel:
+        """Build one fixed-size preview cell with the standard chrome."""
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        label.setFixedSize(self._preview_size, self._preview_size)
+        label.setStyleSheet(
+            "QLabel { background: palette(base); border: 1px solid palette(mid); }"
+        )
+        label.setText("—")
+        return label
+
+    def _make_preview_caption(self, text: str) -> QLabel:
+        """Small caption above a preview cell."""
+        cap = QLabel(text)
+        cap.setAlignment(Qt.AlignHCenter)
+        cap.setStyleSheet("color: palette(mid); font-size: 10px;")
+        return cap
+
+    def _set_preview(self, label: QLabel, pix) -> None:
+        """Helper: paint ``pix`` into ``label``, falling back to a dash."""
+        if pix is None:
+            label.clear()
+            label.setText("—")
+        else:
+            label.setPixmap(pix)
+
+    def _refresh_all_previews(self) -> None:
+        """Repaint all four preview tiles from the current slot."""
+        self._refresh_battle_preview()
+        self._refresh_overworld_preview()
+        self._refresh_portrait_preview()
+        self._refresh_mini_preview()
+
+    def _refresh_battle_preview(self, *_args) -> None:
+        if not self._has_slot_for_target():
+            self._set_preview(self._battle_preview, None)
+            return
+        group_idx = self._sprite_map[self._target_id].main_sprite
+        self._set_preview(self._battle_preview, self._session.battle_sprite_pixmap(
+            group_idx, max_size=self._preview_size
+        ))
+
+    def _refresh_overworld_preview(self, *_args) -> None:
+        if not self._has_slot_for_target():
+            self._set_preview(self._overworld_preview, None)
+            return
+        mchr_idx = self._sprite_map[self._target_id].unknown_0x4
+        self._set_preview(self._overworld_preview, self._session.mchr_sprite_pixmap(
+            mchr_idx, max_size=self._preview_size
+        ))
+
+    def _refresh_portrait_preview(self, *_args) -> None:
+        if not self._has_slot_for_target():
+            self._set_preview(self._portrait_preview, None)
+            return
+        spr_idx = self._sprite_map[self._target_id].upperscreen_low
+        self._set_preview(self._portrait_preview, self._session.spr_sprite_pixmap(
+            spr_idx, max_size=self._preview_size
+        ))
+
+    def _refresh_mini_preview(self, *_args) -> None:
+        if not self._has_slot_for_target():
+            self._set_preview(self._mini_preview, None)
+            return
+        spr_idx = self._sprite_map[self._target_id].upperscreen_high
+        self._set_preview(self._mini_preview, self._session.spr_sprite_pixmap(
+            spr_idx, max_size=self._preview_size
+        ))
+
     def _snap_reskin_text(self) -> None:
         """Revert free-typed text to the current item's label on focus-out."""
         line_edit = self._combo.lineEdit()
@@ -455,7 +615,8 @@ class SpriteMapRow:
         source_sprite = self._sprite_map[new_base_id]
         source_str = self._battle_strings[new_base_id]
 
-        if (sprite_entry.main_sprite == source_sprite.main_sprite
+        if (sprite_entry.unknown_0x4 == source_sprite.unknown_0x4
+                and sprite_entry.main_sprite == source_sprite.main_sprite
                 and sprite_entry.upperscreen_sprites == source_sprite.upperscreen_sprites
                 and str_entry.value == source_str.value):
             return
@@ -464,6 +625,7 @@ class SpriteMapRow:
             ReskinSlotCommand(
                 sprite_entry,
                 str_entry,
+                source_sprite.unknown_0x4,
                 source_sprite.main_sprite,
                 source_sprite.upperscreen_sprites,
                 source_str.value,

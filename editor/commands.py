@@ -65,10 +65,11 @@ class SetAttrCommand(QUndoCommand):
 class ReskinSlotCommand(QUndoCommand):
     """Atomic "Displayed As" reskin of a sprite_map slot.
 
-    Copies main_sprite + upperscreen_sprites from a source SpriteMapEntry and
-    the battle-string value from a source BattleStringEntry into the target
-    slot. Undo restores the previous three values in one step so a single
-    Ctrl+Z reverts the full reskin.
+    Copies unknown_0x4 (party-follower overworld) + main_sprite +
+    upperscreen_sprites from a source SpriteMapEntry and the battle-string
+    value from a source BattleStringEntry into the target slot. Undo
+    restores the previous four values in one step so a single Ctrl+Z
+    reverts the full reskin.
 
     Used by both base and enemy digimon editors — `sprite_map` is one flat
     table keyed by digimon_id, so the same operation applies in either
@@ -79,6 +80,7 @@ class ReskinSlotCommand(QUndoCommand):
         self,
         sprite_entry: Any,
         str_entry: Any,
+        new_overworld: int,
         new_main_sprite: int,
         new_upperscreen: int,
         new_str_value: int,
@@ -87,19 +89,23 @@ class ReskinSlotCommand(QUndoCommand):
         super().__init__(description or f"Reskin slot 0x{sprite_entry.id:03x}")
         self._sprite_entry = sprite_entry
         self._str_entry = str_entry
+        self._old_overworld = sprite_entry.unknown_0x4
         self._old_main = sprite_entry.main_sprite
         self._old_upper = sprite_entry.upperscreen_sprites
         self._old_str = str_entry.value
+        self._new_overworld = new_overworld
         self._new_main = new_main_sprite
         self._new_upper = new_upperscreen
         self._new_str = new_str_value
 
     def redo(self) -> None:
+        self._sprite_entry.unknown_0x4 = self._new_overworld
         self._sprite_entry.main_sprite = self._new_main
         self._sprite_entry.upperscreen_sprites = self._new_upper
         self._str_entry.value = self._new_str
 
     def undo(self) -> None:
+        self._sprite_entry.unknown_0x4 = self._old_overworld
         self._sprite_entry.main_sprite = self._old_main
         self._sprite_entry.upperscreen_sprites = self._old_upper
         self._str_entry.value = self._old_str

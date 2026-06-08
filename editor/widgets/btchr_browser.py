@@ -143,9 +143,10 @@ def compute_btchr_group_labels(session) -> List[str]:
     any appended). Used by other widgets (e.g. the enemy-digimon editor's
     main-sprite picker) so labels stay consistent across the app."""
     chrsize_rows = _load_chrsize_rows_live(session)
-    sprite_to_base: dict[int, int] = {}
-    for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
-        sprite_to_base.setdefault(entry.main_sprite, base_id)
+    # Frozen at session load — see RomSession.sprite_attribution. Means
+    # reassigning a digimon's main_sprite later doesn't relabel the
+    # original sprite.
+    sprite_to_base = session.sprite_attribution()["main_sprite"]
 
     n_groups = session.vanilla_btchr_group_count() + len(session.btchr_appended_sidecars())
     out: List[str] = []

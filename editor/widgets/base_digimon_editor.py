@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
+from .._perf import span
 from .digimon_list_panel import DigimonListPanel
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
@@ -126,40 +127,55 @@ class BaseDigimonEditor(QWidget):
         self._session = session
         self._current_id: int = -1
 
-        self._list_panel = DigimonListPanel(
-            entries, label_for=self._list_label_for, dirty_aware=True,
-        )
-        self._list_panel.digimonSelected.connect(self._on_selection)
+        with span("BaseDigimonEditor.__init__"):
+            with span("DigimonListPanel"):
+                self._list_panel = DigimonListPanel(
+                    entries, label_for=self._list_label_for, dirty_aware=True,
+                )
+            self._list_panel.digimonSelected.connect(self._on_selection)
 
-        # _build_detail_container() creates _sprite_row, which the label
-        # callback depends on for the reverse sprite-to-base lookup. The list
-        # was built before that existed, so re-render every row now.
-        self._detail = self._build_detail_container()
-        self._list_panel.refresh_all_labels()
+            # _build_detail_container() creates _sprite_row, which the label
+            # callback depends on for the reverse sprite-to-base lookup. The
+            # list was built before that existed, so re-render every row now.
+            with span("_build_detail_container"):
+                self._detail = self._build_detail_container()
+            with span("refresh_all_labels"):
+                self._list_panel.refresh_all_labels()
 
-        splitter = QSplitter(Qt.Horizontal, self)
-        splitter.addWidget(self._list_panel)
-        splitter.addWidget(self._detail)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 740])
+            with span("splitter+layout"):
+                splitter = QSplitter(Qt.Horizontal, self)
+                splitter.addWidget(self._list_panel)
+                splitter.addWidget(self._detail)
+                splitter.setStretchFactor(0, 0)
+                splitter.setStretchFactor(1, 1)
+                splitter.setSizes([260, 740])
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(splitter)
+                layout = QVBoxLayout(self)
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.addWidget(splitter)
 
-        # repopulate after undo/redo so the form reflects the model
-        undo_stack.indexChanged.connect(self._refresh_form)
-        # Reskin commands mutate sprite_map (not the digimon itself), so the
-        # list label has to be re-rendered explicitly whenever the undo state
-        # advances — _refresh_form only updates the right-hand form.
-        undo_stack.indexChanged.connect(self._refresh_list_label_for_current)
-        undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
+            # repopulate after undo/redo so the form reflects the model
+            undo_stack.indexChanged.connect(self._refresh_form)
+            # Reskin commands mutate sprite_map (not the digimon itself), so
+            # the list label has to be re-rendered explicitly whenever the
+            # undo state advances — _refresh_form only updates the right form.
+            undo_stack.indexChanged.connect(self._refresh_list_label_for_current)
+            undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
 
-        self._list_panel.select_first()
+            with span("select_first"):
+                self._list_panel.select_first()
 
     def select_by_id(self, digimon_id: int) -> bool:
         return self._list_panel.select_by_id(digimon_id)
+
+    def aboutToTeardown(self) -> None:
+        """Called by main_window.set_content before this editor is destroyed.
+
+        Hands every pooled widget back to the session — otherwise Qt
+        deletes them along with this widget tree, defeating the pool.
+        """
+        self._sprite_row.release_pickers()
+        self._session.release_combo_pool("moves", self._moves_pool_generation)
 
     # ---- detail form -----------------------------------------------------
 
@@ -182,9 +198,10 @@ class BaseDigimonEditor(QWidget):
         identity_form.addRow("Species", self._species_combo)
         identity_form.addRow("Type", self._type_combo)
 
-        self._sprite_row = SpriteMapRow(
-            self._sprite_map, self._battle_strings, self._undo_stack, self._session,
-        )
+        with span("SpriteMapRow"):
+            self._sprite_row = SpriteMapRow(
+                self._sprite_map, self._battle_strings, self._undo_stack, self._session,
+            )
 
         # Stats and resistances are 8 fields each — laid out as 2 rows × 4
         # label+value pairs so the entire detail form fits on one screen.
@@ -212,28 +229,31 @@ class BaseDigimonEditor(QWidget):
         # Sentinel values for "no trait" / "no move" slots — all-bits-set for
         # the field's byte width. Base digimon trait fields are 1 byte → 0xFF;
         # move fields are 2 bytes → 0xFFFF.
-        self._trait_rows: Dict[str, BoundIdCombo] = {}
-        traits_box = QGroupBox("Traits")
-        traits_form = make_form(traits_box)
-        for attr, label in _TRAIT_FIELDS:
-            combo = BoundIdCombo(
-                first, attr, trait_choices(), self._undo_stack,
-                none_value=0xFF, none_label="(none)",
-            )
-            self._trait_rows[attr] = combo
-            traits_form.addRow(label, combo)
+        with span("trait_combos"):
+            self._trait_rows: Dict[str, BoundIdCombo] = {}
+            traits_box = QGroupBox("Traits")
+            traits_form = make_form(traits_box)
+            for attr, label in _TRAIT_FIELDS:
+                combo = BoundIdCombo(
+                    first, attr, trait_choices(), self._undo_stack,
+                    none_value=0xFF, none_label="(none)",
+                    shared_kind="traits_byte",
+                )
+                self._trait_rows[attr] = combo
+                traits_form.addRow(label, combo)
 
-        self._move_rows: Dict[str, BoundIdComboRow] = {}
-        moves_box = QGroupBox("Moves")
-        moves_form = make_form(moves_box)
-        for attr, label in _MOVE_FIELDS:
-            row = BoundIdComboRow(
-                first, attr, move_choices(), self._undo_stack,
-                details_kind="move",
-                none_value=0xFFFF, none_label="(none)",
-            )
-            self._move_rows[attr] = row
-            moves_form.addRow(label, row)
+        with span("move_combos"):
+            # Pooled at the session level — see RomSession._build_combo_pools.
+            # Pool slot order matches _MOVE_FIELDS so attrs line up 1:1.
+            pool_rows, self._moves_pool_generation = self._session.acquire_combo_pool("moves")
+            self._move_rows: Dict[str, BoundIdComboRow] = {}
+            moves_box = QGroupBox("Moves")
+            moves_form = make_form(moves_box)
+            for (attr, label), row in zip(_MOVE_FIELDS, pool_rows):
+                row.set_undo_stack(self._undo_stack)
+                row.rebind(first)
+                self._move_rows[attr] = row
+                moves_form.addRow(label, row)
 
         self._misc_widgets: Dict[str, object] = {}
         misc_box = QGroupBox("Misc")
@@ -272,7 +292,8 @@ class BaseDigimonEditor(QWidget):
         content_layout.addWidget(misc_box)
         content_layout.addStretch(1)
 
-        return wrap_in_scroll(content)
+        with span("wrap_in_scroll"):
+            return wrap_in_scroll(content)
 
     # ---- selection / refresh --------------------------------------------
 

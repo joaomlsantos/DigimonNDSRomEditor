@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QLineEdit, QListView, QVBoxLayout, QWidget
 
 from digimon_core import constants
 
+from .._perf import span
 from .form_helpers import is_record_dirty
 
 
@@ -52,33 +53,35 @@ class DigimonListPanel(QWidget):
         self._inner_label_for = label_for or _default_label
         self._dirty_aware = dirty_aware
 
-        self._source_model = QStandardItemModel(self)
-        self._row_by_id: Dict[int, int] = {}
-        for row_ix, digimon_id in enumerate(sorted(entries.keys())):
-            item = QStandardItem(self._decorated_label(digimon_id))
-            item.setEditable(False)
-            item.setData(digimon_id, Qt.UserRole)
-            self._source_model.appendRow(item)
-            self._row_by_id[digimon_id] = row_ix
+        with span(f"build_rows×{len(entries)}"):
+            self._source_model = QStandardItemModel(self)
+            self._row_by_id: Dict[int, int] = {}
+            for row_ix, digimon_id in enumerate(sorted(entries.keys())):
+                item = QStandardItem(self._decorated_label(digimon_id))
+                item.setEditable(False)
+                item.setData(digimon_id, Qt.UserRole)
+                self._source_model.appendRow(item)
+                self._row_by_id[digimon_id] = row_ix
 
-        self._proxy = QSortFilterProxyModel(self)
-        self._proxy.setSourceModel(self._source_model)
-        self._proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        with span("proxy+view"):
+            self._proxy = QSortFilterProxyModel(self)
+            self._proxy.setSourceModel(self._source_model)
+            self._proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
 
-        self._filter_box = QLineEdit()
-        self._filter_box.setPlaceholderText("Filter by name or id…")
-        self._filter_box.textChanged.connect(self._proxy.setFilterFixedString)
+            self._filter_box = QLineEdit()
+            self._filter_box.setPlaceholderText("Filter by name or id…")
+            self._filter_box.textChanged.connect(self._proxy.setFilterFixedString)
 
-        self._view = QListView()
-        self._view.setModel(self._proxy)
-        self._view.setUniformItemSizes(True)
-        self._view.setEditTriggers(QListView.NoEditTriggers)
-        self._view.selectionModel().currentChanged.connect(self._on_current_changed)
+            self._view = QListView()
+            self._view.setModel(self._proxy)
+            self._view.setUniformItemSizes(True)
+            self._view.setEditTriggers(QListView.NoEditTriggers)
+            self._view.selectionModel().currentChanged.connect(self._on_current_changed)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(self._filter_box)
-        layout.addWidget(self._view)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(4, 4, 4, 4)
+            layout.addWidget(self._filter_box)
+            layout.addWidget(self._view)
 
     def _decorated_label(self, digimon_id: int) -> str:
         base = self._inner_label_for(digimon_id)
@@ -117,10 +120,11 @@ class DigimonListPanel(QWidget):
             item.setText(self._decorated_label(digimon_id))
 
     def refresh_all_labels(self) -> None:
-        for digimon_id, row in self._row_by_id.items():
-            item = self._source_model.item(row)
-            if item is not None:
-                item.setText(self._decorated_label(digimon_id))
+        with span(f"refresh_labels×{len(self._row_by_id)}"):
+            for digimon_id, row in self._row_by_id.items():
+                item = self._source_model.item(row)
+                if item is not None:
+                    item.setText(self._decorated_label(digimon_id))
 
     def refresh_dirty_state(self) -> None:
         """Re-render every row label so dirty markers reflect the latest

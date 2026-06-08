@@ -62,6 +62,7 @@ class _EncounterRow:
             target, "digimon_id", digimon_choices(), undo_stack,
             include_level=True,
             nav_kind="enemy_digimon",
+            shared_kind="digimon",
         )
         # reward_slot indexes into encounter_rewards; anything past the table
         # length points at nothing and the game won't drop a reward. Warn the

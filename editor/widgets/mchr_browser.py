@@ -100,9 +100,10 @@ def compute_mchr_labels(session) -> List[str]:
     browser's `_labels` so other widgets can populate pickers without
     instantiating a viewer."""
     chr_pak = session.sprite_pak(MCHR_CHR)
-    overworld_to_base: dict[int, int] = {}
-    for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
-        overworld_to_base.setdefault(entry.unknown_0x4, base_id)
+    # Frozen at session load — see RomSession.sprite_attribution. Means
+    # reassigning a digimon's overworld sprite later doesn't relabel
+    # the original sprite.
+    overworld_to_base = session.sprite_attribution()["unknown_0x4"]
 
     out: List[str] = []
     for ix in range(chr_pak.count):

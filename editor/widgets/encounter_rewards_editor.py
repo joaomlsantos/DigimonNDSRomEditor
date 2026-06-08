@@ -142,7 +142,8 @@ class _SlotRow:
         self._empty_filler = QLabel("—")
         self._empty_filler.setStyleSheet("color: palette(mid);")
         self.item_combo = BoundIdCombo(
-            proxy, "reward", _reward_item_choices(), undo_stack, details_kind="item"
+            proxy, "reward", _reward_item_choices(), undo_stack,
+            details_kind="item", shared_kind="item_reward",
         )
         self.money_spin = NoWheelSpinBox()
         self.money_spin.setRange(1, MAX_MONEY_AMOUNT)

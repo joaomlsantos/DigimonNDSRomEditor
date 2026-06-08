@@ -33,6 +33,7 @@ from .form_helpers import (
     BoundSpinBox,
     NoWheelSpinBox,
     add_unknown_form_row,
+    get_element_icon_pixmap,
     is_record_dirty,
     make_form,
     register_unknown_container,
@@ -374,6 +375,19 @@ class MoveEditor(QWidget):
             warn_above=_MP_COST_CAP, warn_message=_MP_COST_MESSAGE,
         )
         self._element_combo = BoundEnumCombo(first, "element", model.Element, self._undo_stack)
+        # Element icon parked right of the combo: lifts the same SPR_CHR
+        # entry the in-game move HUD uses, refreshed on every combo change
+        # and on record swap (refresh()).
+        self._element_icon = QLabel()
+        self._element_icon.setFixedSize(24, 24)
+        self._element_icon.setAlignment(Qt.AlignCenter)
+        self._element_combo.currentIndexChanged.connect(lambda _i: self._refresh_element_icon())
+        element_row = QWidget()
+        element_h = QHBoxLayout(element_row)
+        element_h.setContentsMargins(0, 0, 0, 0)
+        element_h.addWidget(self._element_combo)
+        element_h.addWidget(self._element_icon)
+        element_h.addStretch(1)
         self._special_combo = BoundIntChoiceCombo(
             first, "special_identifier", _SPECIAL_IDENTIFIER_CHOICES, self._undo_stack
         )
@@ -386,7 +400,7 @@ class MoveEditor(QWidget):
         identity_form = make_form(identity_box)
         identity_form.addRow("ID", self._id_spin)
         identity_form.addRow("MP Cost", self._mp_spin)
-        identity_form.addRow("Element", self._element_combo)
+        identity_form.addRow("Element", element_row)
         identity_form.addRow("Special", self._special_combo)
         identity_form.addRow("Level Learned", self._level_spin)
 
@@ -466,6 +480,7 @@ class MoveEditor(QWidget):
         self._title.setText(self._title_for(target))
         for w in self._all_widgets():
             w.rebind(target)
+        self._refresh_element_icon()
 
     def _refresh_form(self, _index: int) -> None:
         if not (0 <= self._current_ix < len(self._moves)):
@@ -474,6 +489,17 @@ class MoveEditor(QWidget):
         self._title.setText(self._title_for(target))
         for w in self._all_widgets():
             w.refresh()
+        self._refresh_element_icon()
+
+    def _refresh_element_icon(self) -> None:
+        ix = self._element_combo.currentIndex()
+        member = self._element_combo.itemData(ix) if ix >= 0 else None
+        element_value = getattr(member, "value", None)
+        pix = get_element_icon_pixmap(element_value) if element_value is not None else None
+        if pix is not None:
+            self._element_icon.setPixmap(pix)
+        else:
+            self._element_icon.clear()
 
     @staticmethod
     def _title_for(target: model.MoveData) -> str:

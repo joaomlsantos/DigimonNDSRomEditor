@@ -66,6 +66,8 @@ class _CondValueField(QWidget):
         self._digi_combo = BoundIdComboRow(
             target, value_attr, digimon_choices(), undo_stack,
             nav_kind="standard_digivolution",
+            shared_kind="digimon",
+            show_portrait_icons=False,
         )
 
         self._stack = QStackedWidget()
@@ -115,6 +117,7 @@ class _EvoTargetGroup(QGroupBox):
             target, id_attr, digimon_choices(), undo_stack,
             none_value=NO_EVO_SENTINEL,
             nav_kind="standard_digivolution",
+            shared_kind="digimon_evo",
         )
 
         self._cond_id_combos: List[BoundIntChoiceCombo] = []

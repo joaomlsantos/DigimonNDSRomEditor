@@ -56,7 +56,8 @@ class _StarterRow:
     def __init__(self, target: model.StarterEntry, undo_stack: QUndoStack):
         self._target = target
         self.id_combo = BoundIdComboRow(
-            target, "digimon_id", digimon_choices(), undo_stack
+            target, "digimon_id", digimon_choices(), undo_stack,
+            shared_kind="digimon",
         )
         self.level_spin = BoundSpinBox(target, "level", 2, undo_stack)
         self.level_spin.setToolTip(
