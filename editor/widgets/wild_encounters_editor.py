@@ -38,11 +38,12 @@ from .record_list_panel import RecordListPanel
 
 def _build_area_labels(version: str, areas: List[model.WildEncounterArea]) -> List[str]:
     """Label each area as `<Location> Area <n>` with n resetting per location."""
+    del version
     labels: List[str] = []
     last_location: str = ""
     counter = 0
-    for area in areas:
-        location = loaders.getCurrentLocation(area.offset, version)
+    for ix, _area in enumerate(areas):
+        location = loaders.getLocationForAreaIndex(ix)
         if location != last_location:
             counter = 1
             last_location = location

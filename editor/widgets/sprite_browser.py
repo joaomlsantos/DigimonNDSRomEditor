@@ -41,13 +41,21 @@ from PySide6.QtWidgets import (
 
 from digimon_core import ncer as ncer_mod, pak, sprite
 
-from ..commands import ReplaceSpriteCommand
+from ..commands import AppendPakEntriesCommand, ReplaceSpriteCommand
 from .record_list_panel import RecordListPanel
 
 
 SPR_CHR = "DAT/SPR_CHR.PAK"
 SPR_PAL = "DAT/SPR_PAL.PAK"
 SPR_CEL = "DAT/SPR_CEL.PAK"
+SPR_ANM = "DAT/SPR_ANM.PAK"
+
+# Every SPR_* pak is a strict parallel array of the same length — appending
+# an entry to one without the others would desynchronize the trio that the
+# preview pipeline relies on (CHR/PAL/CEL by-index pairing) plus the ANM
+# table the engine reads in lockstep. "Duplicate entry" therefore clones
+# the source index from all four paks at once.
+SPR_PARALLEL_PAKS = (SPR_CHR, SPR_PAL, SPR_CEL, SPR_ANM)
 
 
 # Per-cell highlight colors for the OAM overlay. RGBA with low alpha so the
@@ -62,6 +70,67 @@ OAM_OVERLAY_COLORS = (
     (255, 140,  40),
     (180, 120, 255),
 )
+
+
+def _format_spr_label(prefix: str, role_token: str, metadata: str) -> str:
+    """Compose a SPR_* list label.
+
+    Format with role: ``"{prefix}  [ICON] {name} - {metadata}"`` (or BTMINI,
+    or both joined). Format without role: ``"{prefix}  {metadata}"``.
+    """
+    if role_token:
+        return f"{prefix}  {role_token} - {metadata}"
+    return f"{prefix}  {metadata}"
+
+
+def compute_spr_labels(session) -> List[str]:
+    """Public helper: full SPR_* label list (one per CHR entry).
+
+    Used by the enemy-digimon editor's picker comboboxes so portrait /
+    battle-mini fields surface the same `[ICON]` / `[BTMINI]` annotations
+    the browser shows. Equivalent to instantiating the browser and reading
+    ``_labels`` but without building a widget.
+    """
+    chr_pak = session.sprite_pak(SPR_CHR)
+    cel_pak = session.sprite_pak(SPR_CEL)
+    count = min(chr_pak.count, cel_pak.count, session.sprite_pak(SPR_PAL).count)
+    portrait_to_base: dict[int, int] = {}
+    preview_to_base: dict[int, int] = {}
+    for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
+        portrait_to_base.setdefault(entry.upperscreen_low, base_id)
+        preview_to_base.setdefault(entry.upperscreen_high, base_id)
+
+    out: List[str] = []
+    for ix in range(count):
+        prefix = f"0x{ix:04x}"
+        parts: List[str] = []
+        p_base = portrait_to_base.get(ix)
+        if p_base is not None:
+            # NPC portraits (e.g. icon 0x600 ↔ slot 0x30e for Glare)
+            # resolve through the battle-string fallback the same way
+            # digimon portraits do — single lookup for both cases.
+            parts.append(f"[ICON] {session.digimon_display_name(p_base)}")
+        b_base = preview_to_base.get(ix)
+        if b_base is not None:
+            parts.append(f"[BTMINI] {session.digimon_display_name(b_base)}")
+        role = " ".join(parts)
+        try:
+            tile_bytes, bit_depth, *_ = sprite.parse_ncgr(chr_pak.entries[ix])
+            parsed_ncer = ncer_mod.parse_ncer(cel_pak.entries[ix])
+        except (ValueError, IndexError):
+            out.append(_format_spr_label(prefix, role, "(parse error)"))
+            continue
+        bytes_per_tile = 32 if bit_depth == 3 else 64
+        n_tiles = len(tile_bytes) // bytes_per_tile
+        n_cells = len(parsed_ncer.cells)
+        if n_cells == 0 or n_tiles == 0:
+            out.append(_format_spr_label(prefix, role, "(empty)"))
+            continue
+        w, h = ncer_mod.sprite_bbox(parsed_ncer)
+        bpp_token = "4bpp" if bit_depth == 3 else "8bpp"
+        size_token = f"{w}×{h}" if (w and h) else "0×0"
+        out.append(_format_spr_label(prefix, role, f"{bpp_token} {size_token} {n_cells}c"))
+    return out
 
 
 class SpriteBrowser(QWidget):
@@ -92,6 +161,18 @@ class SpriteBrowser(QWidget):
         self._preview_src_size: Tuple[int, int] = (0, 0)
         self._preview_pixmap_size: Tuple[int, int] = (0, 0)
         self._show_oam_overlay: bool = False
+
+        # Reverse lookups: SPR index -> first sprite-map slot that points at
+        # it. SpriteMapEntry.upperscreen_low is the portrait sprite, and
+        # upperscreen_high is the battle-preview mini — both index SPR_*.
+        # The slot's list position is the digimon id, so this is what turns
+        # "entry 0x0427" into "Agumon (portrait)". Recolors share sprites;
+        # setdefault keeps the first (canonical) name.
+        self._portrait_to_base: dict[int, int] = {}
+        self._preview_to_base: dict[int, int] = {}
+        for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
+            self._portrait_to_base.setdefault(entry.upperscreen_low, base_id)
+            self._preview_to_base.setdefault(entry.upperscreen_high, base_id)
 
         # Precompute structural labels — one parse_ncgr + parse_ncer per
         # entry. Done eagerly so the filter box can match on bpp / size /
@@ -135,21 +216,41 @@ class SpriteBrowser(QWidget):
         return out
 
     def _compute_index_label(self, ix: int) -> str:
-        prefix = f"{ix:04d}"
+        prefix = f"0x{ix:04x}"
+        role_token = self._role_tag(ix)
         try:
             tile_bytes, bit_depth, *_ = sprite.parse_ncgr(self._chr_pak.entries[ix])
             parsed_ncer = ncer_mod.parse_ncer(self._cel_pak.entries[ix])
         except (ValueError, IndexError):
-            return f"{prefix}  (parse error)"
+            return _format_spr_label(prefix, role_token, "(parse error)")
         bytes_per_tile = 32 if bit_depth == 3 else 64
         n_tiles = len(tile_bytes) // bytes_per_tile
         n_cells = len(parsed_ncer.cells)
         if n_cells == 0 or n_tiles == 0:
-            return f"{prefix}  (empty)"
+            return _format_spr_label(prefix, role_token, "(empty)")
         w, h = ncer_mod.sprite_bbox(parsed_ncer)
         bpp_token = "4bpp" if bit_depth == 3 else "8bpp"
         size_token = f"{w}×{h}" if (w and h) else "0×0"
-        return f"{prefix}  {bpp_token} {size_token} {n_cells}c"
+        meta = f"{bpp_token} {size_token} {n_cells}c"
+        return _format_spr_label(prefix, role_token, meta)
+
+    def _role_tag(self, ix: int) -> str:
+        """`[ICON] <name>` / `[BTMINI] <name>` for SPR indices referenced
+        by sprite_map (joined when one index plays both roles). Empty
+        string for unreferenced UI / utility sprites.
+
+        `digimon_display_name` resolves NPC slots (0x30e..0x363) via the
+        battle-string fallback, so NPC portraits (e.g. SPR 0x600 ↔ slot
+        0x30e for Glare) surface their name instead of the raw slot id.
+        """
+        parts: List[str] = []
+        portrait_base = self._portrait_to_base.get(ix)
+        if portrait_base is not None:
+            parts.append(f"[ICON] {self._session.digimon_display_name(portrait_base)}")
+        preview_base = self._preview_to_base.get(ix)
+        if preview_base is not None:
+            parts.append(f"[BTMINI] {self._session.digimon_display_name(preview_base)}")
+        return " ".join(parts)
 
     # ---- UI construction -------------------------------------------------
 
@@ -275,6 +376,15 @@ class SpriteBrowser(QWidget):
         #   the new colours).
         self._replace_png_btn = QPushButton("Import from PNG…")
         self._replace_png_btn.clicked.connect(self._on_replace_png_dispatch)
+        self._duplicate_entry_btn = QPushButton("Duplicate sprite entry")
+        self._duplicate_entry_btn.setToolTip(
+            "Append a new SPR_* entry cloned from the currently-selected "
+            "entry. Grows SPR_CHR/SPR_PAL/SPR_CEL/SPR_ANM in lockstep so the "
+            "preview pipeline and engine animation table stay in sync. "
+            "Engine extensibility past vanilla 1627 is unproven — test "
+            "in-game before relying on it."
+        )
+        self._duplicate_entry_btn.clicked.connect(self._on_add_entry)
         self._import_pal_with_sheet_cb = QCheckBox("Also import palette from PNG")
         self._import_pal_with_sheet_cb.setChecked(True)
         self._import_pal_with_sheet_cb.setToolTip(
@@ -289,6 +399,7 @@ class SpriteBrowser(QWidget):
         for btn in (
             self._export_png_btn, self._export_native_btn,
             self._replace_png_btn, self._replace_native_btn,
+            self._duplicate_entry_btn,
         ):
             btn.setEnabled(False)
         # Replace requires an undo stack to push onto; without one the
@@ -297,6 +408,7 @@ class SpriteBrowser(QWidget):
             self._replace_png_btn.setVisible(False)
             self._import_pal_with_sheet_cb.setVisible(False)
             self._replace_native_btn.setVisible(False)
+            self._duplicate_entry_btn.setVisible(False)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -317,6 +429,7 @@ class SpriteBrowser(QWidget):
         native_col.setSpacing(4)
         native_col.addWidget(self._export_native_btn)
         native_col.addWidget(self._replace_native_btn)
+        native_col.addWidget(self._duplicate_entry_btn)
         native_col.addStretch(1)
         controls_row = QHBoxLayout()
         controls_row.addLayout(controls)
@@ -328,8 +441,29 @@ class SpriteBrowser(QWidget):
         controls_row.addLayout(meta_form)
         right_layout.addLayout(controls_row)
 
+        # List column: index list on top, "+ Add Entry" toolbar below.
+        # Placement mirrors BTCHR — the button sits under the list because
+        # appended entries always land at the bottom, so the affordance
+        # lives next to where the new row appears.
+        self._add_entry_btn = QPushButton("+ Add Entry")
+        self._add_entry_btn.setToolTip(
+            "Append a new SPR_* entry cloned from the currently-selected "
+            "entry. Grows SPR_CHR/SPR_PAL/SPR_CEL/SPR_ANM in lockstep."
+        )
+        self._add_entry_btn.clicked.connect(self._on_add_entry)
+        # Read-only mode (no undo stack) hides the button to match the
+        # rest of the import affordances.
+        if self._undo_stack is None:
+            self._add_entry_btn.setVisible(False)
+        list_col = QWidget()
+        list_col_layout = QVBoxLayout(list_col)
+        list_col_layout.setContentsMargins(0, 0, 0, 0)
+        list_col_layout.setSpacing(4)
+        list_col_layout.addWidget(self._list)
+        list_col_layout.addWidget(self._add_entry_btn)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._list)
+        splitter.addWidget(list_col)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -348,6 +482,7 @@ class SpriteBrowser(QWidget):
         if self._undo_stack is not None:
             self._replace_png_btn.setEnabled(True)
             self._replace_native_btn.setEnabled(True)
+            self._duplicate_entry_btn.setEnabled(True)
         self._refresh_palette_combo()
         self._refresh_meta_and_preview()
 
@@ -411,7 +546,7 @@ class SpriteBrowser(QWidget):
             palettes, _pal_bpp = sprite.parse_nclr(sprite.maybe_decompress(pal_raw))
             parsed_ncer = ncer_mod.parse_ncer(cel_raw)
         except ValueError as exc:
-            self._image_label.setText(f"Entry {ix:04d} failed to parse:\n{exc}")
+            self._image_label.setText(f"Entry 0x{ix:04x} failed to parse:\n{exc}")
             return
 
         bytes_per_tile = 32 if bit_depth == 3 else 64
@@ -787,7 +922,7 @@ class SpriteBrowser(QWidget):
             self._session,
             pak_changes,
             description=(
-                f"Set transparent color (bank {bank_idx}) for sprite {ix:04d}"
+                f"Set transparent color (bank {bank_idx}) for sprite 0x{ix:04x}"
             ),
             on_change=self._reload_current_entry,
         )
@@ -872,7 +1007,7 @@ class SpriteBrowser(QWidget):
             )
             if choice != QMessageBox.Ok:
                 return
-        default = f"sprite_{self._current_idx:04d}.png"
+        default = f"sprite_0x{self._current_idx:04x}.png"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export PNG", default, "PNG image (*.png)"
         )
@@ -894,7 +1029,7 @@ class SpriteBrowser(QWidget):
         # Single dialog asking for the NCGR path; the NCLR is written
         # alongside with a matching stem. Avoids a second file-picker round
         # trip and makes the pair obvious in the user's file browser.
-        default = f"sprite_{ix:04d}.NCGR"
+        default = f"sprite_0x{ix:04x}.NCGR"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export NCGR (NCLR will be written alongside)",
             default, "NDS character graphic (*.NCGR)",
@@ -963,6 +1098,62 @@ class SpriteBrowser(QWidget):
             self._on_replace_png_new_palette()
         else:
             self._on_replace_png()
+
+    def _on_add_entry(self) -> None:
+        """Append a new SPR_* entry cloned from the current selection.
+
+        Same handler for the toolbar "+ Add Entry" (below the list) and
+        the panel "Duplicate sprite entry" button — neither needs an
+        extra picker step because the source is always the currently
+        selected entry. Confirms first so the user can back out without
+        an undo step on the stack.
+        """
+        if self._current_idx is None or self._undo_stack is None:
+            return
+        source = self._current_idx
+        new_idx = self._chr_pak.count
+        confirm = QMessageBox.question(
+            self,
+            "Duplicate sprite entry?",
+            f"Append a new SPR_* entry at index 0x{new_idx:04x} carrying a "
+            f"copy of entry 0x{source:04x} (across SPR_CHR/SPR_PAL/SPR_CEL/"
+            f"SPR_ANM)?\n\nEngine extensibility past vanilla 1627 is "
+            f"unproven — test in-game before relying on the new entry.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        cmd = AppendPakEntriesCommand(
+            self._session,
+            list(SPR_PARALLEL_PAKS),
+            source,
+            description=f"Append SPR entry 0x{new_idx:04x} from 0x{source:04x}",
+            on_change=self._refresh_after_entry_appended,
+        )
+        self._undo_stack.push(cmd)
+        self._list.select_index(cmd.new_entry_index)
+
+    def _refresh_after_entry_appended(self) -> None:
+        """Reconcile the browser's caches with the live pak entry count.
+
+        Called from AppendPakEntriesCommand's redo/undo. Re-syncs the
+        local count + label list + RecordListPanel rows — appending on
+        redo, dropping on undo.
+        """
+        live_count = min(
+            self._session.sprite_pak(p).count for p in SPR_PARALLEL_PAKS
+        )
+        if live_count > self._count:
+            for ix in range(self._count, live_count):
+                self._labels.append(self._compute_index_label(ix))
+                self._list.append_record(ix)
+            self._count = live_count
+        elif live_count < self._count:
+            for _ in range(self._count - live_count):
+                self._labels.pop()
+                self._list.pop_record()
+            self._count = live_count
 
     def _on_replace_png(self) -> None:
         if self._current_idx is None or self._undo_stack is None:
@@ -1058,7 +1249,7 @@ class SpriteBrowser(QWidget):
         cmd = ReplaceSpriteCommand(
             self._session,
             [(SPR_CHR, ix, new_entry)],
-            description=f"Replace sprite {ix:04d} from PNG",
+            description=f"Replace sprite 0x{ix:04x} from PNG",
             on_change=self._reload_current_entry,
         )
         self._undo_stack.push(cmd)
@@ -1214,7 +1405,7 @@ class SpriteBrowser(QWidget):
         ]
         cmd = ReplaceSpriteCommand(
             self._session, replacements,
-            description=f"Replace sprite {ix:04d} from PNG (new palette)",
+            description=f"Replace sprite 0x{ix:04x} from PNG (new palette)",
             on_change=self._reload_current_entry,
         )
         self._undo_stack.push(cmd)
@@ -1322,7 +1513,7 @@ class SpriteBrowser(QWidget):
             )
         cmd = ReplaceSpriteCommand(
             self._session, replacements,
-            description=f"Replace sprite {ix:04d} from NCGR+NCLR",
+            description=f"Replace sprite 0x{ix:04x} from NCGR+NCLR",
             on_change=self._reload_current_entry,
         )
         self._undo_stack.push(cmd)

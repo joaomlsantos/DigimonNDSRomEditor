@@ -115,6 +115,27 @@ class SpriteMapEntry:
     def writeToRom(self, rom_data: bytearray):
         rom_data[self.offset:self.offset + self.SIZE] = self.getByteArray()
 
+    # The 4-byte ``upperscreen_sprites`` field packs two 16-bit sprite refs
+    # (low half at bytes 0xc–0xd, high half at bytes 0xe–0xf). Editors can
+    # bind directly to either half via these proxy properties — getattr/
+    # setattr drive ``SetAttrCommand`` undo correctly, and serialization
+    # still reads the 32-bit composite.
+    @property
+    def upperscreen_low(self) -> int:
+        return self.upperscreen_sprites & 0xFFFF
+
+    @upperscreen_low.setter
+    def upperscreen_low(self, value: int) -> None:
+        self.upperscreen_sprites = (self.upperscreen_sprites & 0xFFFF0000) | (int(value) & 0xFFFF)
+
+    @property
+    def upperscreen_high(self) -> int:
+        return (self.upperscreen_sprites >> 16) & 0xFFFF
+
+    @upperscreen_high.setter
+    def upperscreen_high(self, value: int) -> None:
+        self.upperscreen_sprites = (self.upperscreen_sprites & 0x0000FFFF) | ((int(value) & 0xFFFF) << 16)
+
 
 class BattleStringEntry:
     SIZE = 4

@@ -30,14 +30,18 @@ from digimon_core import qol as qol_module
 # v2: adds string_edits channel for over-budget MSG.PAK strings.
 # v3: adds sprite_edits channel for per-entry sprite PAK replacements
 #     (keeps the byte diff small even when a sprite grows past its FAT slot).
+# v4: adds btchr_appended_sidecars channel — chrsize/btchrsize u32 pairs
+#     for BTCHR groups appended past vanilla 415. The corresponding PAK
+#     entries ride sprite_edits at idx >= vanilla.count.
 # Loader accepts every prior version; saver always writes the current version.
-FORMAT_VERSION = 3
-_ACCEPTED_VERSIONS = (1, 2, 3)
+FORMAT_VERSION = 4
+_ACCEPTED_VERSIONS = (1, 2, 3, 4)
 EDITOR_VERSION = "0.1.0"
 
 
 StringEdit = Tuple[str, int, str]  # (region_id, vanilla_offset, new_text)
 SpriteEdit = Tuple[str, int, bytes]  # (pak_name, entry_idx, new_entry_bytes)
+BtchrAppendedSidecar = Tuple[int, int]  # (chrsize_word, btchrsize_value)
 
 
 def vanilla_sha256(rom_bytes: bytes) -> str:
@@ -99,6 +103,7 @@ def save_project(
     qol: qol_module.QolSettings,
     string_edits: List[StringEdit] = (),
     sprite_edits: List[SpriteEdit] = (),
+    btchr_appended_sidecars: List[BtchrAppendedSidecar] = (),
 ) -> None:
     """Write a .romproj at `path`.
 
@@ -120,7 +125,13 @@ def save_project(
     ``(pak_name, entry_idx, new_entry_bytes)`` triples. On reopen they're
     applied to the session via ``apply_sprite_pak_edits`` after the byte diff
     and string edits land; the next ROM save runs them through the normal
-    sprite splice path.
+    sprite splice path. Entries with ``entry_idx >= vanilla pak count`` are
+    appends (extend the pak by one slot); they must arrive in order.
+
+    `btchr_appended_sidecars` carries chrsize/btchrsize u32 pairs for BTCHR
+    groups appended past vanilla 415 — parallel to the BTCHR.PAK appended
+    entries in `sprite_edits`. Required so the (PAK count, chrsize length,
+    btchrsize length) triple stays consistent on reload.
     """
     diffs = compute_byte_diff(vanilla_rom_data, edited_rom_data)
     payload = {
@@ -140,6 +151,10 @@ def save_project(
         "sprite_edits": [
             {"pak": pak, "idx": idx, "bytes": base64.b64encode(data).decode("ascii")}
             for pak, idx, data in sprite_edits
+        ],
+        "btchr_appended_sidecars": [
+            {"chrsize": chrsize_word, "btchrsize": btchrsize_value}
+            for chrsize_word, btchrsize_value in btchr_appended_sidecars
         ],
     }
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -171,5 +186,9 @@ def load_project(path: str) -> dict:
     data["sprite_edits"] = [
         (entry["pak"], entry["idx"], base64.b64decode(entry["bytes"]))
         for entry in data.get("sprite_edits", [])
+    ]
+    data["btchr_appended_sidecars"] = [
+        (entry["chrsize"], entry["btchrsize"])
+        for entry in data.get("btchr_appended_sidecars", [])
     ]
     return data

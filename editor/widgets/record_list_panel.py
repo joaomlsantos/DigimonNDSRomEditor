@@ -100,6 +100,31 @@ class RecordListPanel(QWidget):
         self._view.scrollTo(proxy_index)
         return True
 
+    def append_record(self, record: object) -> int:
+        """Append ``record`` to the end of the list and return its source row.
+
+        Mutates the same ``records`` list passed to ``__init__`` (so the
+        caller's reference stays in sync) and inserts a matching row into
+        the underlying QStandardItemModel. The proxy and current selection
+        survive — the new row appears at the bottom; callers wanting to
+        focus it should follow up with ``select_index(returned_row)``.
+        """
+        self._records.append(record)
+        index = len(self._records) - 1
+        item = QStandardItem(self._decorated_label(index))
+        item.setEditable(False)
+        item.setData(index, Qt.UserRole)
+        self._source_model.appendRow(item)
+        return index
+
+    def pop_record(self) -> None:
+        """Remove the last appended row. Mirror of ``append_record`` for
+        undo paths — quietly does nothing on an empty list."""
+        if not self._records:
+            return
+        self._records.pop()
+        self._source_model.removeRow(self._source_model.rowCount() - 1)
+
     def refresh_label(self, index: int, new_label: str = None) -> None:
         """Refresh a row's label. If `new_label` is None, the panel recomputes
         the label via the originally-supplied `label_for` (and applies the

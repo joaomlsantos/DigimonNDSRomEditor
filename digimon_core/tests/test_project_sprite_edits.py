@@ -109,7 +109,7 @@ class _ProjectSpriteEditsBase:
             )
             loaded = project_file.load_project(proj_path)
 
-        self.assertEqual(loaded["format_version"], 3)
+        self.assertEqual(loaded["format_version"], project_file.FORMAT_VERSION)
         self.assertIn((SPR_CHR, 0, new_bytes), loaded["sprite_edits"])
 
         patched = bytearray(sess.original_rom_data)

@@ -144,6 +144,61 @@ def parse_mini_header(raw: bytes) -> MiniHeader:
     )
 
 
+def serialize_mini_header(h: MiniHeader) -> bytes:
+    """Round-trip writer for :func:`parse_mini_header`.
+
+    Layout::
+
+        0x00 H footprint_scale
+        0x02 H flag
+        0x04 h pad_04
+        0x06 h y_pivot_a
+        0x08 h x_pivot
+        0x0A h y_pivot_b
+        0x0C H pad_0c
+        0x0E ... track A (u16 implicit-cell-0 dur, then (u16 cell, u16 dur)*)
+             u32 0xFFFFFFFF terminator
+             ...  track B ((u16 cell, u16 dur)*)
+             u32 0xFFFFFFFF terminator
+             ...  track C
+             u32 0xFFFFFFFF terminator
+
+    Track A always has its implicit-cell-0 first duration; if the input
+    ``idle`` list is empty we still emit a zero duration to keep the
+    structure valid (engine reads at least one u16 before scanning for
+    the terminator).
+    """
+    out = bytearray()
+    out += struct.pack(
+        "<HHhhhhH",
+        h.footprint_scale & 0xFFFF, h.flag & 0xFFFF,
+        h.pad_04, h.y_pivot_a, h.x_pivot, h.y_pivot_b,
+        h.pad_0c & 0xFFFF,
+    )
+    # Track A: first u16 is the implicit cell-0 duration; remaining
+    # steps are explicit (cell, dur) pairs.
+    if h.idle:
+        out += struct.pack("<H", h.idle[0].duration & 0xFFFF)
+        for step in h.idle[1:]:
+            out += struct.pack(
+                "<HH", step.cell & 0xFFFF, step.duration & 0xFFFF,
+            )
+    else:
+        out += struct.pack("<H", 0)
+    out += struct.pack("<I", 0xFFFFFFFF)
+    for step in h.attack:
+        out += struct.pack(
+            "<HH", step.cell & 0xFFFF, step.duration & 0xFFFF,
+        )
+    out += struct.pack("<I", 0xFFFFFFFF)
+    for step in h.defend:
+        out += struct.pack(
+            "<HH", step.cell & 0xFFFF, step.duration & 0xFFFF,
+        )
+    out += struct.pack("<I", 0xFFFFFFFF)
+    return bytes(out)
+
+
 # ---- per-digimon sprite kit -----------------------------------------------
 
 

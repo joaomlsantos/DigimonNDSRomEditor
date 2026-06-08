@@ -133,6 +133,25 @@ def getCurrentLocation(current_offset: int, version: str) -> str:
     return constants.LOCATION_OFFSETS_TO_NAMES[location_offset]
 
 
+def getLocationForAreaIndex(area_index: int) -> str:
+    """Resolve the location name for an area by its position in the list.
+
+    `LOCATION_OFFSETS_TO_NAMES` keys are relative offsets inside the
+    legacy `AREA_ENCOUNTER_OFFSETS` region, assuming a fixed 0x200
+    stride per area. Under FNT-driven loading each area is its own
+    file and the absolute ROM file_start no longer lands on that stride
+    (`getCurrentLocation` only worked when areas were laid out
+    contiguously inside one region). FNT iteration still yields areas
+    in legacy order, so the area's INDEX is the stable key.
+    """
+    relative_offset = area_index * model.WildEncounterArea.SIZE
+    location_offset = max(
+        (off for off in constants.LOCATION_OFFSETS_TO_NAMES if off <= relative_offset),
+        default=0x0000,
+    )
+    return constants.LOCATION_OFFSETS_TO_NAMES[location_offset]
+
+
 # ---- model-table loaders -----------------------------------------------------
 
 def loadBaseDigimonInfo(

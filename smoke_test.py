@@ -82,7 +82,13 @@ def main() -> int:
     undo_stack = QUndoStack()
 
     # ---- base editor -----------------------------------------------------
-    base_editor = BaseDigimonEditor(session.base_digimon, undo_stack)
+    base_editor = BaseDigimonEditor(
+        session.base_digimon,
+        undo_stack,
+        session.sprite_map,
+        session.battle_strings,
+        session,
+    )
     first_id = next(iter(sorted(session.base_digimon.keys())))
     target = session.base_digimon[first_id]
     orig_hp = target.hp
@@ -118,6 +124,7 @@ def main() -> int:
         undo_stack,
         session.sprite_map,
         session.battle_strings,
+        session,
     )
     enemy_id = next(iter(sorted(session.enemy_digimon.keys())))
     enemy = session.enemy_digimon[enemy_id]

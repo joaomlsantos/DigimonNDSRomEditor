@@ -100,6 +100,31 @@ class _BtchrRomCase(unittest.TestCase):
         # The 52-byte variant must dominate (~409/415 in vanilla Dusk).
         self.assertGreater(size_hist[52], 350)
 
+    def test_mini_header_roundtrip_every_group(self):
+        """serialize_mini_header is the exact inverse of parse_mini_header.
+
+        Compares against the uncompressed entry-0 bytes (truncated to
+        ``raw_size`` — vanilla entries sometimes carry trailing bytes
+        past the third terminator that we don't model). If this passes
+        across all 415 groups, the writer is byte-perfect for every
+        header shape DWDD ships.
+        """
+        n_groups = btchr.parse_pak_groups(self.pak)
+        mismatches = []
+        for g in range(n_groups):
+            base = g * btchr.GROUP_SIZE
+            raw = sprite.decompress_rle30(self.pak.entries[base])
+            h = btchr.parse_mini_header(raw)
+            rebuilt = btchr.serialize_mini_header(h)
+            # raw_size is the byte length parse_mini_header consumed —
+            # the third terminator's end. Compare just that prefix; any
+            # trailing pad is the engine's concern, not ours.
+            if rebuilt != raw[:h.raw_size]:
+                mismatches.append(g)
+                if len(mismatches) >= 3:
+                    break
+        self.assertEqual(mismatches, [], f"first mismatches: {mismatches}")
+
     def test_btchrsize_matches_uncompressed_body_sum(self):
         n_groups = btchr.parse_pak_groups(self.pak)
         sidecar = struct.unpack(f"<{len(self.btchrsize_raw) // 4}I",

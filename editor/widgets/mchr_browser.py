@@ -28,6 +28,8 @@ PNG round-trip format:
 """
 from __future__ import annotations
 
+import os
+import re
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt
@@ -85,6 +87,45 @@ def _decoded_entry(chr_pak: pak.PakFile, idx: int) -> Optional[mchr.MchrEntry]:
         return None
 
 
+def _format_mchr_label(prefix: str, role_token: str, metadata: str) -> str:
+    """Compose an MCHR_CHR list label. Format with role: ``"{prefix}  [OW]
+    {name} - {metadata}"``. Format without role: ``"{prefix}  {metadata}"``."""
+    if role_token:
+        return f"{prefix}  {role_token} - {metadata}"
+    return f"{prefix}  {metadata}"
+
+
+def compute_mchr_labels(session) -> List[str]:
+    """Public helper: MCHR_CHR label list (one per entry). Mirrors the
+    browser's `_labels` so other widgets can populate pickers without
+    instantiating a viewer."""
+    chr_pak = session.sprite_pak(MCHR_CHR)
+    overworld_to_base: dict[int, int] = {}
+    for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
+        overworld_to_base.setdefault(entry.unknown_0x4, base_id)
+
+    out: List[str] = []
+    for ix in range(chr_pak.count):
+        prefix = f"0x{ix:04x}"
+        base_id = overworld_to_base.get(ix)
+        role = ""
+        if base_id is not None:
+            # `digimon_display_name` covers both digimon (DIGIMON_ID_TO_STR)
+            # and NPC slots (battle-string fallback) — NPCs occupy
+            # sprite_map 0x30e..0x363, where the slot's `unknown_0x4`
+            # points back at the MCHR index, so this single lookup
+            # handles Glare/Kogure/etc without a special path.
+            role = f"[OW] {session.digimon_display_name(base_id)}"
+        entry = _decoded_entry(chr_pak, ix)
+        if entry is None:
+            out.append(_format_mchr_label(prefix, role, "(parse error)"))
+            continue
+        wt, ht = mchr.pick_tile_grid(entry.tiles_per_frame)
+        size_token = f"{wt * 8}×{ht * 8}"
+        out.append(_format_mchr_label(prefix, role, f"{entry.frame_count}f {size_token}"))
+    return out
+
+
 class MchrBrowser(QWidget):
     """Read-only browser for the MCHR_CHR + MCHR_PAL overworld-sprite pair."""
 
@@ -114,6 +155,17 @@ class MchrBrowser(QWidget):
         self._preview_src_size: Tuple[int, int] = (0, 0)
         self._preview_pix_size: Tuple[int, int] = (0, 0)
 
+        # Reverse lookup: MCHR_CHR index -> first sprite-map slot that
+        # points at it. SpriteMapEntry.unknown_0x4 is the party-follower
+        # overworld sprite for that digimon (fixed NPC encounters and
+        # scripted map events use their own sources, but the field IS
+        # read for the digimon trailing the player). The slot's list
+        # position is the digimon id, so this turns "0x0042" into
+        # "Koromon". Recolors share sprites; setdefault keeps the first.
+        self._overworld_to_base: dict[int, int] = {}
+        for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
+            self._overworld_to_base.setdefault(entry.unknown_0x4, base_id)
+
         # Precompute decorated labels once (parse_mchr_chr_entry × 890 is a
         # few hundred ms — cheap enough at open, lets the filter box match
         # tokens like "32×64" or "8f" from the start).
@@ -131,14 +183,27 @@ class MchrBrowser(QWidget):
         return out
 
     def _compute_index_label(self, ix: int) -> str:
-        prefix = f"{ix:04d}"
+        prefix = f"0x{ix:04x}"
+        role_token = self._role_tag(ix)
         entry = _decoded_entry(self._chr_pak, ix)
         if entry is None:
-            return f"{prefix}  (parse error)"
+            return _format_mchr_label(prefix, role_token, "(parse error)")
         tc = entry.tiles_per_frame
         wt, ht = mchr.pick_tile_grid(tc)
         size_token = f"{wt * 8}×{ht * 8}"
-        return f"{prefix}  {entry.frame_count}f {size_token}"
+        return _format_mchr_label(prefix, role_token, f"{entry.frame_count}f {size_token}")
+
+    def _role_tag(self, ix: int) -> str:
+        """`[OW] <name>` for MCHR indices referenced by any sprite_map
+        slot. `digimon_display_name` covers both digimon and NPC slots
+        (NPCs live in sprite_map 0x30e..0x363 with their `unknown_0x4`
+        pointing at the MCHR index), so a single lookup labels Glare,
+        Kogure, Veemon, etc. uniformly. Empty for unreferenced utility
+        / scene sprites."""
+        base_id = self._overworld_to_base.get(ix)
+        if base_id is None:
+            return ""
+        return f"[OW] {self._session.digimon_display_name(base_id)}"
 
     # ---- UI -------------------------------------------------------------
 
@@ -220,6 +285,14 @@ class MchrBrowser(QWidget):
         self._export_pal_btn.clicked.connect(self._on_export_palette_png)
         self._import_pal_btn = QPushButton("Import palette PNG…")
         self._import_pal_btn.clicked.connect(self._on_import_palette_png)
+        # Per-frame IO: one PNG per frame instead of a horizontal strip.
+        # Same codec as the strip path; the on-disk files are sized to the
+        # current frame dimensions so they're swappable between sprites
+        # with matching shapes.
+        self._export_per_frame_btn = QPushButton("Export per-frame PNGs…")
+        self._export_per_frame_btn.clicked.connect(self._on_export_per_frame_pngs)
+        self._import_per_frame_btn = QPushButton("Import per-frame PNGs…")
+        self._import_per_frame_btn.clicked.connect(self._on_import_per_frame_pngs)
         # Same checkbox as BTCHR: treat the imported PNG as the source of
         # truth for colours. Indexed → use PLTE; RGB/RGBA → median-cut a
         # fresh 16-colour palette from opaque pixels. Off → posterize
@@ -234,15 +307,15 @@ class MchrBrowser(QWidget):
             "Off: index against the existing MCHR_PAL (colours may posterize)."
         )
 
-        # Two columns: frames sheet (left) and palette PNG (right). All
-        # four buttons pinned to the widest label so Export/Import line
-        # up across columns.
+        # Three columns: frames strip, per-frame PNGs, palette PNG. All
+        # six buttons pinned to the widest label so Export/Import line up.
         sheet_btns = (self._export_btn, self._import_btn)
+        per_frame_btns = (self._export_per_frame_btn, self._import_per_frame_btn)
         pal_btns = (self._export_pal_btn, self._import_pal_btn)
         max_btn_w = max(
-            b.sizeHint().width() for b in sheet_btns + pal_btns
+            b.sizeHint().width() for b in sheet_btns + per_frame_btns + pal_btns
         )
-        for b in sheet_btns + pal_btns:
+        for b in sheet_btns + per_frame_btns + pal_btns:
             b.setMinimumWidth(max_btn_w)
         sheet_col = QVBoxLayout()
         sheet_col.setSpacing(4)
@@ -250,6 +323,11 @@ class MchrBrowser(QWidget):
         sheet_col.addWidget(self._import_btn)
         sheet_col.addWidget(self._import_pal_with_sheet_cb)
         sheet_col.addStretch(1)
+        per_frame_col = QVBoxLayout()
+        per_frame_col.setSpacing(4)
+        per_frame_col.addWidget(self._export_per_frame_btn)
+        per_frame_col.addWidget(self._import_per_frame_btn)
+        per_frame_col.addStretch(1)
         pal_col = QVBoxLayout()
         pal_col.setSpacing(4)
         pal_col.addWidget(self._export_pal_btn)
@@ -269,6 +347,8 @@ class MchrBrowser(QWidget):
         controls_row.addLayout(controls)
         controls_row.addSpacing(16)
         controls_row.addLayout(sheet_col)
+        controls_row.addSpacing(16)
+        controls_row.addLayout(per_frame_col)
         controls_row.addSpacing(16)
         controls_row.addLayout(pal_col)
         controls_row.addSpacing(16)
@@ -455,7 +535,7 @@ class MchrBrowser(QWidget):
         if entry is None or palette is None:
             QMessageBox.critical(self, "Export failed", "Could not decode sprite/palette.")
             return
-        suggested = f"mchr_chr_{self._current_idx:04d}.png"
+        suggested = f"mchr_chr_0x{self._current_idx:04x}.png"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export sprite PNG", suggested, "PNG (*.png)"
         )
@@ -582,11 +662,241 @@ class MchrBrowser(QWidget):
                 sprite.compress_rle30(encoded_pal),
             ))
             desc = (
-                f"Import MCHR sprite {self._current_idx:04d} + palette "
-                f"{self._current_palette_idx:04d}"
+                f"Import MCHR sprite 0x{self._current_idx:04x} + palette "
+                f"0x{self._current_palette_idx:04x}"
             )
         else:
-            desc = f"Import MCHR sprite {self._current_idx:04d}"
+            desc = f"Import MCHR sprite 0x{self._current_idx:04x}"
+
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            replacements,
+            description=desc,
+            on_change=self._on_chr_entry_replaced,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+
+    # ---- per-frame PNG IO ----------------------------------------------
+
+    def _on_export_per_frame_pngs(self) -> None:
+        """Write each frame to its own PNG ``<base>_frame_<K>.png``.
+
+        Each file is sized to the current frame dimensions (driven by the
+        Width-tiles override). Embeds ``mchr_mode=per_frame`` and
+        ``mchr_frame=K`` so import can validate the set.
+        """
+        if self._current_idx is None:
+            return
+        entry = _decoded_entry(self._chr_pak, self._current_idx)
+        palette = _decoded_palette(self._pal_pak, self._current_palette_idx)
+        if entry is None or palette is None:
+            QMessageBox.critical(
+                self, "Export failed", "Could not decode sprite/palette.",
+            )
+            return
+        suggested = f"mchr_chr_0x{self._current_idx:04x}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export per-frame PNGs (pick base name)",
+            suggested, "PNG (*.png)",
+        )
+        if not path:
+            return
+        base = path[:-4] if path.lower().endswith(".png") else path
+        m = re.match(r"^(.*)_frame_\d+$", base)
+        if m:
+            base = m.group(1)
+        # Build the full strip once and slice columns out — keeps the
+        # codec path identical to the composite exporter (decode_frame_to_
+        # indices + colour table), so per-frame and composite outputs
+        # agree pixel-for-pixel.
+        strip = self._build_indexed_strip(entry, palette)
+        fw, fh = self._frame_dims(entry)
+        for fi in range(entry.frame_count):
+            sub = strip.copy(fi * fw, 0, fw, fh)
+            sub.setText("mchr_mode", "per_frame")
+            sub.setText("mchr_frame", str(fi))
+            sub.setText("mchr_n_frames", str(entry.frame_count))
+            out_path = f"{base}_frame_{fi}.png"
+            if not sub.save(out_path, "PNG"):
+                QMessageBox.critical(
+                    self, "Export failed",
+                    f"Could not write {out_path}.",
+                )
+                return
+
+    def _on_import_per_frame_pngs(self) -> None:
+        """Read ``<base>_frame_<K>.png`` siblings and rebuild the MCHR entry.
+
+        Frame count is auto-detected from the on-disk set: starting at
+        ``_frame_0.png``, count consecutive indices until the next file
+        is missing. Lets users add or drop frames externally without a
+        separate count control. All files must share dimensions and PNG
+        format (Indexed8 vs RGB) — a mismatch can't round-trip into one
+        4bpp tile stream + one MCHR_PAL.
+        """
+        if self._current_idx is None:
+            return
+        entry = _decoded_entry(self._chr_pak, self._current_idx)
+        palette = _decoded_palette(self._pal_pak, self._current_palette_idx)
+        if entry is None or palette is None:
+            QMessageBox.critical(
+                self, "Import failed",
+                "Current sprite/palette won't decode.",
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import per-frame PNGs (pick any frame)",
+            "", "PNG (*.png)",
+        )
+        if not path:
+            return
+        m = re.match(r"^(.*)_frame_(\d+)\.png$", path, re.IGNORECASE)
+        if not m:
+            QMessageBox.critical(
+                self, "Bad filename",
+                "Per-frame PNGs must follow the pattern "
+                "'<name>_frame_<N>.png'.\n"
+                f"Got: {os.path.basename(path)}",
+            )
+            return
+        base = m.group(1)
+        # Walk consecutive indices from 0 until a gap. Bounded by a sane
+        # max (256) so a stray glob accident can't run away.
+        pngs: List[QImage] = []
+        fi = 0
+        while fi < 256:
+            sibling = f"{base}_frame_{fi}.png"
+            if not os.path.exists(sibling):
+                break
+            cell_img = QImage(sibling)
+            if cell_img.isNull():
+                QMessageBox.critical(
+                    self, "Import failed",
+                    f"Could not read {sibling}.",
+                )
+                return
+            pngs.append(cell_img)
+            fi += 1
+        if not pngs:
+            QMessageBox.critical(
+                self, "Missing frame PNG",
+                f"Expected file not found:\n{base}_frame_0.png",
+            )
+            return
+
+        fw, fh = self._frame_dims(entry)
+        for idx, img in enumerate(pngs):
+            if img.width() != fw or img.height() != fh:
+                QMessageBox.critical(
+                    self, "Bad image size",
+                    f"{os.path.basename(f'{base}_frame_{idx}.png')} is "
+                    f"{img.width()}×{img.height()}; expected {fw}×{fh}. "
+                    "Adjust the Width (tiles) spinner if the sprite "
+                    "shape is wrong.",
+                )
+                return
+
+        use_indexed = pngs[0].format() == QImage.Format_Indexed8
+        for idx, img in enumerate(pngs):
+            if (img.format() == QImage.Format_Indexed8) != use_indexed:
+                QMessageBox.critical(
+                    self, "Mixed PNG formats",
+                    f"Frame {idx} PNG format differs from frame 0. "
+                    "Convert all frames to the same format before importing.",
+                )
+                return
+        if not use_indexed:
+            pngs = [p.convertToFormat(QImage.Format_RGBA8888) for p in pngs]
+
+        # Palette source — same shape as the composite importer, but RGB
+        # quantisation runs across all frames concatenated so a colour
+        # that only appears in one frame still makes it into the palette.
+        checkbox_on = self._import_pal_with_sheet_cb.isChecked()
+        pal_from_plte = (
+            use_indexed and checkbox_on and len(pngs[0].colorTable()) >= 2
+        )
+        pal_from_quant = (not use_indexed) and checkbox_on
+        rebuild_palette = pal_from_plte or pal_from_quant
+        if rebuild_palette:
+            if pal_from_plte:
+                built = build_palette_from_png(pngs[0], total_slots=PALETTE_SLOTS)
+            else:
+                strip_w = fw * len(pngs)
+                strip = QImage(strip_w, fh, QImage.Format_RGBA8888)
+                strip.fill(0)
+                from PySide6.QtGui import QPainter
+                painter = QPainter(strip)
+                for ci, p in enumerate(pngs):
+                    painter.drawImage(ci * fw, 0, p)
+                painter.end()
+                built = build_palette_from_png(strip, total_slots=PALETTE_SLOTS)
+            if built is None:
+                QMessageBox.critical(
+                    self, "PNG is fully transparent",
+                    "Cannot rebuild a palette from PNGs with no opaque "
+                    "pixels.",
+                )
+                return
+            working_palette: mchr.Palette = list(built)
+        else:
+            working_palette = list(palette)
+
+        new_frames: List[bytes] = []
+        for img in pngs:
+            if use_indexed:
+                indices = [
+                    img.pixelIndex(x, y)
+                    for y in range(fh) for x in range(fw)
+                ]
+            elif pal_from_quant:
+                indices = []
+                for y in range(fh):
+                    for x in range(fw):
+                        c = img.pixelColor(x, y)
+                        if c.alpha() < 128:
+                            indices.append(0)
+                        else:
+                            indices.append(nearest_idx_opaque(
+                                c.red(), c.green(), c.blue(), working_palette,
+                            ))
+            else:
+                rgba_buf = bytearray(fw * fh * 4)
+                for y in range(fh):
+                    for x in range(fw):
+                        c = img.pixelColor(x, y)
+                        off = (y * fw + x) * 4
+                        rgba_buf[off] = c.red()
+                        rgba_buf[off + 1] = c.green()
+                        rgba_buf[off + 2] = c.blue()
+                        rgba_buf[off + 3] = c.alpha()
+                indices = mchr.quantize_rgba_to_indices(bytes(rgba_buf), palette)
+            new_frames.append(mchr.encode_frame_from_indices(indices, fw, fh))
+
+        try:
+            new_raw = mchr.encode_mchr_chr_entry(new_frames)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Encode failed", str(exc))
+            return
+
+        replacements = [
+            (MCHR_CHR, self._current_idx, sprite.compress_rle30(new_raw)),
+        ]
+        if rebuild_palette:
+            encoded_pal = mchr.encode_palette_bgr555(working_palette)
+            replacements.append((
+                MCHR_PAL,
+                self._current_palette_idx,
+                sprite.compress_rle30(encoded_pal),
+            ))
+            desc = (
+                f"Import MCHR per-frame 0x{self._current_idx:04x} + palette "
+                f"0x{self._current_palette_idx:04x}"
+            )
+        else:
+            desc = f"Import MCHR per-frame 0x{self._current_idx:04x}"
 
         cmd = ReplaceSpriteCommand(
             self._session,
@@ -604,7 +914,7 @@ class MchrBrowser(QWidget):
         if palette is None:
             QMessageBox.critical(self, "Export failed", "Could not decode palette.")
             return
-        suggested = f"mchr_pal_{self._current_palette_idx:04d}.png"
+        suggested = f"mchr_pal_0x{self._current_palette_idx:04x}.png"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export palette PNG", suggested, "PNG (*.png)"
         )
@@ -648,7 +958,7 @@ class MchrBrowser(QWidget):
         cmd = ReplaceSpriteCommand(
             self._session,
             [(MCHR_PAL, self._current_palette_idx, compressed)],
-            description=f"Import MCHR palette {self._current_palette_idx:04d}",
+            description=f"Import MCHR palette 0x{self._current_palette_idx:04x}",
             on_change=self._refresh_preview_only,
         )
         if self._undo_stack is not None:
@@ -743,7 +1053,7 @@ class MchrBrowser(QWidget):
 
         desc = (
             f"Set transparent color for MCHR palette "
-            f"{self._current_palette_idx:04d}"
+            f"0x{self._current_palette_idx:04x}"
         )
         cmd = ReplaceSpriteCommand(
             self._session,

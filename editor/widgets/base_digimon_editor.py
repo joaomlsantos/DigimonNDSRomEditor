@@ -30,6 +30,7 @@ from .form_helpers import (
     move_choices,
     trait_choices,
 )
+from .sprite_map_row import SpriteMapRow, displayed_as_suffix
 
 
 # Game-engine caps enforced by the level-up routine (see research_docs/
@@ -108,16 +109,33 @@ _MISC_FIELDS: List[Tuple[str, str, int, bool, Optional[int], str]] = [
 
 
 class BaseDigimonEditor(QWidget):
-    def __init__(self, entries: Dict[int, model.BaseDataDigimon], undo_stack: QUndoStack, parent=None):
+    def __init__(
+        self,
+        entries: Dict[int, model.BaseDataDigimon],
+        undo_stack: QUndoStack,
+        sprite_map: List[model.SpriteMapEntry],
+        battle_strings: List[model.BattleStringEntry],
+        session,
+        parent=None,
+    ):
         super().__init__(parent)
         self._entries = entries
         self._undo_stack = undo_stack
+        self._sprite_map = sprite_map
+        self._battle_strings = battle_strings
+        self._session = session
         self._current_id: int = -1
 
-        self._list_panel = DigimonListPanel(entries, dirty_aware=True)
+        self._list_panel = DigimonListPanel(
+            entries, label_for=self._list_label_for, dirty_aware=True,
+        )
         self._list_panel.digimonSelected.connect(self._on_selection)
 
+        # _build_detail_container() creates _sprite_row, which the label
+        # callback depends on for the reverse sprite-to-base lookup. The list
+        # was built before that existed, so re-render every row now.
         self._detail = self._build_detail_container()
+        self._list_panel.refresh_all_labels()
 
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.addWidget(self._list_panel)
@@ -132,6 +150,10 @@ class BaseDigimonEditor(QWidget):
 
         # repopulate after undo/redo so the form reflects the model
         undo_stack.indexChanged.connect(self._refresh_form)
+        # Reskin commands mutate sprite_map (not the digimon itself), so the
+        # list label has to be re-rendered explicitly whenever the undo state
+        # advances — _refresh_form only updates the right-hand form.
+        undo_stack.indexChanged.connect(self._refresh_list_label_for_current)
         undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
 
         self._list_panel.select_first()
@@ -159,6 +181,10 @@ class BaseDigimonEditor(QWidget):
         identity_form.addRow("ID", self._id_spin)
         identity_form.addRow("Species", self._species_combo)
         identity_form.addRow("Type", self._type_combo)
+
+        self._sprite_row = SpriteMapRow(
+            self._sprite_map, self._battle_strings, self._undo_stack, self._session,
+        )
 
         # Stats and resistances are 8 fields each — laid out as 2 rows × 4
         # label+value pairs so the entire detail form fits on one screen.
@@ -239,6 +265,7 @@ class BaseDigimonEditor(QWidget):
         content_layout.setSpacing(4)
         content_layout.addWidget(self._title)
         content_layout.addWidget(identity_box)
+        content_layout.addWidget(self._sprite_row.widget)
         content_layout.addWidget(stats_box)
         content_layout.addWidget(res_box)
         content_layout.addLayout(trait_move_row)
@@ -259,6 +286,7 @@ class BaseDigimonEditor(QWidget):
         self._id_spin.rebind(target)
         self._species_combo.rebind(target)
         self._type_combo.rebind(target)
+        self._sprite_row.rebind(target)
         for spin in self._stat_widgets.values():
             spin.rebind(target)
         for spin in self._res_widgets.values():
@@ -278,6 +306,7 @@ class BaseDigimonEditor(QWidget):
         self._id_spin.refresh()
         self._species_combo.refresh()
         self._type_combo.refresh()
+        self._sprite_row.refresh()
         for spin in self._stat_widgets.values():
             spin.refresh()
         for spin in self._res_widgets.values():
@@ -289,10 +318,35 @@ class BaseDigimonEditor(QWidget):
         for spin in self._misc_widgets.values():
             spin.refresh()
 
-    @staticmethod
-    def _title_for(target: model.BaseDataDigimon) -> str:
-        name = constants.DIGIMON_ID_TO_STR.get(target.id, "<unknown>")
-        return f"0x{target.id:03x}  —  {name}    (offset 0x{target.offset:08x})"
+    def _list_label_for(self, digimon_id: int) -> str:
+        """Decorate the left-pane label with a [displayed-as] suffix.
+
+        Same logic as the enemy editor — surfaces reskinned slots at a
+        glance. For base species ids the suffix usually matches the
+        entry's own name; if the slot has been reskinned (or carries
+        an unmapped sprite), it diverges.
+        """
+        own_name = self._session.digimon_display_name(digimon_id)
+        sprite_row = getattr(self, "_sprite_row", None)
+        sprite_to_base = sprite_row.sprite_to_base if sprite_row else {}
+        suffix = displayed_as_suffix(
+            self._sprite_map, sprite_to_base, digimon_id, own_name,
+            name_resolver=self._session.digimon_display_name,
+        )
+        return f"0x{digimon_id:03x} — {own_name}{suffix}"
+
+    def _refresh_list_label_for_current(self, _index: int = 0) -> None:
+        if self._current_id < 0:
+            return
+        self._list_panel.refresh_label(self._current_id)
+
+    def _title_for(self, target: model.BaseDataDigimon) -> str:
+        name = self._session.digimon_display_name(target.id)
+        suffix = displayed_as_suffix(
+            self._sprite_map, self._sprite_row.sprite_to_base, target.id, name,
+            name_resolver=self._session.digimon_display_name,
+        )
+        return f"0x{target.id:03x}  —  {name}{suffix}    (offset 0x{target.offset:08x})"
 
 
 # ---- aggregated validation collector -------------------------------------

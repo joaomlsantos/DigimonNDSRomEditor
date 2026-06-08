@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -30,6 +31,14 @@ SPRITE_PAK_PATHS = (
     "DAT/MCHR_CHR.PAK", "DAT/MCHR_PAL.PAK",
     "DAT/BTCHR.PAK",
 )
+
+# BTCHR sidecars: fixed-size 1660B each (415 × u32). Edits ride the byte
+# diff channel — no FAT resize needed because per-group writes are u32
+# in-place. Resolution happens against the post-sprite-splice ROM in
+# :meth:`RomSession._apply_btchr_size_edits` so BTCHR.PAK growth still
+# leaves these files findable.
+CHRSIZE_PATH = "DAT/BTCHR/CHRSIZE.BIN"
+BTCHRSIZE_PATH = "DAT/BTCHR/BTCHRSIZE.BIN"
 
 
 @dataclass
@@ -77,6 +86,34 @@ class RomSession:
     # Sprite paks with at least one ReplaceSpriteCommand applied. Serialize
     # iterates this on save to splice the rebuilt pak over its FAT slot.
     _dirty_sprite_paks: Set[str] = field(default_factory=set)
+
+    # Per-group edits to BTCHR/CHRSIZE.BIN and BTCHR/BTCHRSIZE.BIN. Both
+    # files are fixed-size (1660B = 415 × u32) and never resize, so edits
+    # ride the byte diff channel instead of a sprite-style splice: writes
+    # happen in-place into ``out`` during serialize_all and the
+    # vanilla-vs-edited diff captures them automatically. Keys are group
+    # indices; values are the full u32 to store at ``group * 4``.
+    _chrsize_edits: Dict[int, int] = field(default_factory=dict)
+    _btchrsize_edits: Dict[int, int] = field(default_factory=dict)
+
+    # Sidecar entries for BTCHR groups appended past vanilla 415. Parallel
+    # arrays: position k describes vanilla_count + k. The PAK growth itself
+    # rides ``_sprite_pak_cache[BTCHR_PAK]`` (count/entries bumped, splice
+    # path resizes the FAT slot); these two arrays carry the u32s that
+    # have to ride alongside in the chrsize/btchrsize sidecars so the
+    # loader sees a consistent triple. Engine extensibility confirmed by
+    # in-game test 2026-06-07 (project memory project_btchr_extensible).
+    _btchr_appended_chrsize: List[int] = field(default_factory=list)
+    _btchr_appended_btchrsize: List[int] = field(default_factory=list)
+
+    # Lazy display-name cache. Built on first access from battle_strings +
+    # string_regions["arm9_digiegg_enemy_names"]; invalidated explicitly via
+    # invalidate_name_caches() when a battle-string entry or that region's
+    # strings change. Editors that surface these labels (base/enemy digimon,
+    # MCHR browser, sprite browser) call the resolver on every list-row
+    # build, so the cache avoids the per-call dict rebuild.
+    _digimon_name_cache: Dict[int, str] = field(default_factory=dict)
+    _digimon_name_cache_valid: bool = False
 
     @classmethod
     def from_file(cls, path: str) -> "RomSession":
@@ -134,6 +171,27 @@ class RomSession:
             if vanilla_data[v_start:v_end] != patched_data[p_start:p_end]:
                 session._sprite_pak_cache[pak_name] = pak.PakFile(patched_data[p_start:p_end])
                 session._dirty_sprite_paks.add(pak_name)
+        # BTCHR sidecars: scan per-group u32 slots in patched vs vanilla.
+        # The byte diff already landed these in patched_data; mirror them
+        # into the per-group edit dicts so a re-save writes them back even
+        # after we strip the sprite splice from the next diff.
+        for path, target in (
+            (CHRSIZE_PATH, session._chrsize_edits),
+            (BTCHRSIZE_PATH, session._btchrsize_edits),
+        ):
+            try:
+                v_start, v_end = ft_vanilla.resolve(path)
+                p_start, p_end = ft_patched.resolve(path)
+            except KeyError:
+                continue
+            v_buf = vanilla_data[v_start:v_end]
+            p_buf = patched_data[p_start:p_end]
+            n = min(len(v_buf), len(p_buf)) // 4
+            for g in range(n):
+                v_word = struct.unpack_from("<I", v_buf, g * 4)[0]
+                p_word = struct.unpack_from("<I", p_buf, g * 4)[0]
+                if v_word != p_word:
+                    target[g] = p_word
         # vanilla_path isn't stored on the session — the caller (main_window)
         # owns the QSettings cache so projects sharing a vanilla ROM don't
         # each re-prompt the user.
@@ -255,6 +313,11 @@ class RomSession:
         # sprite would shift every downstream file and bloat the byte diff.
         if not skip_sprite_splice:
             self._apply_sprite_pak_splice(out)
+        # Sidecar growth piggybacks on the sprite splice — without the PAK
+        # growing too, longer chrsize/btchrsize files would describe groups
+        # that don't exist. Project save skips both; the next ROM export
+        # writes the consistent triple.
+        self._apply_btchr_size_edits(out, skip_sidecar_resize=skip_sprite_splice)
         return out
 
     def serialize_all_with_qol(self) -> bytearray:
@@ -338,6 +401,176 @@ class RomSession:
             )
             fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
 
+    # ---- BTCHR sidecar edits ----------------------------------------------
+
+    def current_chrsize_word(self, group: int) -> int:
+        """Return the live u32 for ``group`` in BTCHR/CHRSIZE.BIN.
+
+        Prefers an in-memory edit if one exists; otherwise reads the
+        vanilla word from ``original_rom_data``. Used by undo commands
+        to snapshot the pre-edit state before they overwrite it.
+        """
+        if group in self._chrsize_edits:
+            return self._chrsize_edits[group]
+        ft = fnt.FileTable.from_rom(self.original_rom_data)
+        start, _end = ft.resolve(CHRSIZE_PATH)
+        return struct.unpack_from("<I", self.original_rom_data, start + group * 4)[0]
+
+    def current_btchrsize_value(self, group: int) -> int:
+        """Return the live u32 for ``group`` in BTCHR/BTCHRSIZE.BIN."""
+        if group in self._btchrsize_edits:
+            return self._btchrsize_edits[group]
+        ft = fnt.FileTable.from_rom(self.original_rom_data)
+        start, _end = ft.resolve(BTCHRSIZE_PATH)
+        return struct.unpack_from("<I", self.original_rom_data, start + group * 4)[0]
+
+    def set_chrsize_word(self, group: int, word: int) -> None:
+        """Record a u32 edit for ``group`` in BTCHR/CHRSIZE.BIN.
+
+        Idempotent — writing the vanilla word leaves the edit in the dict
+        but produces a no-op diff at save time. Undo commands rely on
+        this so they can restore an exact pre-edit value without having
+        to special-case "no edit" vs "edit equal to vanilla".
+        """
+        self._chrsize_edits[group] = word & 0xFFFFFFFF
+
+    def set_btchrsize_value(self, group: int, value: int) -> None:
+        """Record a u32 edit for ``group`` in BTCHR/BTCHRSIZE.BIN."""
+        self._btchrsize_edits[group] = value & 0xFFFFFFFF
+
+    def vanilla_btchr_group_count(self) -> int:
+        """Number of BTCHR groups in ``original_rom_data`` — 415 on vanilla
+        US Dusk/Dawn. Derived from CHRSIZE.BIN size since the PAK count
+        already reflects any in-memory appends."""
+        ft = fnt.FileTable.from_rom(self.original_rom_data)
+        start, end = ft.resolve(CHRSIZE_PATH)
+        return (end - start) // 4
+
+    def append_btchr_group_sidecars(
+        self, chrsize_word: int, btchrsize_value: int,
+    ) -> None:
+        """Record a new BTCHR group's sidecar words (chrsize + btchrsize).
+
+        The PAK growth is the caller's responsibility (bump
+        ``sprite_pak(BTCHR_PAK).count`` and append 5 entries). These two
+        u32s ride the sidecar resize on serialize so the engine sees a
+        consistent (PAK count, chrsize length, btchrsize length) triple.
+        """
+        self._btchr_appended_chrsize.append(chrsize_word & 0xFFFFFFFF)
+        self._btchr_appended_btchrsize.append(btchrsize_value & 0xFFFFFFFF)
+
+    def pop_btchr_group_sidecars(self) -> Tuple[int, int]:
+        """Drop the last appended sidecar pair. Used by undo paths to
+        rewind an append. Returns the popped ``(chrsize_word,
+        btchrsize_value)``. Raises ``IndexError`` if no appends are
+        pending."""
+        return (
+            self._btchr_appended_chrsize.pop(),
+            self._btchr_appended_btchrsize.pop(),
+        )
+
+    def _apply_btchr_size_edits(
+        self, out: bytearray, *, skip_sidecar_resize: bool = False,
+    ) -> None:
+        """Stamp every recorded chrsize/btchrsize edit into ``out``.
+
+        Resolved against the current ROM image's FAT so this works
+        whether or not :meth:`_apply_sprite_pak_splice` already ran —
+        if a sprite splice shifted BTCHR.PAK and pushed the sidecars to
+        new offsets, the freshly-walked FAT finds them at their new home.
+
+        Sidecar growth (``_btchr_appended_chrsize`` non-empty) takes the
+        splice path instead: each file is rebuilt as ``vanilla_bytes +
+        appended u32s`` with in-place edits stamped on top, then run
+        through ``fat.splice_range`` so the FAT/header track the new
+        length. Walking a fresh FNT before each splice keeps offsets
+        valid through interleaved file shifts.
+
+        ``skip_sidecar_resize=True`` suppresses the splice path —
+        project save uses it so the byte diff stays small. The appended
+        groups are dropped from the project save; they only survive a
+        direct ROM export.
+        """
+        no_edits = not self._chrsize_edits and not self._btchrsize_edits
+        no_appended = not self._btchr_appended_chrsize or skip_sidecar_resize
+        if no_edits and no_appended:
+            return
+        if no_appended:
+            ft = fnt.FileTable.from_rom(bytes(out))
+            if self._chrsize_edits:
+                start, _end = ft.resolve(CHRSIZE_PATH)
+                for g, word in self._chrsize_edits.items():
+                    struct.pack_into("<I", out, start + g * 4, word)
+            if self._btchrsize_edits:
+                start, _end = ft.resolve(BTCHRSIZE_PATH)
+                for g, value in self._btchrsize_edits.items():
+                    struct.pack_into("<I", out, start + g * 4, value)
+            return
+        for path, edits, appended in (
+            (CHRSIZE_PATH, self._chrsize_edits, self._btchr_appended_chrsize),
+            (BTCHRSIZE_PATH, self._btchrsize_edits, self._btchr_appended_btchrsize),
+        ):
+            ft = fnt.FileTable.from_rom(bytes(out))
+            start, end = ft.resolve(path)
+            content = bytearray(out[start:end])
+            for word in appended:
+                content += struct.pack("<I", word)
+            for g, word in edits.items():
+                struct.pack_into("<I", content, g * 4, word)
+            idx, _cs, ce = fat.find_container(out, start, end)
+            content_delta = len(content) - (end - start)
+            aligned_shift = fat.splice_range(out, start, end, ce, bytes(content))
+            fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
+
+    # ---- display-name resolvers --------------------------------------------
+
+    def digimon_display_name(self, digimon_id: int) -> str:
+        """Best available display name for a sprite_map slot id.
+
+        Prefers ``DIGIMON_ID_TO_STR``; falls back to the battle-string
+        text resolved via ``STRING_BATTLE_TABLE_OFFSET[version][0] +
+        BattleStringEntry.value``. The fallback covers ~380 digimon
+        slots (digieggs, in-trainings, fixed-enemy bosses) plus the
+        NPC slots in 0x30e..0x363 (Glare..Sayo and assorted aliased
+        recolors) — every sprite_map slot whose battle_string points
+        at a string in ``arm9_digiegg_enemy_names`` resolves through
+        the same path. Unknown ids return ``<unnamed 0x...>``.
+        """
+        if not self._digimon_name_cache_valid:
+            self._build_digimon_name_cache()
+        name = self._digimon_name_cache.get(digimon_id)
+        if name is not None:
+            return name
+        return f"<unnamed 0x{digimon_id:03x}>"
+
+    def invalidate_name_caches(self) -> None:
+        """Force rebuild of the display-name caches on next access.
+
+        Call after editing a ``BattleStringEntry.value`` or a string
+        inside ``arm9_digiegg_enemy_names`` — the cache is otherwise
+        held for the lifetime of the session.
+        """
+        self._digimon_name_cache_valid = False
+
+    def _build_digimon_name_cache(self) -> None:
+        cache: Dict[int, str] = {}
+        base = constants.STRING_BATTLE_TABLE_OFFSET[self.version][0]
+        region = self.string_regions.get("arm9_digiegg_enemy_names", [])
+        addr_to_text = {g.offset: g.text for g in region}
+        for i, entry in enumerate(self.battle_strings):
+            named = constants.DIGIMON_ID_TO_STR.get(i)
+            if named is not None:
+                cache[i] = named
+                continue
+            text = addr_to_text.get(base + entry.value)
+            if text:
+                cache[i] = text
+        # Cover ids past the battle-string table too (rare, but cheap).
+        for did, named in constants.DIGIMON_ID_TO_STR.items():
+            cache.setdefault(did, named)
+        self._digimon_name_cache = cache
+        self._digimon_name_cache_valid = True
+
     def over_budget_strings(self) -> List[model.GameString]:
         """Non-MSG.PAK strings whose encoded length exceeds their byte budget.
 
@@ -405,6 +638,11 @@ class RomSession:
         ``original_entry`` would be wrong for project-loaded sessions
         because the cached PakFile was parsed from patched_data (project
         state), not vanilla.
+
+        Entries past ``vanilla.count`` are emitted in order so the load
+        side can append them sequentially (each one extends the pak by
+        one entry). For BTCHR.PAK these ride alongside the
+        ``btchr_appended_sidecars`` channel (chrsize + btchrsize words).
         """
         out: List[Tuple[str, int, bytes]] = []
         if not self._dirty_sprite_paks:
@@ -424,7 +662,35 @@ class RomSession:
                 v_bytes = vanilla.original_entry(i)
                 if edited.entries[i] != v_bytes:
                     out.append((pak_name, i, bytes(edited.entries[i])))
+            for i in range(vanilla.count, edited.count):
+                out.append((pak_name, i, bytes(edited.entries[i])))
         return out
+
+    def btchr_appended_sidecars(self) -> List[Tuple[int, int]]:
+        """Snapshot per-group sidecar values for appended BTCHR groups.
+
+        Each tuple is ``(chrsize_word, btchrsize_value)`` parallel to
+        the appended PAK entries. Used by .romproj save so the project
+        load can restore the full (PAK count, chrsize length, btchrsize
+        length) triple without depending on the byte diff (which is
+        skipped on save by ``skip_sprite_splice=True``).
+        """
+        return list(zip(
+            self._btchr_appended_chrsize,
+            self._btchr_appended_btchrsize,
+        ))
+
+    def apply_btchr_appended_sidecars(
+        self, sidecars: List[Tuple[int, int]],
+    ) -> None:
+        """Replay ``btchr_appended_sidecars`` snapshots onto the session.
+
+        Pairs are stored verbatim; the caller (project load) must also
+        replay the corresponding 5-entry PAK appends so the triple stays
+        consistent. Idempotent: replays into an empty list (project
+        load runs once on a fresh session)."""
+        for chrsize_word, btchrsize_value in sidecars:
+            self.append_btchr_group_sidecars(chrsize_word, btchrsize_value)
 
     def apply_sprite_pak_edits(
         self, edits: List[Tuple[str, int, bytes]],
@@ -436,15 +702,25 @@ class RomSession:
         the splice + FAT-shift path. Raises ``KeyError`` on unknown pak
         name (signals project/ROM version drift) and ``IndexError`` on
         out-of-range ``entry_idx``.
+
+        ``entry_idx == pak_obj.count`` triggers an append (extending
+        the pak by one entry). Higher gaps raise — appended entries
+        must arrive in order so each ``count`` value the previous
+        append produced matches the next ``entry_idx``.
         """
         for pak_name, idx, new_bytes in edits:
             pak_obj = self.sprite_pak(pak_name)
-            if not (0 <= idx < pak_obj.count):
+            if idx == pak_obj.count:
+                pak_obj.entries.append(bytes(new_bytes))
+                pak_obj.flags.append(0x80000000)
+                pak_obj.count += 1
+            elif 0 <= idx < pak_obj.count:
+                pak_obj.replace_entry(idx, new_bytes)
+            else:
                 raise IndexError(
                     f"sprite_edits: entry {idx} out of range for "
                     f"{pak_name} (count={pak_obj.count})"
                 )
-            pak_obj.replace_entry(idx, new_bytes)
             self.mark_sprite_pak_dirty(pak_name)
 
     def apply_string_edits(self, edits: List[Tuple[str, int, str]]) -> None:

@@ -13,30 +13,42 @@ signature later.
 """
 from __future__ import annotations
 
+import os
+import re
+import struct
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QUndoStack, qRgba
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from digimon_core import btchr, fnt, mchr, ncer as ncer_mod, pak, sprite
+from digimon_core import btchr, btchrspr, fnt, mchr, ncer as ncer_mod, pak, sprite
 
-from ..commands import ReplaceSpriteCommand
+from ..commands import (
+    AppendBtchrGroupCommand,
+    PortBtchrSpriteCommand,
+    ReplaceSpriteCommand,
+)
 from ._png_palette import build_palette_from_png, nearest_idx_opaque
 from .record_list_panel import RecordListPanel
 from .transparent_picker import TransparentColorPicker
@@ -87,6 +99,71 @@ def _load_chrsize_rows(session) -> List[tuple]:
         return []
 
 
+def _load_chrsize_rows_live(session) -> List[tuple]:
+    """Vanilla chrsize.bin parse, then overlay any in-memory edits.
+
+    The widget caches chrsize rows on session open for the left-list
+    label; after an in-editor port the cache is stale (target's tpf has
+    changed). Overlaying ``session._chrsize_edits`` on top of the
+    vanilla parse gives every reader the post-port view without forcing
+    a session re-read.
+    """
+    rows = _load_chrsize_rows(session)
+    edits = getattr(session, "_chrsize_edits", {})
+    if not edits:
+        return rows
+    out = list(rows)
+    for g, word in edits.items():
+        if 0 <= g < len(out):
+            out[g] = (word & 0xFFFF, (word >> 16) & 0xFFFF)
+    return out
+
+
+def _format_btchr_label(
+    g: int,
+    digimon_id: int,
+    name: Optional[str],
+    placeholder: bool = False,
+) -> str:
+    """Compose a BTCHR group list label.
+
+    Format with name: ``"0x{g:04x} {name} [id=0x{digimon_id:04x}]"``.
+    Format without name: ``"0x{g:04x} [id=0x{digimon_id:04x}]"``.
+    Missing digimon id renders as ``[id=????]``. Sentinel/placeholder
+    groups get a trailing ``(placeholder)`` marker.
+    """
+    id_token = f"[id=0x{digimon_id:04x}]" if digimon_id >= 0 else "[id=????]"
+    name_token = f"{name} " if name else ""
+    tag = " (placeholder)" if placeholder else ""
+    return f"0x{g:04x}  {name_token}{id_token}{tag}"
+
+
+def compute_btchr_group_labels(session) -> List[str]:
+    """Public helper: BTCHR group label list. One per group (vanilla 415 +
+    any appended). Used by other widgets (e.g. the enemy-digimon editor's
+    main-sprite picker) so labels stay consistent across the app."""
+    chrsize_rows = _load_chrsize_rows_live(session)
+    sprite_to_base: dict[int, int] = {}
+    for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
+        sprite_to_base.setdefault(entry.main_sprite, base_id)
+
+    n_groups = session.vanilla_btchr_group_count() + len(session.btchr_appended_sidecars())
+    out: List[str] = []
+    for g in range(n_groups):
+        digimon_id = chrsize_rows[g][0] if g < len(chrsize_rows) else -1
+        base_id = sprite_to_base.get(g)
+        name: Optional[str] = None
+        if base_id is not None:
+            resolved = session.digimon_display_name(base_id)
+            if not resolved.startswith("<unnamed"):
+                name = resolved
+        out.append(_format_btchr_label(
+            g, digimon_id, name,
+            placeholder=(g in btchr.SENTINEL_GROUPS),
+        ))
+    return out
+
+
 class BtchrBrowser(QWidget):
     """Read-only browser for BTCHR battle sprites."""
 
@@ -96,7 +173,7 @@ class BtchrBrowser(QWidget):
         self._undo_stack = undo_stack
         self._pak: pak.PakFile = session.sprite_pak(BTCHR_PAK)
         self._n_groups = btchr.parse_pak_groups(self._pak)
-        self._chrsize_rows = _load_chrsize_rows(session)
+        self._chrsize_rows = _load_chrsize_rows_live(session)
 
         self._current_group: Optional[int] = None
         self._current_decoded: Optional[btchr.BtchrDigimon] = None
@@ -124,6 +201,17 @@ class BtchrBrowser(QWidget):
         # character, not the underlying tile layout.
         self._view_mode_overrides: dict[int, str] = {}
 
+        # Animation playback state. ``_anim_flat`` is one entry per
+        # output tick (see :func:`btchr.flatten_anim_track`); the timer
+        # drives ``_anim_pos`` forward and ``_refresh_preview`` reads
+        # ``_current_cell`` so playback rides the existing render path.
+        # Default FPS = 60 to match NDS vblank — DWDD's mini-header
+        # durations behave as 60Hz tick counts in-game.
+        self._anim_track_key: str = "idle"
+        self._anim_flat: List[Tuple[int, int]] = []
+        self._anim_pos: int = 0
+        self._anim_fps: int = 60
+
         # Cached cell QPixmaps for the *current* digimon. Cleared on
         # selection change.
         self._cell_pixmaps: List[Optional[QPixmap]] = []
@@ -143,12 +231,36 @@ class BtchrBrowser(QWidget):
         self._sheet_src_size: Tuple[int, int] = (0, 0)
         self._sheet_pix_size: Tuple[int, int] = (0, 0)
 
+        # Reverse lookup: BTCHR group index -> first sprite-map list
+        # position pointing at it. SpriteMapEntry.main_sprite carries
+        # the battle-sprite (BTCHR group) index, and the entry's list
+        # position is the key into DIGIMON_ID_TO_STR — so this join is
+        # what turns "group 2" into "Koromon". Multiple recolors can
+        # share a battle sprite; setdefault keeps the first (canonical)
+        # name. Groups whose battle sprite isn't referenced by any
+        # entry fall through to "id=NNNN" only.
+        self._sprite_to_base: dict[int, int] = {}
+        for base_id, entry in enumerate(getattr(session, "sprite_map", [])):
+            self._sprite_to_base.setdefault(entry.main_sprite, base_id)
+
         self._labels: List[str] = self._build_labels()
 
         self._build_ui()
         self._list.select_first()
 
     # ---- labels ---------------------------------------------------------
+
+    def _name_for_group(self, g: int) -> Optional[str]:
+        """Human name for BTCHR group ``g`` via the sprite-map cross-
+        reference. Routes through ``digimon_display_name`` so bosses /
+        NPCs surface their battle-string name (e.g. group 0x192 →
+        sprite_map slot 0x1f9 → "OphanimonC"). Returns None when no
+        entry points at this group or the resolver can't name the slot."""
+        base_id = self._sprite_to_base.get(g)
+        if base_id is None:
+            return None
+        name = self._session.digimon_display_name(base_id)
+        return None if name.startswith("<unnamed") else name
 
     def _build_labels(self) -> List[str]:
         out: List[str] = []
@@ -157,9 +269,10 @@ class BtchrBrowser(QWidget):
                 self._chrsize_rows[g][0]
                 if g < len(self._chrsize_rows) else -1
             )
-            tag = " (placeholder)" if g in btchr.SENTINEL_GROUPS else ""
-            id_token = f"id={digimon_id:04d}" if digimon_id >= 0 else "id=????"
-            out.append(f"{g:04d}  {id_token}{tag}")
+            out.append(_format_btchr_label(
+                g, digimon_id, self._name_for_group(g),
+                placeholder=(g in btchr.SENTINEL_GROUPS),
+            ))
         return out
 
     # ---- UI -------------------------------------------------------------
@@ -261,6 +374,36 @@ class BtchrBrowser(QWidget):
         self._export_sheet_btn.clicked.connect(self._on_export_sheet_png)
         self._import_sheet_btn = QPushButton("Import tile sheet PNG…")
         self._import_sheet_btn.clicked.connect(self._on_import_sheet_png)
+        # Per-cell IO: 5 separate PNGs (one per cell) instead of a single
+        # composite. Same OAM-walk codec as the composite cells mode, just
+        # sourcing pixels from N independent files. The on-disk PNGs are
+        # all sized to the union bbox over all 5 cells — guarantees the
+        # "all cells must be the same size" invariant the engine relies
+        # on, and lets the user copy frames between digimon freely.
+        self._export_per_cell_btn = QPushButton("Export per-cell PNGs…")
+        self._export_per_cell_btn.clicked.connect(self._on_export_per_cell_pngs)
+        self._import_per_cell_btn = QPushButton("Import per-cell PNGs…")
+        self._import_per_cell_btn.clicked.connect(self._on_import_per_cell_pngs)
+
+        # .btchrspr: portable single-digimon sprite kit. Export packs the 5
+        # PAK entries + the two sidecar u32s into one file; import replays
+        # them onto the selected slot (keeping the slot's secondary id).
+        # The whole port (5 PAK entries + chrsize.tpf + btchrsize) lands as
+        # one undo step.
+        self._export_btchrspr_btn = QPushButton("Export .btchrspr…")
+        self._export_btchrspr_btn.clicked.connect(self._on_export_btchrspr)
+        self._import_btchrspr_btn = QPushButton("Import .btchrspr…")
+        self._import_btchrspr_btn.clicked.connect(self._on_import_btchrspr)
+        # In-context duplicate: same op as the list's "+ Add Entry" button
+        # but acts on the currently-selected group directly (no extra
+        # picker step).
+        self._duplicate_entry_btn = QPushButton("Duplicate sprite entry")
+        self._duplicate_entry_btn.setToolTip(
+            "Append a new BTCHR group at the end of the list carrying a "
+            "copy of this sprite's data. Equivalent to selecting + Add "
+            "Entry below the list with this group selected."
+        )
+        self._duplicate_entry_btn.clicked.connect(self._on_add_entry)
 
         # When on, an Indexed8 import also rebuilds the NCLR from the PNG's
         # embedded color table — matches the natural Aseprite/GIMP workflow
@@ -279,24 +422,137 @@ class BtchrBrowser(QWidget):
         cells_controls.addRow("Cell", self._cell_spin)
         cells_controls.addRow("", self._show_all_cells)
 
+        # ---- Animation playback + step editing -----------------------
+        # Timer drives _anim_pos at the chosen FPS; _on_anim_tick reads
+        # the flattened track and updates _current_cell. Stopped state
+        # leaves _current_cell wherever the user last manually picked.
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(max(1, 1000 // self._anim_fps))
+        self._anim_timer.timeout.connect(self._on_anim_tick)
+
+        self._anim_track_combo = QComboBox()
+        self._anim_track_combo.addItem("Idle", "idle")
+        self._anim_track_combo.addItem("Attack", "attack")
+        self._anim_track_combo.addItem("Defend", "defend")
+        self._anim_track_combo.currentIndexChanged.connect(
+            self._on_anim_track_changed
+        )
+
+        self._anim_play_btn = QPushButton("▶ Play")
+        self._anim_play_btn.setCheckable(True)
+        self._anim_play_btn.toggled.connect(self._on_anim_play_toggled)
+
+        self._anim_fps_spin = QSpinBox()
+        self._anim_fps_spin.setRange(1, 120)
+        self._anim_fps_spin.setValue(self._anim_fps)
+        self._anim_fps_spin.setSuffix(" fps")
+        self._anim_fps_spin.valueChanged.connect(self._on_anim_fps_changed)
+
+        # Steps table — 2 cols (cell, duration). Track A's first row is
+        # the implicit cell-0 step (cell editable disabled). Edits push
+        # ReplaceSpriteCommand re-encoding the whole entry-0; merging
+        # rapid edits into one undo step is a known follow-up.
+        self._anim_table = QTableWidget(0, 2)
+        self._anim_table.setHorizontalHeaderLabels(["Cell", "Duration"])
+        self._anim_table.verticalHeader().setVisible(False)
+        self._anim_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+        self._anim_table.setEditTriggers(
+            QAbstractItemView.DoubleClicked
+            | QAbstractItemView.EditKeyPressed
+            | QAbstractItemView.SelectedClicked
+        )
+        self._anim_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._anim_table.setMaximumHeight(180)
+        self._anim_table.itemChanged.connect(self._on_anim_step_edited)
+        # Re-entrancy guard: programmatic table population must not
+        # trip itemChanged → re-encode.
+        self._anim_table_loading = False
+
+        # Add / remove buttons. Idle[0] is the implicit cell-0 anchor —
+        # the engine reads from there even if the bytes say otherwise,
+        # so removing it would desync the rest of the track. Remove is
+        # disabled when the active row is Idle[0], when no row is
+        # selected, or when the track is down to a single step (the
+        # parser asserts ≥1 step per track across all vanilla groups).
+        self._anim_add_btn = QPushButton("+ Add step")
+        self._anim_add_btn.clicked.connect(self._on_anim_add_step)
+        self._anim_remove_btn = QPushButton("- Remove step")
+        self._anim_remove_btn.clicked.connect(self._on_anim_remove_step)
+        self._anim_remove_btn.setEnabled(False)
+        self._anim_table.itemSelectionChanged.connect(
+            self._update_anim_remove_enabled
+        )
+
         # Metadata block — fixed-width labels so switching digimon doesn't
         # cause the layout to reflow.
+        self._meta_name = QLabel("—")
         self._meta_cells = QLabel("—")
         self._meta_tiles = QLabel("—")
-        self._meta_bbox = QLabel("—")
         self._meta_idle = QLabel("—")
         self._meta_attack = QLabel("—")
         self._meta_defend = QLabel("—")
         for lbl in (
-            self._meta_cells, self._meta_tiles, self._meta_bbox,
+            self._meta_name,
+            self._meta_cells, self._meta_tiles,
             self._meta_idle, self._meta_attack, self._meta_defend,
         ):
             lbl.setMinimumWidth(280)
+        name_font = self._meta_name.font()
+        name_font.setBold(True)
+        self._meta_name.setFont(name_font)
+
+        # Editable header fields. footprint_scale is u16; y_pivot_a,
+        # x_pivot, y_pivot_b are i16 (vanilla y-pivots are always ≤ 0
+        # because the engine pivots from the sprite's top, but signed
+        # range is exposed for parity with the stored shape). Edits go
+        # through _push_header_replacement so undo/redo wraps them.
+        # _hdr_loading guards programmatic refresh from re-firing the
+        # valueChanged → re-encode loop on selection change.
+        self._hdr_loading = False
+        self._hdr_scale_spin = QSpinBox()
+        self._hdr_scale_spin.setRange(0, 0xFFFF)
+        self._hdr_scale_spin.setToolTip(
+            "footprint_scale (u16) — scales with sprite size; affects "
+            "render footprint."
+        )
+        self._hdr_scale_spin.valueChanged.connect(
+            lambda v: self._on_header_field_changed("footprint_scale", v)
+        )
+        self._hdr_y_pivot_a_spin = QSpinBox()
+        self._hdr_y_pivot_a_spin.setRange(-0x8000, 0x7FFF)
+        self._hdr_y_pivot_a_spin.setToolTip(
+            "y_pivot_a (i16) — top pivot; vanilla values are always ≤ 0."
+        )
+        self._hdr_y_pivot_a_spin.valueChanged.connect(
+            lambda v: self._on_header_field_changed("y_pivot_a", v)
+        )
+        self._hdr_x_pivot_spin = QSpinBox()
+        self._hdr_x_pivot_spin.setRange(-0x8000, 0x7FFF)
+        self._hdr_x_pivot_spin.setToolTip(
+            "x_pivot (i16) — horizontal pivot offset."
+        )
+        self._hdr_x_pivot_spin.valueChanged.connect(
+            lambda v: self._on_header_field_changed("x_pivot", v)
+        )
+        self._hdr_y_pivot_b_spin = QSpinBox()
+        self._hdr_y_pivot_b_spin.setRange(-0x8000, 0x7FFF)
+        self._hdr_y_pivot_b_spin.setToolTip(
+            "y_pivot_b (i16) — bottom pivot; vanilla values are always ≤ 0."
+        )
+        self._hdr_y_pivot_b_spin.valueChanged.connect(
+            lambda v: self._on_header_field_changed("y_pivot_b", v)
+        )
 
         meta_form = QFormLayout()
+        meta_form.addRow("Name", self._meta_name)
         meta_form.addRow("Cells", self._meta_cells)
         meta_form.addRow("NCGR tiles", self._meta_tiles)
-        meta_form.addRow("Header bbox", self._meta_bbox)
+        meta_form.addRow("Footprint scale", self._hdr_scale_spin)
+        meta_form.addRow("Y pivot (top)", self._hdr_y_pivot_a_spin)
+        meta_form.addRow("X pivot", self._hdr_x_pivot_spin)
+        meta_form.addRow("Y pivot (bottom)", self._hdr_y_pivot_b_spin)
         meta_form.addRow("Idle", self._meta_idle)
         meta_form.addRow("Attack", self._meta_attack)
         meta_form.addRow("Defend", self._meta_defend)
@@ -309,6 +565,34 @@ class BtchrBrowser(QWidget):
         cells_layout = QVBoxLayout(cells_tab)
         cells_layout.setContentsMargins(8, 8, 8, 8)
         cells_layout.addWidget(self._scroll, 1)
+
+        # Animation panel sits below the preview so playback animates
+        # the same preview the user is already looking at. Controls row
+        # first, then the editable steps table. Wrapped in a checkable
+        # QGroupBox starting collapsed — most browsing sessions just
+        # need the preview, so reclaiming the vertical space by default
+        # keeps the cells tab compact.
+        self._anim_group = QGroupBox("Animation")
+        self._anim_group.setCheckable(True)
+        self._anim_group.setChecked(False)
+        anim_content = QWidget()
+        anim_content_layout = QVBoxLayout(anim_content)
+        anim_content_layout.setContentsMargins(0, 0, 0, 0)
+        anim_controls_row = QHBoxLayout()
+        anim_controls_row.addWidget(QLabel("Track:"))
+        anim_controls_row.addWidget(self._anim_track_combo)
+        anim_controls_row.addWidget(self._anim_play_btn)
+        anim_controls_row.addWidget(self._anim_fps_spin)
+        anim_controls_row.addStretch(1)
+        anim_controls_row.addWidget(self._anim_add_btn)
+        anim_controls_row.addWidget(self._anim_remove_btn)
+        anim_content_layout.addLayout(anim_controls_row)
+        anim_content_layout.addWidget(self._anim_table)
+        anim_group_layout = QVBoxLayout(self._anim_group)
+        anim_group_layout.addWidget(anim_content)
+        anim_content.setVisible(False)
+        self._anim_group.toggled.connect(anim_content.setVisible)
+        cells_layout.addWidget(self._anim_group)
 
         # ---- Tile sheet tab: width + columns spinners + sheet preview
         sheet_tab = QWidget()
@@ -341,11 +625,18 @@ class BtchrBrowser(QWidget):
         # four buttons pinned to the widest label so Export/Import line
         # up across columns.
         sheet_btns = (self._export_sheet_btn, self._import_sheet_btn)
+        per_cell_btns = (self._export_per_cell_btn, self._import_per_cell_btn)
         pal_btns = (self._export_pal_btn, self._import_pal_btn)
-        max_btn_w = max(
-            b.sizeHint().width() for b in sheet_btns + pal_btns
+        kit_btns = (
+            self._export_btchrspr_btn,
+            self._import_btchrspr_btn,
+            self._duplicate_entry_btn,
         )
-        for b in sheet_btns + pal_btns:
+        max_btn_w = max(
+            b.sizeHint().width()
+            for b in sheet_btns + per_cell_btns + pal_btns + kit_btns
+        )
+        for b in sheet_btns + per_cell_btns + pal_btns + kit_btns:
             b.setMinimumWidth(max_btn_w)
         sheet_col = QVBoxLayout()
         sheet_col.setSpacing(4)
@@ -353,10 +644,23 @@ class BtchrBrowser(QWidget):
         sheet_col.addWidget(self._import_sheet_btn)
         sheet_col.addWidget(self._import_pal_with_sheet_cb)
         sheet_col.addStretch(1)
+        per_cell_col = QVBoxLayout()
+        per_cell_col.setSpacing(4)
+        per_cell_col.addWidget(self._export_per_cell_btn)
+        per_cell_col.addWidget(self._import_per_cell_btn)
+        per_cell_col.addStretch(1)
+        # Palette buttons share a column with the .btchrspr sprite-kit
+        # buttons — kit IO is a sibling operation (port a whole digimon
+        # vs. a single channel) and the visual gap between the two pairs
+        # keeps the two scopes distinct without burning extra columns.
         pal_col = QVBoxLayout()
         pal_col.setSpacing(4)
         pal_col.addWidget(self._export_pal_btn)
         pal_col.addWidget(self._import_pal_btn)
+        pal_col.addSpacing(12)
+        pal_col.addWidget(self._export_btchrspr_btn)
+        pal_col.addWidget(self._import_btchrspr_btn)
+        pal_col.addWidget(self._duplicate_entry_btn)
         pal_col.addStretch(1)
 
         right = QWidget()
@@ -374,6 +678,8 @@ class BtchrBrowser(QWidget):
         actions_row.addSpacing(16)
         actions_row.addLayout(sheet_col)
         actions_row.addSpacing(16)
+        actions_row.addLayout(per_cell_col)
+        actions_row.addSpacing(16)
         actions_row.addLayout(pal_col)
         actions_row.addSpacing(16)
         actions_row.addLayout(meta_form)
@@ -383,8 +689,26 @@ class BtchrBrowser(QWidget):
         right_layout.addWidget(self._picker)
 
 
+        # `+ Add Entry` sits below the digimon list so it appears next to
+        # the slot the new row will land in (appends always land at the
+        # end). Wraps the list + button in one column container so they
+        # share the same splitter pane.
+        self._add_entry_btn = QPushButton("+ Add Entry")
+        self._add_entry_btn.setToolTip(
+            "Duplicate the currently-selected battle sprite into a new "
+            "group appended at the end. The new entry can then be edited "
+            "and pointed at by any enemy via sprite_map."
+        )
+        self._add_entry_btn.clicked.connect(self._on_add_entry)
+        list_col = QWidget()
+        list_col_layout = QVBoxLayout(list_col)
+        list_col_layout.setContentsMargins(0, 0, 0, 0)
+        list_col_layout.setSpacing(4)
+        list_col_layout.addWidget(self._list, 1)
+        list_col_layout.addWidget(self._add_entry_btn)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._list)
+        splitter.addWidget(list_col)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -420,12 +744,11 @@ class BtchrBrowser(QWidget):
         self._current_cell = 0
 
         h = d.header
+        name = self._name_for_group(g)
+        self._meta_name.setText(name if name else "—")
         self._meta_cells.setText(str(len(d.ncer.cells)))
         self._meta_tiles.setText(f"{d.n_tiles} tiles (8bpp)")
-        self._meta_bbox.setText(
-            f"scale={h.footprint_scale}  "
-            f"y₁={h.y_pivot_a:+d}  x={h.x_pivot:+d}  y₂={h.y_pivot_b:+d}"
-        )
+        self._load_header_spinboxes(h)
         self._meta_idle.setText(_format_track(h.idle))
         self._meta_attack.setText(_format_track(h.attack))
         self._meta_defend.setText(_format_track(h.defend))
@@ -469,6 +792,11 @@ class BtchrBrowser(QWidget):
             self._refresh_sheet_preview()
             self._sheet_dirty = False
         self._picker.set_current_color(self._current_decoded.palette[0])
+        # Selection swap implicitly stops playback — the new digimon
+        # has different cell/track indices so blind continuation would
+        # render against the wrong tile bank.
+        self._stop_anim_playback()
+        self._refresh_anim_table()
 
     def _on_cell_changed(self, value: int) -> None:
         self._current_cell = value
@@ -627,6 +955,68 @@ class BtchrBrowser(QWidget):
             return None
         return rects, max_w, max_h
 
+    def _make_indexed8_canvas(self, w: int, h: int) -> QImage:
+        """Indexed8 QImage sized ``w × h`` with the live NCLR as the colour
+        table and slot 0 set to alpha=0 — same shape composite and per-cell
+        exports both paint into."""
+        d = self._current_decoded
+        assert d is not None  # callers gate on this
+        img = QImage(w, h, QImage.Format_Indexed8)
+        ctable = [
+            qRgba(r, g, b, 0 if pi == 0 else 255)
+            for pi, (r, g, b) in enumerate(d.palette)
+        ]
+        img.setColorTable(ctable)
+        img.fill(0)
+        return img
+
+    def _paint_cell_indexed8(
+        self,
+        img: QImage,
+        cell,
+        slot_x: int,
+        slot_y: int,
+        xmin: int,
+        ymin: int,
+    ) -> None:
+        """Walk one cell's OAMs and write palette indices into ``img`` at
+        ``(slot_x, slot_y)``. ``xmin/ymin`` is the cell's bbox origin —
+        the per-OAM ``x/y`` are relative to those so the cell content
+        lands at the slot's top-left."""
+        d = self._current_decoded
+        assert d is not None
+        tile_mult = d.ncer.boundary_bytes // btchr.BYTES_PER_TILE_8BPP
+        n_tiles = d.n_tiles
+        img_w = img.width()
+        img_h = img.height()
+        for o in cell.oams:
+            first_tile = o.tile * tile_mult
+            ox = o.x - xmin
+            oy = o.y - ymin
+            ntw = o.w // 8
+            nth = o.h // 8
+            for ty in range(nth):
+                for tx in range(ntw):
+                    idx = first_tile + ty * ntw + tx
+                    if idx >= n_tiles:
+                        continue
+                    tile_off = idx * btchr.BYTES_PER_TILE_8BPP
+                    for r in range(8):
+                        sr = (7 - r) if o.vflip else r
+                        src_row = tile_off + sr * 8
+                        dst_y = slot_y + oy + ty * 8 + r
+                        if not (0 <= dst_y < img_h):
+                            continue
+                        for c in range(8):
+                            sc = (7 - c) if o.hflip else c
+                            pi = d.tile_bytes[src_row + sc]
+                            if pi == 0:
+                                continue
+                            dst_x = slot_x + ox + tx * 8 + c
+                            if not (0 <= dst_x < img_w):
+                                continue
+                            img.setPixel(dst_x, dst_y, pi)
+
     def _render_cells_qimage(self, columns: int) -> Optional[QImage]:
         """Compose each NCER cell into one Indexed8 slot, ``columns`` slots
         per row. Slot size = ``(max_cell_w, max_cell_h)`` so the grid is
@@ -648,51 +1038,35 @@ class BtchrBrowser(QWidget):
         columns = max(1, min(columns, n_cells))
         rows = (n_cells + columns - 1) // columns
 
-        img = QImage(max_w * columns, max_h * rows, QImage.Format_Indexed8)
-        ctable = []
-        for pi, (r, g, b) in enumerate(d.palette):
-            ctable.append(qRgba(r, g, b, 0 if pi == 0 else 255))
-        img.setColorTable(ctable)
-        img.fill(0)
-
-        tile_mult = d.ncer.boundary_bytes // btchr.BYTES_PER_TILE_8BPP
-        n_tiles = d.n_tiles
-        img_w = img.width()
-        img_h = img.height()
-
+        img = self._make_indexed8_canvas(max_w * columns, max_h * rows)
         for ci, cell in enumerate(d.ncer.cells):
             col = ci % columns
             row = ci // columns
-            slot_x = col * max_w
-            slot_y = row * max_h
             xmin, ymin, _, _ = rects[ci]
-            for o in cell.oams:
-                first_tile = o.tile * tile_mult
-                ox = o.x - xmin
-                oy = o.y - ymin
-                ntw = o.w // 8
-                nth = o.h // 8
-                for ty in range(nth):
-                    for tx in range(ntw):
-                        idx = first_tile + ty * ntw + tx
-                        if idx >= n_tiles:
-                            continue
-                        tile_off = idx * btchr.BYTES_PER_TILE_8BPP
-                        for r in range(8):
-                            sr = (7 - r) if o.vflip else r
-                            src_row = tile_off + sr * 8
-                            dst_y = slot_y + oy + ty * 8 + r
-                            if not (0 <= dst_y < img_h):
-                                continue
-                            for c in range(8):
-                                sc = (7 - c) if o.hflip else c
-                                pi = d.tile_bytes[src_row + sc]
-                                if pi == 0:
-                                    continue
-                                dst_x = slot_x + ox + tx * 8 + c
-                                if not (0 <= dst_x < img_w):
-                                    continue
-                                img.setPixel(dst_x, dst_y, pi)
+            self._paint_cell_indexed8(
+                img, cell, col * max_w, row * max_h, xmin, ymin,
+            )
+        return img
+
+    def _render_one_cell_qimage(self, cell_idx: int) -> Optional[QImage]:
+        """Single cell rendered at the union slot size (max_w × max_h
+        over all 5 cells). Cell content top-left aligned; the rest is
+        transparent gutter. Same Indexed8 + colour table as the
+        composite renderer so the two formats are pixel-compatible."""
+        if self._current_decoded is None:
+            return None
+        d = self._current_decoded
+        layout = self._cell_layout()
+        if layout is None:
+            return None
+        rects, max_w, max_h = layout
+        if not (0 <= cell_idx < len(d.ncer.cells)):
+            return None
+        img = self._make_indexed8_canvas(max_w, max_h)
+        xmin, ymin, _, _ = rects[cell_idx]
+        self._paint_cell_indexed8(
+            img, d.ncer.cells[cell_idx], 0, 0, xmin, ymin,
+        )
         return img
 
     def _refresh_sheet_preview(self) -> None:
@@ -779,7 +1153,7 @@ class BtchrBrowser(QWidget):
         if n_tiles == 0:
             QMessageBox.critical(self, "Export failed", "Sprite has no tiles.")
             return
-        suggested = f"btchr_chr_{self._current_group:04d}.png"
+        suggested = f"btchr_chr_0x{self._current_group:04x}.png"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export tile sheet PNG", suggested, "PNG (*.png)"
         )
@@ -992,9 +1366,9 @@ class BtchrBrowser(QWidget):
                 self._nclr_entry_idx(group),
                 sprite.compress_rle30(new_nclr),
             ))
-            desc = f"Import BTCHR tile sheet + palette {group:04d}"
+            desc = f"Import BTCHR tile sheet + palette 0x{group:04x}"
         else:
-            desc = f"Import BTCHR tile sheet {group:04d}"
+            desc = f"Import BTCHR tile sheet 0x{group:04x}"
 
         cmd = ReplaceSpriteCommand(
             self._session,
@@ -1148,9 +1522,260 @@ class BtchrBrowser(QWidget):
                 self._nclr_entry_idx(group),
                 sprite.compress_rle30(new_nclr),
             ))
-            desc = f"Import BTCHR cells + palette {group:04d}"
+            desc = f"Import BTCHR cells + palette 0x{group:04x}"
         else:
-            desc = f"Import BTCHR cells {group:04d}"
+            desc = f"Import BTCHR cells 0x{group:04x}"
+
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            replacements,
+            description=desc,
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+
+    # ---- per-cell PNG IO -----------------------------------------------
+
+    def _on_export_per_cell_pngs(self) -> None:
+        """Write each cell to its own PNG, all sized to the union bbox.
+
+        File naming: ``<base>_cell_<K>.png``. Embeds ``btchr_mode=per_cell``
+        and ``btchr_cell=<K>`` so import can validate the set. Uniform
+        size across cells means files can be swapped between digimon
+        without manual cropping, and matches the engine invariant that
+        all 5 cells share one slot.
+        """
+        if self._current_decoded is None or self._current_group is None:
+            return
+        d = self._current_decoded
+        layout = self._cell_layout()
+        if layout is None:
+            QMessageBox.critical(
+                self, "Export failed",
+                "Current digimon has no cells — nothing to export.",
+            )
+            return
+        n_cells = len(d.ncer.cells)
+        suggested = f"btchr_chr_0x{self._current_group:04x}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export per-cell PNGs (pick base name)",
+            suggested, "PNG (*.png)",
+        )
+        if not path:
+            return
+        # Normalise the base: strip the user-typed .png, and also any
+        # existing ``_cell_N`` suffix so re-exporting on top of a previous
+        # set doesn't produce ``foo_cell_0_cell_0.png``.
+        base = path[:-4] if path.lower().endswith(".png") else path
+        m = re.match(r"^(.*)_cell_\d+$", base)
+        if m:
+            base = m.group(1)
+        for ci in range(n_cells):
+            img = self._render_one_cell_qimage(ci)
+            if img is None:
+                QMessageBox.critical(
+                    self, "Export failed",
+                    f"Could not render cell {ci}.",
+                )
+                return
+            img.setText("btchr_mode", "per_cell")
+            img.setText("btchr_cell", str(ci))
+            img.setText("btchr_n_cells", str(n_cells))
+            out_path = f"{base}_cell_{ci}.png"
+            if not img.save(out_path, "PNG"):
+                QMessageBox.critical(
+                    self, "Export failed",
+                    f"Could not write {out_path}.",
+                )
+                return
+
+    def _on_import_per_cell_pngs(self) -> None:
+        """Read 5 per-cell PNGs and rebuild the tile bank from them.
+
+        User picks any one ``<base>_cell_<K>.png`` file; siblings for the
+        other cells are located by stripping the suffix and re-applying
+        each index. Each cell's pixels are decoded straight into its
+        OAMs' tile ranges (same inverse render path as the composite
+        cells importer). Format and dimensions must match across the
+        set — mixed Indexed8/RGB or off-size cells would require either
+        per-cell palettes (impossible: one NCLR covers all 5) or
+        ambiguous slot layouts.
+        """
+        if self._current_decoded is None or self._current_group is None:
+            return
+        d = self._current_decoded
+        layout = self._cell_layout()
+        if layout is None:
+            QMessageBox.critical(
+                self, "Import failed",
+                "Current digimon has no cells — nothing to import.",
+            )
+            return
+        rects, max_w, max_h = layout
+        n_cells = len(d.ncer.cells)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import per-cell PNGs (pick any cell)",
+            "", "PNG (*.png)",
+        )
+        if not path:
+            return
+        m = re.match(r"^(.*)_cell_(\d+)\.png$", path, re.IGNORECASE)
+        if not m:
+            QMessageBox.critical(
+                self, "Bad filename",
+                "Per-cell PNGs must follow the pattern "
+                "'<name>_cell_<N>.png'.\n"
+                f"Got: {os.path.basename(path)}",
+            )
+            return
+        base = m.group(1)
+        pngs: List[QImage] = []
+        for ci in range(n_cells):
+            sibling = f"{base}_cell_{ci}.png"
+            if not os.path.exists(sibling):
+                QMessageBox.critical(
+                    self, "Missing cell PNG",
+                    f"Expected file not found:\n{sibling}",
+                )
+                return
+            cell_img = QImage(sibling)
+            if cell_img.isNull():
+                QMessageBox.critical(
+                    self, "Import failed",
+                    f"Could not read {sibling}.",
+                )
+                return
+            if cell_img.width() != max_w or cell_img.height() != max_h:
+                QMessageBox.critical(
+                    self, "Bad image size",
+                    f"{os.path.basename(sibling)} is "
+                    f"{cell_img.width()}×{cell_img.height()}; expected "
+                    f"{max_w}×{max_h}.",
+                )
+                return
+            pngs.append(cell_img)
+
+        # Format consistency: all 5 cells must agree, because the NCLR is
+        # a single 256-entry table shared by every cell. Indexed PNGs
+        # with diverging palettes would silently produce wrong colours
+        # for cells 1–4 if we used cell 0's table; refusing forces the
+        # user to flatten externally.
+        use_indexed = pngs[0].format() == QImage.Format_Indexed8
+        for ci, p in enumerate(pngs):
+            if (p.format() == QImage.Format_Indexed8) != use_indexed:
+                QMessageBox.critical(
+                    self, "Mixed PNG formats",
+                    f"Cell {ci} PNG format differs from cell 0. Convert "
+                    "all cells to the same format before importing.",
+                )
+                return
+        if not use_indexed:
+            pngs = [p.convertToFormat(QImage.Format_RGBA8888) for p in pngs]
+
+        # Palette source — same checkbox semantics as the composite path,
+        # but the RGB case median-cuts across all 5 cells composited
+        # side-by-side so a colour that only appears in cell 3 still
+        # makes it into the palette.
+        checkbox_on = self._import_pal_with_sheet_cb.isChecked()
+        pal_from_plte = (
+            use_indexed and checkbox_on and len(pngs[0].colorTable()) >= 2
+        )
+        pal_from_quant = (not use_indexed) and checkbox_on
+        rebuild_palette = pal_from_plte or pal_from_quant
+        if rebuild_palette:
+            if pal_from_plte:
+                built = build_palette_from_png(pngs[0], total_slots=256)
+            else:
+                strip = QImage(
+                    max_w * n_cells, max_h, QImage.Format_RGBA8888,
+                )
+                strip.fill(0)
+                painter = QPainter(strip)
+                for ci, p in enumerate(pngs):
+                    painter.drawImage(ci * max_w, 0, p)
+                painter.end()
+                built = build_palette_from_png(strip, total_slots=256)
+            if built is None:
+                QMessageBox.critical(
+                    self, "PNG is fully transparent",
+                    "Cannot rebuild a palette from PNGs with no opaque "
+                    "pixels.",
+                )
+                return
+            new_palette: List[Tuple[int, int, int]] = list(built)
+        else:
+            new_palette = list(d.palette)
+
+        new_tiles = bytearray(d.tile_bytes)
+        n_tiles = d.n_tiles
+        tile_mult = d.ncer.boundary_bytes // btchr.BYTES_PER_TILE_8BPP
+
+        for ci, cell in enumerate(d.ncer.cells):
+            src_img = pngs[ci]
+            xmin, ymin, _, _ = rects[ci]
+            for o in cell.oams:
+                first_tile = o.tile * tile_mult
+                ox = o.x - xmin
+                oy = o.y - ymin
+                ntw = o.w // 8
+                nth = o.h // 8
+                for ty in range(nth):
+                    for tx in range(ntw):
+                        tile_idx = first_tile + ty * ntw + tx
+                        if tile_idx >= n_tiles:
+                            continue
+                        tile_off = tile_idx * btchr.BYTES_PER_TILE_8BPP
+                        for r in range(8):
+                            sr = (7 - r) if o.vflip else r
+                            dst_y = oy + ty * 8 + r
+                            if not (0 <= dst_y < src_img.height()):
+                                continue
+                            for c in range(8):
+                                sc = (7 - c) if o.hflip else c
+                                dst_x = ox + tx * 8 + c
+                                if not (0 <= dst_x < src_img.width()):
+                                    continue
+                                if use_indexed:
+                                    idx = src_img.pixelIndex(dst_x, dst_y)
+                                else:
+                                    color = src_img.pixelColor(dst_x, dst_y)
+                                    if color.alpha() < 128:
+                                        idx = 0
+                                    else:
+                                        idx = nearest_idx_opaque(
+                                            color.red(), color.green(),
+                                            color.blue(), new_palette,
+                                        )
+                                new_tiles[tile_off + sr * 8 + sc] = idx & 0xFF
+
+        group = self._current_group
+        orig_ncgr_raw = sprite.decompress_rle30(
+            self._pak.entries[self._ncgr_entry_idx(group)]
+        )
+        new_ncgr = sprite.build_ncgr_from_template(
+            bytes(new_tiles), orig_ncgr_raw,
+        )
+        compressed = sprite.compress_rle30(new_ncgr)
+        replacements = [(BTCHR_PAK, self._ncgr_entry_idx(group), compressed)]
+
+        if rebuild_palette:
+            nclr_raw = sprite.decompress_rle30(
+                self._pak.entries[self._nclr_entry_idx(group)]
+            )
+            new_nclr = sprite.build_nclr_from_template(
+                nclr_raw, {0: new_palette},
+            )
+            replacements.append((
+                BTCHR_PAK,
+                self._nclr_entry_idx(group),
+                sprite.compress_rle30(new_nclr),
+            ))
+            desc = f"Import BTCHR per-cell + palette 0x{group:04x}"
+        else:
+            desc = f"Import BTCHR per-cell 0x{group:04x}"
 
         cmd = ReplaceSpriteCommand(
             self._session,
@@ -1169,7 +1794,7 @@ class BtchrBrowser(QWidget):
         if self._current_decoded is None or self._current_group is None:
             return
         palette = self._current_decoded.palette
-        suggested = f"btchr_pal_{self._current_group:04d}.png"
+        suggested = f"btchr_pal_0x{self._current_group:04x}.png"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export palette PNG", suggested, "PNG (*.png)"
         )
@@ -1223,13 +1848,207 @@ class BtchrBrowser(QWidget):
         cmd = ReplaceSpriteCommand(
             self._session,
             [(BTCHR_PAK, self._nclr_entry_idx(group), compressed)],
-            description=f"Import BTCHR palette {group:04d}",
+            description=f"Import BTCHR palette 0x{group:04x}",
             on_change=self._refresh_after_pak_change,
         )
         if self._undo_stack is not None:
             self._undo_stack.push(cmd)
         else:
             cmd.redo()
+
+    # ---- .btchrspr (portable sprite kit) -------------------------------
+
+    def _on_export_btchrspr(self) -> None:
+        """Pack the current digimon's full sprite kit into a .btchrspr file.
+
+        Reads the live PAK entries + the session's current
+        ``chrsize.bin`` / ``btchrsize.bin`` slots (so an export after an
+        in-editor port carries the ported state, not vanilla). ``source_*``
+        fields are informational — import preserves the destination's id.
+        """
+        if self._current_decoded is None or self._current_group is None:
+            return
+        group = self._current_group
+        digimon_id_label = (
+            self._chrsize_rows[group][0]
+            if group < len(self._chrsize_rows) else group
+        )
+        suggested = f"btchr_0x{group:04x}_id0x{digimon_id_label:04x}.btchrspr"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export .btchrspr", suggested, ".btchrspr (*.btchrspr)"
+        )
+        if not path:
+            return
+        chrsize_word = self._session.current_chrsize_word(group)
+        source_id = chrsize_word & 0xFFFF
+        source_tpf = (chrsize_word >> 16) & 0xFFFF
+        btchrsize_value = self._session.current_btchrsize_value(group)
+        try:
+            payload = btchrspr.serialize(
+                self._pak, group,
+                source_digimon_id=source_id,
+                source_tpf=source_tpf,
+                btchrsize_value=btchrsize_value,
+            )
+        except (ValueError, IndexError) as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        try:
+            with open(path, "wb") as fh:
+                fh.write(payload)
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Export failed", f"Could not write {path}: {exc}"
+            )
+
+    def _on_import_btchrspr(self) -> None:
+        """Replay a .btchrspr onto the selected group.
+
+        The destination's secondary digimon id (chrsize.lo) is preserved;
+        only the tpf and btchrsize follow the imported sprite. Sprites
+        that exceed the non-boss tile budget (>2160 NCGR tiles) get a
+        confirmation prompt — they render fine in 1-up screens like the
+        gallery but tend to vanish in multi-sprite screens (starter pack,
+        battles vs two enemies). Project memory ``project_btchr_format``
+        / probe ``_probe_btchr_port`` explain the budget.
+        """
+        if self._current_group is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import .btchrspr", "", ".btchrspr (*.btchrspr)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Import failed", f"Could not read {path}: {exc}"
+            )
+            return
+        try:
+            spr = btchrspr.parse(raw)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Import failed", str(exc))
+            return
+        try:
+            tile_count = spr.ncgr_tile_count
+        except (ValueError, struct.error) as exc:
+            QMessageBox.critical(
+                self, "Import failed", f"Could not inspect NCGR: {exc}"
+            )
+            return
+        if tile_count > btchrspr.TILE_COUNT_WARN_THRESHOLD:
+            reply = QMessageBox.warning(
+                self, "Large sprite",
+                f"This sprite uses {tile_count} NCGR tiles, above the "
+                f"{btchrspr.TILE_COUNT_WARN_THRESHOLD}-tile non-boss budget. "
+                "It will render in single-sprite screens (digimon gallery) "
+                "but may vanish or crash in multi-sprite screens (starter "
+                "pack, two-enemy battles).\n\nImport anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        group = self._current_group
+        cmd = PortBtchrSpriteCommand(
+            self._session,
+            group,
+            spr,
+            description=f"Import .btchrspr into BTCHR 0x{group:04x}",
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+        # chrsize.bin is also touched by the port; refresh the cached
+        # parse so the left-list label (``id=DDDD``) and other readers
+        # see the post-port tpf next time they re-read.
+        self._chrsize_rows = _load_chrsize_rows_live(self._session)
+
+    # ---- Add Entry / Duplicate sprite entry ----------------------------
+
+    def _on_add_entry(self) -> None:
+        """Append a new BTCHR group cloned from the current selection.
+
+        Same handler for both the toolbar "+ Add Entry" button (below the
+        list) and the panel "Duplicate sprite entry" button (under
+        Import btchrspr) — neither needs an extra picker step because
+        the source is always the currently-selected group. Confirms
+        first so the user can back out without an undo step on the stack.
+        """
+        if self._current_group is None:
+            return
+        source = self._current_group
+        new_group_idx = self._pak.count // btchr.GROUP_SIZE
+        chrsize_word = self._session.current_chrsize_word(source)
+        source_id = chrsize_word & 0xFFFF
+        name = self._name_for_group(source)
+        name_token = f" ({name})" if name else ""
+        confirm = QMessageBox.question(
+            self,
+            "Duplicate sprite entry?",
+            f"Append a new BTCHR group at index {new_group_idx} carrying "
+            f"a copy of group 0x{source:04x} (id=0x{source_id:02x}{name_token}) "
+            f"data?\n\nThe new group will need a sprite_map entry pointing "
+            f"at index {new_group_idx} before any enemy can use it.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        cmd = AppendBtchrGroupCommand(
+            self._session,
+            source,
+            description=f"Append BTCHR group 0x{new_group_idx:04x} from 0x{source:04x}",
+            on_change=self._refresh_after_group_appended,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+        self._list.select_index(cmd.new_group_index)
+
+    def _refresh_after_group_appended(self) -> None:
+        """Reconcile the browser's caches with the live BTCHR group count.
+
+        Called from AppendBtchrGroupCommand's redo/undo. Re-syncs the
+        local group count, the chrsize-rows cache (left-list label
+        source), and the list panel — appending a row on redo, dropping
+        it on undo. The sprite_to_base reverse lookup doesn't need to
+        change: no sprite_map entry points at the new group yet, so it
+        stays nameless in the list (``id=NNNN`` only).
+        """
+        live_groups = btchr.parse_pak_groups(self._pak)
+        if live_groups > self._n_groups:
+            for g in range(self._n_groups, live_groups):
+                self._labels.append(self._label_for_new_group(g))
+                self._list.append_record(g)
+            self._n_groups = live_groups
+        elif live_groups < self._n_groups:
+            for _ in range(self._n_groups - live_groups):
+                self._labels.pop()
+                self._list.pop_record()
+            self._n_groups = live_groups
+        # Re-decode the current selection if it survived; otherwise the
+        # selection model will land on whatever the list panel picks.
+        if self._current_group is not None and self._current_group < live_groups:
+            self._refresh_after_pak_change()
+
+    def _label_for_new_group(self, g: int) -> str:
+        """Label for a freshly-appended BTCHR group. Mirrors
+        ``_build_labels`` for one entry; reads the chrsize word from the
+        session's appended-sidecar list so the id token matches the
+        u32 the splice path will write."""
+        appended_idx = g - self._session.vanilla_btchr_group_count()
+        if 0 <= appended_idx < len(self._session._btchr_appended_chrsize):
+            digimon_id = self._session._btchr_appended_chrsize[appended_idx] & 0xFFFF
+        else:
+            digimon_id = -1
+        return _format_btchr_label(g, digimon_id, self._name_for_group(g))
 
     # ---- transparent-color picker --------------------------------------
 
@@ -1335,13 +2154,368 @@ class BtchrBrowser(QWidget):
         cmd = ReplaceSpriteCommand(
             self._session,
             replacements,
-            description=f"Set transparent color for BTCHR {group:04d}",
+            description=f"Set transparent color for BTCHR 0x{group:04x}",
             on_change=self._refresh_after_pak_change,
         )
         if self._undo_stack is not None:
             self._undo_stack.push(cmd)
         else:
             cmd.redo()
+
+    # ---- animation playback / step editing -----------------------------
+
+    def _current_track(self) -> List[btchr.AnimStep]:
+        """Return the AnimStep list for the active track on the live
+        digimon (empty list if no decode)."""
+        if self._current_decoded is None:
+            return []
+        h = self._current_decoded.header
+        return {
+            "idle": h.idle, "attack": h.attack, "defend": h.defend,
+        }.get(self._anim_track_key, [])
+
+    def _refresh_anim_table(self) -> None:
+        """Repopulate the steps table from the live track.
+
+        Track A's first row is the implicit cell-0 step — its cell
+        cell is shown but disabled (the engine reads cell 0 here
+        regardless of what the bytes say). Both columns are otherwise
+        editable u16s; the upper bound on Cell is clipped to
+        n_cells - 1 in :meth:`_on_anim_step_edited` so the engine
+        doesn't read past the bank.
+        """
+        self._anim_table_loading = True
+        try:
+            steps = self._current_track()
+            self._anim_table.setRowCount(len(steps))
+            is_idle = self._anim_track_key == "idle"
+            for r, step in enumerate(steps):
+                cell_item = QTableWidgetItem(str(step.cell))
+                dur_item = QTableWidgetItem(str(step.duration))
+                if is_idle and r == 0:
+                    # Idle[0]'s cell is implicit 0 — engine ignores the
+                    # stored value, so we disable editing instead of
+                    # silently dropping the user's edits.
+                    cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
+                    cell_item.setToolTip(
+                        "First Idle step is implicit cell 0 — "
+                        "duration is editable, cell is not."
+                    )
+                self._anim_table.setItem(r, 0, cell_item)
+                self._anim_table.setItem(r, 1, dur_item)
+        finally:
+            self._anim_table_loading = False
+        self._recompute_anim_flat()
+
+    def _recompute_anim_flat(self) -> None:
+        """Expand the current track into per-tick cell sequence. Resets
+        ``_anim_pos`` if it now points past the new track length so
+        playback keeps a valid index after duration shrinks."""
+        steps = self._current_track()
+        self._anim_flat = btchr.flatten_anim_track(steps)
+        if not self._anim_flat:
+            self._anim_pos = 0
+            return
+        if self._anim_pos >= len(self._anim_flat):
+            self._anim_pos = 0
+
+    def _on_anim_track_changed(self, _idx: int) -> None:
+        self._anim_track_key = self._anim_track_combo.currentData() or "idle"
+        # Restart playback at frame 0 of the new track so the user
+        # sees the new sequence from its start.
+        self._anim_pos = 0
+        self._refresh_anim_table()
+        if self._anim_timer.isActive() and self._anim_flat:
+            cell_idx, _ = self._anim_flat[0]
+            self._current_cell = cell_idx
+            self._refresh_preview()
+
+    def _on_anim_fps_changed(self, fps: int) -> None:
+        self._anim_fps = fps
+        self._anim_timer.setInterval(max(1, 1000 // fps))
+
+    def _on_anim_play_toggled(self, checked: bool) -> None:
+        if checked:
+            if not self._anim_flat:
+                self._recompute_anim_flat()
+            if not self._anim_flat or self._current_decoded is None:
+                self._anim_play_btn.setChecked(False)
+                return
+            self._anim_play_btn.setText("■ Stop")
+            self._cell_spin.setEnabled(False)
+            self._show_all_cells.setEnabled(False)
+            self._anim_pos = 0
+            cell_idx, _ = self._anim_flat[0]
+            self._current_cell = cell_idx
+            self._refresh_preview()
+            self._anim_timer.start()
+        else:
+            self._stop_anim_playback()
+
+    def _stop_anim_playback(self) -> None:
+        """Halt the timer and restore manual cell-selection state."""
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+        self._anim_play_btn.blockSignals(True)
+        self._anim_play_btn.setChecked(False)
+        self._anim_play_btn.setText("▶ Play")
+        self._anim_play_btn.blockSignals(False)
+        self._cell_spin.setEnabled(not self._show_all_cells.isChecked())
+        self._show_all_cells.setEnabled(True)
+
+    def _on_anim_tick(self) -> None:
+        if not self._anim_flat or self._current_decoded is None:
+            return
+        self._anim_pos = (self._anim_pos + 1) % len(self._anim_flat)
+        cell_idx, _ = self._anim_flat[self._anim_pos]
+        n_cells = len(self._current_decoded.ncer.cells)
+        if not (0 <= cell_idx < n_cells):
+            return
+        self._current_cell = cell_idx
+        # Drive the spinner too so it reflects the playing position
+        # without re-firing _on_cell_changed (signals blocked).
+        self._cell_spin.blockSignals(True)
+        self._cell_spin.setValue(cell_idx)
+        self._cell_spin.blockSignals(False)
+        self._refresh_preview()
+
+    def _on_anim_step_edited(self, item: QTableWidgetItem) -> None:
+        """Validate the edit, rebuild the mini-header, and push it as a
+        sprite replace command. Invalid input (non-int / out of range)
+        is reverted in-place from the live model so the table can never
+        carry stale state."""
+        if self._anim_table_loading:
+            return
+        if self._current_decoded is None or self._current_group is None:
+            return
+        row = item.row()
+        col = item.column()
+        steps = self._current_track()
+        if not (0 <= row < len(steps)):
+            return
+        try:
+            value = int(item.text())
+        except ValueError:
+            # Reload the canonical value from the model — silent revert
+            # rather than dialog spam while the user is typing.
+            self._refresh_anim_table()
+            return
+        if value < 0:
+            self._refresh_anim_table()
+            return
+        n_cells = len(self._current_decoded.ncer.cells)
+        if col == 0:
+            # Cell index. Cap to n_cells-1; idle[0] should never reach
+            # here because we disabled the item, but guard anyway.
+            if self._anim_track_key == "idle" and row == 0:
+                return
+            if value >= n_cells:
+                value = n_cells - 1
+            if value == steps[row].cell:
+                return
+            new_step = btchr.AnimStep(cell=value, duration=steps[row].duration)
+        else:
+            # Duration. Clamp to u16 range.
+            if value > 0xFFFF:
+                value = 0xFFFF
+            if value == steps[row].duration:
+                return
+            new_step = btchr.AnimStep(cell=steps[row].cell, duration=value)
+        new_header = self._build_header_with_step_edit(row, new_step)
+        self._push_header_replacement(
+            new_header,
+            description=(
+                f"Edit BTCHR 0x{self._current_group:04x} "
+                f"{self._anim_track_key}[{row}]"
+            ),
+        )
+
+    def _build_header_with_step_edit(
+        self, row: int, new_step: btchr.AnimStep,
+    ) -> btchr.MiniHeader:
+        """Clone the live mini-header with ``row`` of the active track
+        replaced by ``new_step``. Other tracks pass through unchanged."""
+        h = self._current_decoded.header
+        tracks = {
+            "idle": list(h.idle),
+            "attack": list(h.attack),
+            "defend": list(h.defend),
+        }
+        tracks[self._anim_track_key][row] = new_step
+        return btchr.MiniHeader(
+            footprint_scale=h.footprint_scale,
+            flag=h.flag,
+            pad_04=h.pad_04,
+            y_pivot_a=h.y_pivot_a,
+            x_pivot=h.x_pivot,
+            y_pivot_b=h.y_pivot_b,
+            pad_0c=h.pad_0c,
+            idle=tracks["idle"],
+            attack=tracks["attack"],
+            defend=tracks["defend"],
+            raw_size=h.raw_size,
+        )
+
+    def _push_header_replacement(
+        self, new_header: btchr.MiniHeader, description: str,
+    ) -> None:
+        """Re-encode entry-0 from ``new_header`` and push as a
+        ReplaceSpriteCommand. ``_refresh_after_pak_change`` redecodes
+        and repopulates the table so undo/redo land cleanly."""
+        group = self._current_group
+        try:
+            raw = btchr.serialize_mini_header(new_header)
+        except (ValueError, struct.error) as exc:
+            QMessageBox.critical(self, "Build failed", f"mini-header: {exc}")
+            self._refresh_anim_table()
+            return
+        compressed = sprite.compress_rle30(raw)
+        base = group * btchr.GROUP_SIZE
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(BTCHR_PAK, base, compressed)],
+            description=description,
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+
+    def _load_header_spinboxes(self, h: btchr.MiniHeader) -> None:
+        """Programmatic refresh of the 4 editable header spinboxes. The
+        loading guard prevents the valueChanged signals from re-firing
+        _on_header_field_changed → re-encode loop during selection or
+        post-undo refresh."""
+        self._hdr_loading = True
+        try:
+            self._hdr_scale_spin.setValue(h.footprint_scale)
+            self._hdr_y_pivot_a_spin.setValue(h.y_pivot_a)
+            self._hdr_x_pivot_spin.setValue(h.x_pivot)
+            self._hdr_y_pivot_b_spin.setValue(h.y_pivot_b)
+        finally:
+            self._hdr_loading = False
+
+    def _on_header_field_changed(self, attr: str, value: int) -> None:
+        """One handler for all four header spinboxes — clones the live
+        MiniHeader with ``attr`` swapped and pushes a replacement.
+        Skipped when the spinbox value matches the live header (e.g.
+        loading guard let one through, or undo restored the same value)."""
+        if self._hdr_loading:
+            return
+        if self._current_decoded is None or self._current_group is None:
+            return
+        h = self._current_decoded.header
+        if getattr(h, attr) == value:
+            return
+        new_header = btchr.MiniHeader(
+            footprint_scale=h.footprint_scale,
+            flag=h.flag,
+            pad_04=h.pad_04,
+            y_pivot_a=h.y_pivot_a,
+            x_pivot=h.x_pivot,
+            y_pivot_b=h.y_pivot_b,
+            pad_0c=h.pad_0c,
+            idle=list(h.idle),
+            attack=list(h.attack),
+            defend=list(h.defend),
+            raw_size=h.raw_size,
+        )
+        setattr(new_header, attr, value)
+        self._push_header_replacement(
+            new_header,
+            description=f"Edit BTCHR 0x{self._current_group:04x} {attr}",
+        )
+
+    def _build_header_with_track(
+        self, new_track: List[btchr.AnimStep],
+    ) -> btchr.MiniHeader:
+        """Clone the live mini-header with the active track replaced
+        wholesale by ``new_track``. Used by add/remove which change the
+        track's length, unlike _build_header_with_step_edit which only
+        substitutes one step in place."""
+        h = self._current_decoded.header
+        tracks = {
+            "idle": list(h.idle),
+            "attack": list(h.attack),
+            "defend": list(h.defend),
+        }
+        tracks[self._anim_track_key] = list(new_track)
+        return btchr.MiniHeader(
+            footprint_scale=h.footprint_scale,
+            flag=h.flag,
+            pad_04=h.pad_04,
+            y_pivot_a=h.y_pivot_a,
+            x_pivot=h.x_pivot,
+            y_pivot_b=h.y_pivot_b,
+            pad_0c=h.pad_0c,
+            idle=tracks["idle"],
+            attack=tracks["attack"],
+            defend=tracks["defend"],
+            raw_size=h.raw_size,
+        )
+
+    def _on_anim_add_step(self) -> None:
+        """Append a step to the active track. New step defaults to
+        (cell=last step's cell, duration=8) — copying the last cell
+        keeps the sequence visually continuous so the user sees the
+        new step land at the end without flicker."""
+        if self._current_decoded is None or self._current_group is None:
+            return
+        steps = list(self._current_track())
+        last_cell = steps[-1].cell if steps else 0
+        new_track = steps + [btchr.AnimStep(cell=last_cell, duration=8)]
+        new_header = self._build_header_with_track(new_track)
+        self._push_header_replacement(
+            new_header,
+            description=(
+                f"Add BTCHR 0x{self._current_group:04x} "
+                f"{self._anim_track_key} step"
+            ),
+        )
+
+    def _on_anim_remove_step(self) -> None:
+        """Remove the selected step from the active track. Refuses to
+        remove Idle[0] (engine anchor) or to shrink a track to zero
+        steps (parser invariant: every track has ≥1 step)."""
+        if self._current_decoded is None or self._current_group is None:
+            return
+        row = self._anim_table.currentRow()
+        if row < 0:
+            return
+        steps = list(self._current_track())
+        if not (0 <= row < len(steps)):
+            return
+        if self._anim_track_key == "idle" and row == 0:
+            return
+        if len(steps) <= 1:
+            return
+        new_track = steps[:row] + steps[row + 1:]
+        new_header = self._build_header_with_track(new_track)
+        self._push_header_replacement(
+            new_header,
+            description=(
+                f"Remove BTCHR 0x{self._current_group:04x} "
+                f"{self._anim_track_key}[{row}]"
+            ),
+        )
+
+    def _update_anim_remove_enabled(self) -> None:
+        """Remove is enabled only when the selected row is removable:
+        a row is selected, it isn't Idle[0], and the track wouldn't
+        drop below one step."""
+        row = self._anim_table.currentRow()
+        if row < 0:
+            self._anim_remove_btn.setEnabled(False)
+            return
+        steps = self._current_track()
+        if len(steps) <= 1:
+            self._anim_remove_btn.setEnabled(False)
+            return
+        if self._anim_track_key == "idle" and row == 0:
+            self._anim_remove_btn.setEnabled(False)
+            return
+        self._anim_remove_btn.setEnabled(True)
 
     def _refresh_after_pak_change(self) -> None:
         """Re-decode current digimon + invalidate pixmap cache after a
@@ -1370,6 +2544,14 @@ class BtchrBrowser(QWidget):
             self._refresh_sheet_preview()
             self._sheet_dirty = False
         self._picker.set_current_color(self._current_decoded.palette[0])
+        # Header may have just been rewritten by an animation edit;
+        # repopulate the table + flattened track from the fresh decode.
+        h = self._current_decoded.header
+        self._load_header_spinboxes(h)
+        self._meta_idle.setText(_format_track(h.idle))
+        self._meta_attack.setText(_format_track(h.attack))
+        self._meta_defend.setText(_format_track(h.defend))
+        self._refresh_anim_table()
 
     def _build_all_cells_strip(self) -> Optional[QPixmap]:
         d = self._current_decoded

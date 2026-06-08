@@ -651,6 +651,14 @@ class MainWindow(QMainWindow):
             # sprite doesn't fat-shift every later file into the byte diff.
             # Replay them so the next save splices them back in.
             session.apply_sprite_pak_edits(project["sprite_edits"])
+            # Sidecar u32s for any BTCHR groups appended past vanilla 415.
+            # Replayed AFTER apply_sprite_pak_edits — the 5 PAK appends per
+            # group already rode the sprite_edits channel, so the appended
+            # group count is now correct; this only catches up the chrsize/
+            # btchrsize twins.
+            session.apply_btchr_appended_sidecars(
+                project.get("btchr_appended_sidecars", [])
+            )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Failed to load project", str(exc))
             return
@@ -696,6 +704,7 @@ class MainWindow(QMainWindow):
                 qol=self.session.qol,
                 string_edits=self.session.msgpak_string_edits(),
                 sprite_edits=self.session.sprite_pak_edits(),
+                btchr_appended_sidecars=self.session.btchr_appended_sidecars(),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Failed to save project", str(exc))
@@ -959,13 +968,20 @@ class MainWindow(QMainWindow):
         if self.session is None:
             return None
         if key == "base_digimon":
-            return BaseDigimonEditor(self.session.base_digimon, self.undo_stack)
+            return BaseDigimonEditor(
+                self.session.base_digimon,
+                self.undo_stack,
+                self.session.sprite_map,
+                self.session.battle_strings,
+                self.session,
+            )
         if key == "enemy_digimon":
             return EnemyDigimonEditor(
                 self.session.enemy_digimon,
                 self.undo_stack,
                 self.session.sprite_map,
                 self.session.battle_strings,
+                self.session,
             )
         if key == "moves":
             return MoveEditor(self.session.moves, self.undo_stack)

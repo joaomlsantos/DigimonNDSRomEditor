@@ -13,8 +13,6 @@ from typing import Dict, List, Tuple
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
-    QComboBox,
-    QCompleter,
     QHBoxLayout,
     QLabel,
     QSplitter,
@@ -24,7 +22,6 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
-from ..commands import ReskinFixedEnemyCommand
 from .digimon_list_panel import DigimonListPanel
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
@@ -32,21 +29,14 @@ from .form_helpers import (
     BoundIdCombo,
     BoundIdComboRow,
     BoundSpinBox,
-    NoWheelComboBox,
     _make_compact_grid,
     add_unknown_grid_field,
     make_form,
     move_choices,
-    silenced,
     trait_choices,
     wrap_in_scroll,
 )
-
-
-# Enemy ids ≤ 0x1f4 mirror the base digimon table (wild encounters). Anything
-# above that is a fixed encounter — boss, tamer-team member, etc. Only those
-# get the "Displayed As" reskin control.
-FIXED_ENEMY_MIN_ID = 0x1F5
+from .sprite_map_row import SpriteMapRow, displayed_as_suffix
 
 
 # Enemy stats often legitimately exceed the engine caps that the base
@@ -123,166 +113,6 @@ _MISC_FIELDS: List[Tuple[str, str, int, bool]] = [
 
 
 
-class _ReskinRow:
-    """Combo for picking a fixed enemy's displayed sprite/name.
-
-    The combo lists every entry in the sprite-map table (named or not —
-    unnamed slots show "<unnamed 0xNN>" so they can still be picked).
-    Labels in DIGIMON_ID_TO_STR aren't perfectly trustworthy, so we don't
-    filter by them; the source of truth is the sprite-map table itself.
-
-    Picking one pushes a `ReskinFixedEnemyCommand` that copies main_sprite,
-    upperscreen_sprites, and the battle-string value from the picked slot
-    into the current enemy's slots in one atomic undo step.
-
-    The combo is disabled when the enemy id is below the fixed-enemy
-    threshold (0x1f5) — wild encounters share their sprite with the base
-    digimon they mirror, so reskinning them makes no sense — or when no
-    sprite-map / battle-string slot exists for that enemy id.
-    """
-
-    def __init__(
-        self,
-        sprite_map: List[model.SpriteMapEntry],
-        battle_strings: List[model.BattleStringEntry],
-        undo_stack: QUndoStack,
-    ):
-        self._sprite_map = sprite_map
-        self._battle_strings = battle_strings
-        self._undo_stack = undo_stack
-        self._target_enemy_id: int = -1
-
-        # Reverse lookup: main_sprite value -> first slot index that uses it.
-        # Pickable list covers every sprite-map slot.
-        self._sprite_to_base: Dict[int, int] = {}
-        self._pickable: List[Tuple[int, str]] = []
-        for base_id in range(len(sprite_map)):
-            name = constants.DIGIMON_ID_TO_STR.get(base_id, f"<unnamed 0x{base_id:03x}>")
-            self._pickable.append((base_id, name))
-            self._sprite_to_base.setdefault(sprite_map[base_id].main_sprite, base_id)
-
-        self.group = QGroupBox("Display / Reskin (fixed enemies)")
-        form = make_form(self.group)
-
-        self._combo = NoWheelComboBox()
-        self._combo.setMaximumWidth(280)
-        # Editable + NoInsert + substring completer mirrors BoundIdCombo: user
-        # can type any name fragment to filter, free-typed text never inserts.
-        self._combo.setEditable(True)
-        self._combo.setInsertPolicy(QComboBox.NoInsert)
-        completer = QCompleter(self._combo)
-        completer.setCaseSensitivity(Qt.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchContains)
-        completer.setCompletionMode(QCompleter.PopupCompletion)
-        self._combo.setCompleter(completer)
-        for base_id, name in self._pickable:
-            self._combo.addItem(f"0x{base_id:03x}  {name}", userData=base_id)
-        completer.setModel(self._combo.model())
-        self._combo.currentIndexChanged.connect(self._on_changed)
-        line_edit = self._combo.lineEdit()
-        if line_edit is not None:
-            line_edit.editingFinished.connect(self._snap_text_to_selection)
-
-        self._status = QLabel("")
-        self._status.setStyleSheet("color: palette(mid);")
-        self._status.setWordWrap(True)
-
-        form.addRow("Appears as", self._combo)
-        form.addRow(self._status)
-
-    @property
-    def widget(self) -> QWidget:
-        return self.group
-
-    def rebind(self, target: model.EnemyDataDigimon) -> None:
-        self._target_enemy_id = target.id
-        self._apply_state()
-
-    def refresh(self) -> None:
-        if self._target_enemy_id < 0:
-            return
-        self._apply_state()
-
-    def _apply_state(self) -> None:
-        enemy_id = self._target_enemy_id
-
-        if enemy_id < FIXED_ENEMY_MIN_ID:
-            self.group.setVisible(False)
-            return
-        self.group.setVisible(True)
-
-        if enemy_id >= len(self._sprite_map) or enemy_id >= len(self._battle_strings):
-            self._combo.setEnabled(False)
-            self._status.setText("(no sprite-map / battle-string slot for this enemy id)")
-            with silenced(self._combo):
-                self._combo.setCurrentIndex(-1)
-            return
-
-        self._combo.setEnabled(True)
-        current_sprite = self._sprite_map[enemy_id].main_sprite
-        current_base = self._sprite_to_base.get(current_sprite)
-
-        if current_base is None:
-            self._status.setText(
-                f"(sprite 0x{current_sprite:x} not present in the sprite-map table)"
-            )
-            with silenced(self._combo):
-                self._combo.setCurrentIndex(-1)
-            return
-
-        self._status.setText("")
-        for i in range(self._combo.count()):
-            if self._combo.itemData(i) == current_base:
-                with silenced(self._combo):
-                    self._combo.setCurrentIndex(i)
-                break
-
-    def _snap_text_to_selection(self) -> None:
-        """Revert free-typed text to the current item's label on focus-out."""
-        line_edit = self._combo.lineEdit()
-        if line_edit is None:
-            return
-        ix = self._combo.currentIndex()
-        if ix < 0:
-            return
-        expected = self._combo.itemText(ix)
-        if line_edit.text() != expected:
-            with silenced(self._combo):
-                line_edit.setText(expected)
-
-    def _on_changed(self, _index: int) -> None:
-        enemy_id = self._target_enemy_id
-        if enemy_id < FIXED_ENEMY_MIN_ID:
-            return
-        if enemy_id >= len(self._sprite_map) or enemy_id >= len(self._battle_strings):
-            return
-        new_base_id = self._combo.currentData(Qt.UserRole)
-        if new_base_id is None:
-            return
-        if new_base_id >= len(self._sprite_map) or new_base_id >= len(self._battle_strings):
-            return
-
-        sprite_entry = self._sprite_map[enemy_id]
-        str_entry = self._battle_strings[enemy_id]
-        source_sprite = self._sprite_map[new_base_id]
-        source_str = self._battle_strings[new_base_id]
-
-        if (sprite_entry.main_sprite == source_sprite.main_sprite
-                and sprite_entry.upperscreen_sprites == source_sprite.upperscreen_sprites
-                and str_entry.value == source_str.value):
-            return
-
-        self._undo_stack.push(
-            ReskinFixedEnemyCommand(
-                sprite_entry,
-                str_entry,
-                source_sprite.main_sprite,
-                source_sprite.upperscreen_sprites,
-                source_str.value,
-            )
-        )
-
-
 class EnemyDigimonEditor(QWidget):
     def __init__(
         self,
@@ -290,6 +120,7 @@ class EnemyDigimonEditor(QWidget):
         undo_stack: QUndoStack,
         sprite_map: List[model.SpriteMapEntry],
         battle_strings: List[model.BattleStringEntry],
+        session,
         parent=None,
     ):
         super().__init__(parent)
@@ -297,6 +128,7 @@ class EnemyDigimonEditor(QWidget):
         self._undo_stack = undo_stack
         self._sprite_map = sprite_map
         self._battle_strings = battle_strings
+        self._session = session
         self._current_id: int = -1
 
         self._list_panel = DigimonListPanel(
@@ -304,7 +136,7 @@ class EnemyDigimonEditor(QWidget):
         )
         self._list_panel.digimonSelected.connect(self._on_selection)
 
-        # _build_detail_container() creates _reskin_row, which the label
+        # _build_detail_container() creates _sprite_row, which the label
         # callback depends on for the reverse sprite-to-base lookup. The list
         # was built before that existed, so re-render every row now.
         self._detail = self._build_detail_container()
@@ -349,7 +181,9 @@ class EnemyDigimonEditor(QWidget):
         identity_form.addRow("ID", self._id_spin)
         identity_form.addRow("Species", self._species_combo)
 
-        self._reskin_row = _ReskinRow(self._sprite_map, self._battle_strings, self._undo_stack)
+        self._sprite_row = SpriteMapRow(
+            self._sprite_map, self._battle_strings, self._undo_stack, self._session,
+        )
 
         self._stat_widgets: Dict[str, BoundSpinBox] = {}
         stats_box = QGroupBox("Stats")
@@ -456,7 +290,7 @@ class EnemyDigimonEditor(QWidget):
         content_layout.setSpacing(4)
         content_layout.addWidget(self._title)
         content_layout.addWidget(identity_box)
-        content_layout.addWidget(self._reskin_row.widget)
+        content_layout.addWidget(self._sprite_row.widget)
         content_layout.addWidget(stats_box)
         content_layout.addWidget(res_box)
         content_layout.addLayout(trait_move_row)
@@ -481,7 +315,7 @@ class EnemyDigimonEditor(QWidget):
 
         self._id_spin.rebind(target)
         self._species_combo.rebind(target)
-        self._reskin_row.rebind(target)
+        self._sprite_row.rebind(target)
         for spin in self._stat_widgets.values():
             spin.rebind(target)
         for spin in self._res_widgets.values():
@@ -505,7 +339,7 @@ class EnemyDigimonEditor(QWidget):
         self._title.setText(self._title_for(target))
         self._id_spin.refresh()
         self._species_combo.refresh()
-        self._reskin_row.refresh()
+        self._sprite_row.refresh()
         for spin in self._stat_widgets.values():
             spin.refresh()
         for spin in self._res_widgets.values():
@@ -532,23 +366,23 @@ class EnemyDigimonEditor(QWidget):
     def _list_label_for(self, digimon_id: int) -> str:
         """Decorate the left-pane label.
 
-        Wild-encounter ids (< 0x1F5) keep the default `0xNNN — Name` form.
-        Fixed-enemy ids show the in-game displayed sprite via the sprite-map
-        reverse-lookup and a `[reskin slot]` tag so it's clear the slot's
-        appearance is editable independently from the underlying enemy id.
+        Every id with a sprite-map slot picks up a ``[displayed-as]``
+        suffix derived from the slot's ``main_sprite`` via the reverse
+        sprite-map lookup — so the user can see at a glance which sprite
+        each entry actually renders as. For wild-encounter ids the
+        suffix usually matches the entry's own name; for reskinned
+        fixed enemies it diverges.
         """
-        own_name = constants.DIGIMON_ID_TO_STR.get(digimon_id, "<unknown>")
-        if digimon_id < FIXED_ENEMY_MIN_ID or digimon_id >= len(self._sprite_map):
-            return f"0x{digimon_id:03x} — {own_name}"
-        sprite_to_base = getattr(self, "_reskin_row", None) and self._reskin_row._sprite_to_base
-        if not sprite_to_base:
-            return f"0x{digimon_id:03x} — {own_name}  [reskin slot]"
-        sprite = self._sprite_map[digimon_id].main_sprite
-        base = sprite_to_base.get(sprite)
-        if base is None:
-            return f"0x{digimon_id:03x} — {own_name}  [???]"
-        display_name = constants.DIGIMON_ID_TO_STR.get(base, f"0x{base:03x}")
-        return f"0x{digimon_id:03x} — {own_name}  [{display_name}]"
+        own_name = self._session.digimon_display_name(digimon_id)
+        # _build_detail_container() creates _sprite_row, but the list panel
+        # asks for labels before that — guard against the bootstrap call.
+        sprite_row = getattr(self, "_sprite_row", None)
+        sprite_to_base = sprite_row.sprite_to_base if sprite_row else {}
+        suffix = displayed_as_suffix(
+            self._sprite_map, sprite_to_base, digimon_id, own_name,
+            name_resolver=self._session.digimon_display_name,
+        )
+        return f"0x{digimon_id:03x} — {own_name}{suffix}"
 
     def _refresh_list_label_for_current(self, _index: int = 0) -> None:
         if self._current_id < 0:
@@ -556,15 +390,9 @@ class EnemyDigimonEditor(QWidget):
         self._list_panel.refresh_label(self._current_id)
 
     def _title_for(self, target: model.EnemyDataDigimon) -> str:
-        name = constants.DIGIMON_ID_TO_STR.get(target.id, "<unknown>")
-        suffix = ""
-        if FIXED_ENEMY_MIN_ID <= target.id < len(self._sprite_map):
-            sprite_to_base = self._reskin_row._sprite_to_base
-            sprite = self._sprite_map[target.id].main_sprite
-            base = sprite_to_base.get(sprite)
-            if base is None:
-                suffix = "  [???]"
-            else:
-                display_name = constants.DIGIMON_ID_TO_STR.get(base, f"0x{base:03x}")
-                suffix = f"  [{display_name}]"
+        name = self._session.digimon_display_name(target.id)
+        suffix = displayed_as_suffix(
+            self._sprite_map, self._sprite_row.sprite_to_base, target.id, name,
+            name_resolver=self._session.digimon_display_name,
+        )
         return f"0x{target.id:03x}  —  {name}{suffix}    (offset 0x{target.offset:08x})"
