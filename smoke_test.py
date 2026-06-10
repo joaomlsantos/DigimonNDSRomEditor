@@ -203,7 +203,7 @@ def main() -> int:
 
     # ---- move editor -----------------------------------------------------
     undo_stack.clear()
-    move_editor = MoveEditor(session.moves, undo_stack)
+    move_editor = MoveEditor(session.moves, undo_stack, session)
     first_move = session.moves[0]
     orig_mp = first_move.mp_cost
     move_editor._mp_spin.setValue(orig_mp + 5)
@@ -247,7 +247,7 @@ def main() -> int:
 
     # ---- standard digivolution editor ------------------------------------
     undo_stack.clear()
-    sd_editor = StandardDigivolutionEditor(session.standard_digivolutions, undo_stack)
+    sd_editor = StandardDigivolutionEditor(session.standard_digivolutions, undo_stack, session)
     first_digimon_id = next(iter(sorted(session.standard_digivolutions.keys())))
     record = session.standard_digivolutions[first_digimon_id]
     orig_evo_1 = record.evolution_1_id
@@ -272,7 +272,7 @@ def main() -> int:
 
     # ---- armor digivolution editor ---------------------------------------
     undo_stack.clear()
-    armor_editor = ArmorDigivolutionEditor(session.armor_digivolutions, undo_stack)
+    armor_editor = ArmorDigivolutionEditor(session.armor_digivolutions, undo_stack, session)
     first_armor = session.armor_digivolutions[0]
     orig_cond_val = first_armor.condition_value_1
     armor_editor._cond_rows[0]._value_spin.setValue(orig_cond_val + 11)  # spin still bound directly
@@ -285,7 +285,7 @@ def main() -> int:
 
     # ---- DNA digivolution editor -----------------------------------------
     undo_stack.clear()
-    dna_editor = DNADigivolutionEditor(session.dna_digivolutions, undo_stack)
+    dna_editor = DNADigivolutionEditor(session.dna_digivolutions, undo_stack, session)
     first_dna = session.dna_digivolutions[0]
     orig_d1 = first_dna.digimon_1_id
     # _d1_row is a BoundIdComboRow (combo + inline label); reach into `.combo`
@@ -306,7 +306,7 @@ def main() -> int:
 
     # ---- quest editor ----------------------------------------------------
     undo_stack.clear()
-    quest_editor = QuestEditor(session.quests, undo_stack)
+    quest_editor = QuestEditor(session.quests, undo_stack, session)
     first_quest = session.quests[0]
     orig_money = first_quest.money_reward
     quest_editor._money_spin.setValue(orig_money + 1000)
@@ -333,7 +333,7 @@ def main() -> int:
 
     # ---- wild encounters editor ------------------------------------------
     undo_stack.clear()
-    wild_editor = WildEncountersEditor(session.version, session.wild_encounter_areas, undo_stack)
+    wild_editor = WildEncountersEditor(session.version, session.wild_encounter_areas, undo_stack, session)
     # find the first area that actually has encounters
     populated_ix = next(
         ix for ix, a in enumerate(session.wild_encounter_areas) if a.encounters
@@ -363,7 +363,7 @@ def main() -> int:
 
     # ---- encounter rewards editor ----------------------------------------
     undo_stack.clear()
-    rewards_editor = EncounterRewardsEditor(session.encounter_rewards, undo_stack)
+    rewards_editor = EncounterRewardsEditor(session.encounter_rewards, undo_stack, session)
     first_table = session.encounter_rewards[0]
     orig_prob = first_table.probabilitiesArray[0]
     orig_reward = first_table.rewardsArray[0]
@@ -397,7 +397,7 @@ def main() -> int:
 
     # ---- habitats / worldmap editor --------------------------------------
     undo_stack.clear()
-    habitats_editor = HabitatsWorldmapEditor(session.habitats_worldmap, undo_stack)
+    habitats_editor = HabitatsWorldmapEditor(session.habitats_worldmap, undo_stack, session)
     first_habitat = session.habitats_worldmap[0]
     orig_mask = first_habitat.species_living
     # toggle bit 0 (HOLY)
@@ -415,7 +415,7 @@ def main() -> int:
 
     # ---- farm terrains editor --------------------------------------------
     undo_stack.clear()
-    farm_editor = FarmTerrainsEditor(session.farm_terrains, undo_stack)
+    farm_editor = FarmTerrainsEditor(session.farm_terrains, undo_stack, session)
     first_terrain = session.farm_terrains[0]
     orig_limit = first_terrain.farm_digimon_limit
     # find the farm_digimon_limit spinbox via _all_widgets[1] (id, then limit)
@@ -430,7 +430,7 @@ def main() -> int:
 
     # ---- equipment editor ------------------------------------------------
     undo_stack.clear()
-    equipment_editor = EquipmentEditor(session.equipment, undo_stack)
+    equipment_editor = EquipmentEditor(session.equipment, undo_stack, session)
     first_eq_id = next(iter(sorted(session.equipment.keys())))
     first_eq = session.equipment[first_eq_id]
     orig_atk = first_eq.atk_boost
@@ -451,7 +451,7 @@ def main() -> int:
 
     # ---- consumable editor -----------------------------------------------
     undo_stack.clear()
-    consumable_editor = ConsumableEditor(session.consumables, undo_stack)
+    consumable_editor = ConsumableEditor(session.consumables, undo_stack, session)
     first_cons = session.consumables[0]
     orig_cost = first_cons.bit_cost
     cost_widget = None
@@ -470,7 +470,7 @@ def main() -> int:
 
     # ---- farm-items editor -----------------------------------------------
     undo_stack.clear()
-    farm_item_editor = FarmItemEditor(session.farm_items, undo_stack)
+    farm_item_editor = FarmItemEditor(session.farm_items, undo_stack, session)
     first_fi = session.farm_items[0]
     orig_max = first_fi.max_points
     max_widget = None

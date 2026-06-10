@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from typing import List, Tuple
 
-ENABLED = True
+ENABLED = False
 
 # Each node is (name, elapsed_ms, children). The stack holds in-flight nodes
 # whose children list is still being filled; root nodes graduate to _root once

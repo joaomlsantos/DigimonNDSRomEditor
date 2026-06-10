@@ -148,6 +148,8 @@ class DigivolutionTreeEditor(QWidget):
 
     digimonActivated = Signal(int)
 
+    _CURSOR_KEY = "digivolution_trees"
+
     def __init__(
         self,
         records: Dict[int, model.StandardDigivolution],
@@ -258,7 +260,13 @@ class DigivolutionTreeEditor(QWidget):
         layout.addWidget(splitter)
 
         if roots:
-            self._root_list.setCurrentIndex(self._proxy.index(0, 0))
+            remembered = (
+                self._session.recall_selection(self._CURSOR_KEY)
+                if self._session is not None
+                else None
+            )
+            if remembered is None or not self.select_by_id(int(remembered)):
+                self._root_list.setCurrentIndex(self._proxy.index(0, 0))
 
     def _on_root_changed(self, current, _previous) -> None:
         if not current.isValid():
@@ -268,6 +276,8 @@ class DigivolutionTreeEditor(QWidget):
         did = current.data(ROLE_ROOT_ID)
         if did is None:
             return
+        if self._session is not None:
+            self._session.remember_selection(self._CURSOR_KEY, int(did))
         self._render_tree(int(did))
         self._graph_view.render_tree(int(did))
 

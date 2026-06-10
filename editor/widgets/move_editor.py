@@ -329,10 +329,13 @@ class MoveListPanel(QWidget):
 
 
 class MoveEditor(QWidget):
-    def __init__(self, moves: List[model.MoveData], undo_stack: QUndoStack, parent=None):
+    _CURSOR_KEY = "moves"
+
+    def __init__(self, moves: List[model.MoveData], undo_stack: QUndoStack, session, parent=None):
         super().__init__(parent)
         self._moves = moves
         self._undo_stack = undo_stack
+        self._session = session
         self._current_ix: int = -1
 
         self._list_panel = MoveListPanel(moves, dirty_aware=True)
@@ -353,7 +356,9 @@ class MoveEditor(QWidget):
 
         undo_stack.indexChanged.connect(self._refresh_form)
         undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
-        self._list_panel.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list_panel.select_by_id(int(remembered)):
+            self._list_panel.select_first()
 
     def select_by_id(self, move_id: int) -> bool:
         return self._list_panel.select_by_id(move_id)
@@ -477,6 +482,7 @@ class MoveEditor(QWidget):
             return
         target = self._moves[ix]
         self._current_ix = ix
+        self._session.remember_selection(self._CURSOR_KEY, int(target.id))
         self._title.setText(self._title_for(target))
         for w in self._all_widgets():
             w.rebind(target)

@@ -487,6 +487,13 @@ def loadWildEncounterAreas(
     table = _table(rom_data, file_table)
     out: List[model.WildEncounterArea] = []
     for path in _iter_dir_files(table, "DAT/EC/E"):
+        # "DAT/EC/E" also matches ENCTBL.BIN (cross-table file, format TBD —
+        # see PLAN §13.3.c). With sort key (0, path) it slots between E000
+        # and E001, shifting every subsequent area's label down by one
+        # location boundary. Skip it explicitly so the legacy-style
+        # `getLocationForAreaIndex` mapping stays aligned.
+        if path.endswith("/ENCTBL.BIN"):
+            continue
         file_start, file_end = table.resolve(path)
         file_bytes = bytes(rom_data[file_start:file_end])
         out.append(model.WildEncounterArea(file_bytes, file_start))

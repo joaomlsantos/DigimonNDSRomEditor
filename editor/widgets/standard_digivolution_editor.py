@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -38,6 +38,7 @@ from .form_helpers import (
     digimon_choices,
     digimon_name,
     digimon_stage_rank,
+    get_digimon_portrait_icon,
     wrap_in_scroll,
 )
 
@@ -203,15 +204,19 @@ class StandardDigivolutionEditor(QWidget):
     # digimon selected and highlighted in its tree.
     treeRequested = Signal(int)
 
+    _CURSOR_KEY = "standard_digivolutions"
+
     def __init__(
         self,
         entries: Dict[int, model.StandardDigivolution],
         undo_stack: QUndoStack,
+        session,
         parent=None,
     ):
         super().__init__(parent)
         self._entries = entries
         self._undo_stack = undo_stack
+        self._session = session
         self._current_id: int = -1
 
         self._list_panel = DigimonListPanel(entries, dirty_aware=True)
@@ -237,7 +242,9 @@ class StandardDigivolutionEditor(QWidget):
         # clear and trigger warnings on sibling rows.
         for group in self._groups:
             group._id_field.combo.currentIndexChanged.connect(lambda *_a: self._validate_record())
-        self._list_panel.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list_panel.select_by_id(int(remembered)):
+            self._list_panel.select_first()
 
     def _build_detail_container(self) -> QWidget:
         first = next(iter(self._entries.values()))
@@ -248,12 +255,17 @@ class StandardDigivolutionEditor(QWidget):
         font.setBold(True)
         self._title.setFont(font)
 
+        self._portrait_label = QLabel()
+        self._portrait_label.setFixedSize(40, 40)
+        self._portrait_label.setAlignment(Qt.AlignCenter)
+
         self._tree_button = QPushButton("Show in evolution tree")
         self._tree_button.clicked.connect(self._emit_tree_request)
 
         title_row = QWidget()
         title_layout = QHBoxLayout(title_row)
         title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.addWidget(self._portrait_label)
         title_layout.addWidget(self._title)
         title_layout.addStretch(1)
         title_layout.addWidget(self._tree_button)
@@ -281,7 +293,9 @@ class StandardDigivolutionEditor(QWidget):
         if target is None:
             return
         self._current_id = digimon_id
+        self._session.remember_selection(self._CURSOR_KEY, digimon_id)
         self._title.setText(self._title_for(target))
+        self._refresh_portrait()
         for group in self._groups:
             group.rebind(target)
         self._validate_record()
@@ -291,9 +305,17 @@ class StandardDigivolutionEditor(QWidget):
         if target is None:
             return
         self._title.setText(self._title_for(target))
+        self._refresh_portrait()
         for group in self._groups:
             group.refresh()
         self._validate_record()
+
+    def _refresh_portrait(self) -> None:
+        icon = get_digimon_portrait_icon(self._current_id)
+        if icon is None:
+            self._portrait_label.clear()
+            return
+        self._portrait_label.setPixmap(icon.pixmap(QSize(40, 40)))
 
     # ---- validation -----------------------------------------------------
 

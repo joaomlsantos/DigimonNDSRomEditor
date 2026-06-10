@@ -225,6 +225,15 @@ class RomSession:
     _combo_pools: Dict[str, List[object]] = field(default_factory=dict)
     _combo_pool_generations: Dict[str, int] = field(default_factory=dict)
 
+    # Per-editor last-selected row, keyed by the dispatch key in
+    # ``main_window._build_editor_for`` (e.g. "base_digimon", "wild"). Lets
+    # editors restore the user's previous cursor when navigated back to
+    # within the same session. Values are the editor's natural id (digimon
+    # id, area index, equipment id, ...) — each editor knows how to map its
+    # own key back to the list row. Not persisted to .romproj; resets on
+    # ROM close, by design.
+    last_selections: Dict[str, int] = field(default_factory=dict)
+
     @classmethod
     def from_file(cls, path: str) -> "RomSession":
         rom_data = rom.loadRom(path)
@@ -691,6 +700,17 @@ class RomSession:
         held for the lifetime of the session.
         """
         self._digimon_name_cache_valid = False
+
+    def remember_selection(self, editor_key: str, selection_id: int) -> None:
+        """Stash the active row id for ``editor_key`` so a later visit can
+        restore it. ``editor_key`` matches the dispatch key in
+        ``main_window._build_editor_for``."""
+        self.last_selections[editor_key] = int(selection_id)
+
+    def recall_selection(self, editor_key: str) -> Optional[int]:
+        """Return the last id remembered for ``editor_key``, or None if the
+        editor hasn't been visited in this session yet."""
+        return self.last_selections.get(editor_key)
 
     def invalidate_portrait_icon_cache(self) -> None:
         """Drop the cached portrait QIcons.

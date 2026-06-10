@@ -18,6 +18,7 @@ Layout:
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, Qt
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -42,6 +44,23 @@ from PySide6.QtWidgets import (
 from digimon_core import ncer as ncer_mod, pak, sprite
 
 from ..commands import AppendPakEntriesCommand, ReplaceSpriteCommand
+from ._png_palette import build_palette_from_png
+from .cell_export_policy import (
+    allow_shared_tile_exports,
+    register_change_callback as _register_cell_policy_callback,
+)
+from .cell_png_io import (
+    CellPngContext,
+    CellPngError,
+    OamTileConflicts,
+    build_palette_for_per_cell_import,
+    cell_layout as shared_cell_layout,
+    detect_oam_tile_conflicts,
+    import_cells_to_tiles,
+    import_per_cell_to_tiles,
+    render_cells_qimage as shared_render_cells_qimage,
+    render_one_cell_qimage as shared_render_one_cell_qimage,
+)
 from .record_list_panel import RecordListPanel
 
 
@@ -137,6 +156,8 @@ def compute_spr_labels(session) -> List[str]:
 class SpriteBrowser(QWidget):
     """Viewer + dual-format import/export for the SPR_* sprite trio."""
 
+    _CURSOR_KEY = "sprite_browser"
+
     def __init__(self, session, undo_stack: Optional[QUndoStack] = None, parent=None):
         super().__init__(parent)
         self._session = session
@@ -162,6 +183,16 @@ class SpriteBrowser(QWidget):
         self._preview_src_size: Tuple[int, int] = (0, 0)
         self._preview_pixmap_size: Tuple[int, int] = (0, 0)
         self._show_oam_overlay: bool = False
+        # Cells tab state: lazy-render when the tab becomes visible so
+        # switching sprites while the tab is hidden doesn't pay for the
+        # OAM composite cost. Per-entry column overrides persist for the
+        # session — same UX as BTCHR's cells tab.
+        self._cells_dirty: bool = True
+        self._cells_columns_overrides: dict[int, int] = {}
+        # Latest shared-tile detection for the selected sprite. Drives
+        # both the footer warning text and the gating of the four cell-
+        # mode export/import buttons. ``None`` before any selection.
+        self._current_conflicts: Optional[OamTileConflicts] = None
 
         # Reverse lookups: SPR index -> first sprite-map slot that points at
         # it. SpriteMapEntry.upperscreen_low is the portrait sprite, and
@@ -181,7 +212,9 @@ class SpriteBrowser(QWidget):
         self._labels: List[str] = self._build_index_labels()
 
         self._build_ui()
-        self._list.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list.select_index(int(remembered)):
+            self._list.select_first()
 
     # ---- preview width heuristic ----------------------------------------
 
@@ -278,6 +311,41 @@ class SpriteBrowser(QWidget):
         self._scroll.setWidgetResizable(True)
         self._scroll.setAlignment(Qt.AlignCenter)
 
+        # Cells tab: OAM-composed preview, one slot per cell on a
+        # configurable column grid. Pure preview — no interaction with
+        # the tile-mode picker/overlay state. The columns spinner is
+        # tiny and lives above the preview so the pane stays self-
+        # contained even at narrow widths.
+        self._cells_label = QLabel("Select a sprite to preview.")
+        self._cells_label.setAlignment(Qt.AlignCenter)
+        self._cells_label.setMinimumSize(256, 256)
+        self._cells_scroll = QScrollArea()
+        self._cells_scroll.setWidget(self._cells_label)
+        self._cells_scroll.setWidgetResizable(True)
+        self._cells_scroll.setAlignment(Qt.AlignCenter)
+        self._cells_columns_spin = QSpinBox()
+        self._cells_columns_spin.setRange(1, 32)
+        self._cells_columns_spin.setValue(4)
+        self._cells_columns_spin.setMaximumWidth(80)
+        self._cells_columns_spin.valueChanged.connect(self._on_cells_columns_changed)
+        # Tile-conflict heads-up: shows when the sprite has OAMs that
+        # share source tiles. The cells composite still renders fine
+        # (preview is read-only), but the import path would last-write-
+        # wins those shared bytes so any pixel edit leaks across OAMs.
+        # Empty when the sprite is conflict-free — the toolbar stays
+        # quiet for the common single-OAM portrait case.
+        self._cells_conflict_label = QLabel("")
+        self._cells_conflict_label.setStyleSheet(
+            "color: #c47b00; font-weight: bold;"
+        )
+        self._cells_conflict_label.setToolTip(
+            "Some OAMs in this sprite reference the same source tiles. "
+            "The Cells preview renders correctly, but editing the PNG "
+            "and re-importing will overwrite each shared tile from the "
+            "last OAM that touches it — visible as cross-contamination "
+            "between OAMs after re-import."
+        )
+
         # Width-tiles spin: rendering controls only, doesn't mutate the sprite.
         self._width_spin = QSpinBox()
         self._width_spin.setRange(1, 64)
@@ -364,7 +432,7 @@ class SpriteBrowser(QWidget):
         # Export / replace actions: PNG for content editing (round-trips
         # with render_rgba / encode_tiles), NCGR+NCLR for lossless
         # engine-native round-trip (see PLAN.md §11.4.1).
-        self._export_png_btn = QPushButton("Export PNG…")
+        self._export_png_btn = QPushButton("Export tiles PNG…")
         self._export_png_btn.clicked.connect(self._on_export_png)
         self._export_native_btn = QPushButton("Export NCGR+NCLR…")
         self._export_native_btn.clicked.connect(self._on_export_native)
@@ -375,7 +443,7 @@ class SpriteBrowser(QWidget):
         # - on  → run median-cut on the PNG and rebuild the displayed
         #   bank too (CHR + PAL edit; siblings sharing the bank pick up
         #   the new colours).
-        self._replace_png_btn = QPushButton("Import from PNG…")
+        self._replace_png_btn = QPushButton("Import tiles from PNG…")
         self._replace_png_btn.clicked.connect(self._on_replace_png_dispatch)
         self._duplicate_entry_btn = QPushButton("Duplicate sprite entry")
         self._duplicate_entry_btn.setToolTip(
@@ -397,10 +465,26 @@ class SpriteBrowser(QWidget):
         )
         self._replace_native_btn = QPushButton("Import from NCGR+NCLR…")
         self._replace_native_btn.clicked.connect(self._on_replace_native)
+        # OAM-composed cell-mode IO: the PNG dimensions match the OAM
+        # bbox grid instead of a tile sheet, so what the user sees in
+        # their image editor is the sprite's actual cell layout. Same
+        # pipeline BTCHR uses (see cell_png_io). The per-cell variant
+        # writes one PNG per cell, all sized to the union bbox so cells
+        # can be swapped without manual cropping.
+        self._export_cells_png_btn = QPushButton("Export cells PNG…")
+        self._export_cells_png_btn.clicked.connect(self._on_export_cells_png)
+        self._export_per_cell_btn = QPushButton("Export per-cell PNGs…")
+        self._export_per_cell_btn.clicked.connect(self._on_export_per_cell_pngs)
+        self._import_cells_png_btn = QPushButton("Import cells PNG…")
+        self._import_cells_png_btn.clicked.connect(self._on_import_cells_png)
+        self._import_per_cell_btn = QPushButton("Import per-cell PNGs…")
+        self._import_per_cell_btn.clicked.connect(self._on_import_per_cell_pngs)
         for btn in (
             self._export_png_btn, self._export_native_btn,
             self._replace_png_btn, self._replace_native_btn,
             self._duplicate_entry_btn,
+            self._export_cells_png_btn, self._export_per_cell_btn,
+            self._import_cells_png_btn, self._import_per_cell_btn,
         ):
             btn.setEnabled(False)
         # Replace requires an undo stack to push onto; without one the
@@ -410,11 +494,44 @@ class SpriteBrowser(QWidget):
             self._import_pal_with_sheet_cb.setVisible(False)
             self._replace_native_btn.setVisible(False)
             self._duplicate_entry_btn.setVisible(False)
+            self._import_cells_png_btn.setVisible(False)
+            self._import_per_cell_btn.setVisible(False)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(8, 8, 8, 8)
-        right_layout.addWidget(self._scroll, 1)
+
+        # Tile preview lives in the "Tiles" tab; the OAM-composed cells
+        # render lives in "Cells". Splitting the two means the column-
+        # spinner / cell layout doesn't clutter the tile-mode UI, and
+        # users who only ever look at one mode aren't paying for the
+        # other's render on every selection change (see `_cells_dirty`).
+        tiles_tab = QWidget()
+        tiles_layout = QVBoxLayout(tiles_tab)
+        tiles_layout.setContentsMargins(0, 0, 0, 0)
+        tiles_layout.addWidget(self._scroll, 1)
+
+        cells_tab = QWidget()
+        cells_layout = QVBoxLayout(cells_tab)
+        cells_layout.setContentsMargins(0, 0, 0, 0)
+        # Footer (not header) per user request — the column control + the
+        # conflict warning stay close to the preview but out of the way
+        # of the actual cells render.
+        cells_footer = QHBoxLayout()
+        cells_footer.setContentsMargins(0, 0, 0, 0)
+        cells_footer.addWidget(QLabel("Columns"))
+        cells_footer.addWidget(self._cells_columns_spin)
+        cells_footer.addSpacing(12)
+        cells_footer.addWidget(self._cells_conflict_label)
+        cells_footer.addStretch(1)
+        cells_layout.addWidget(self._cells_scroll, 1)
+        cells_layout.addLayout(cells_footer)
+
+        self._preview_tabs = QTabWidget()
+        self._preview_tabs.addTab(tiles_tab, "Tiles")
+        self._preview_tabs.addTab(cells_tab, "Cells")
+        self._preview_tabs.currentChanged.connect(self._on_preview_tab_changed)
+        right_layout.addWidget(self._preview_tabs, 1)
         # Action buttons grouped by target format: PNG column (lossy via
         # the engine's palette quantization) on the left, NCGR+NCLR
         # column (lossless engine-native) on the right. Stacking within
@@ -426,6 +543,13 @@ class SpriteBrowser(QWidget):
         png_col.addWidget(self._replace_png_btn)
         png_col.addWidget(self._import_pal_with_sheet_cb)
         png_col.addStretch(1)
+        cells_col = QVBoxLayout()
+        cells_col.setSpacing(4)
+        cells_col.addWidget(self._export_cells_png_btn)
+        cells_col.addWidget(self._export_per_cell_btn)
+        cells_col.addWidget(self._import_cells_png_btn)
+        cells_col.addWidget(self._import_per_cell_btn)
+        cells_col.addStretch(1)
         native_col = QVBoxLayout()
         native_col.setSpacing(4)
         native_col.addWidget(self._export_native_btn)
@@ -436,6 +560,8 @@ class SpriteBrowser(QWidget):
         controls_row.addLayout(controls)
         controls_row.addSpacing(16)
         controls_row.addLayout(png_col)
+        controls_row.addSpacing(8)
+        controls_row.addLayout(cells_col)
         controls_row.addSpacing(8)
         controls_row.addLayout(native_col)
         controls_row.addStretch(1)
@@ -474,10 +600,17 @@ class SpriteBrowser(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(splitter)
 
+        # Live-update the cell-button gating whenever the policy menu is
+        # flipped. ``cell_export_policy`` self-prunes callbacks whose
+        # bound widget was Qt-deleted (catches RuntimeError) so we don't
+        # need an explicit unregister on tear-down.
+        _register_cell_policy_callback(self._on_cell_policy_changed)
+
     # ---- selection / refresh --------------------------------------------
 
     def _on_index_selected(self, ix: int) -> None:
         self._current_idx = ix
+        self._session.remember_selection(self._CURSOR_KEY, ix)
         self._export_png_btn.setEnabled(True)
         self._export_native_btn.setEnabled(True)
         if self._undo_stack is not None:
@@ -486,18 +619,171 @@ class SpriteBrowser(QWidget):
             self._duplicate_entry_btn.setEnabled(True)
         self._refresh_palette_combo()
         self._refresh_meta_and_preview()
+        # Recompute shared-tile detection so the four cell-mode buttons
+        # are gated correctly for the freshly selected sprite. Has to
+        # run *after* ``_refresh_meta_and_preview`` because the cached
+        # NCER it reads is populated there.
+        self._recompute_current_conflicts()
+        self._refresh_cell_export_button_states()
+        # Cells tab uses the same NCGR + palette as the tile preview, so
+        # any selection / width / palette change invalidates its render.
+        # Re-render lazily — only paint if the user is actually viewing
+        # the Cells tab.
+        self._cells_dirty = True
+        if self._preview_tabs.currentIndex() == 1:
+            self._refresh_cells_preview()
 
     def _on_palette_changed(self, bank: int) -> None:
         if bank < 0:
             return
         self._current_palette_bank = bank
         self._refresh_preview_only()
+        # Cells render uses the same effective palette — bank changes
+        # invalidate it. Width changes don't (cells layout is OAM-driven).
+        self._cells_dirty = True
+        if self._preview_tabs.currentIndex() == 1:
+            self._refresh_cells_preview()
 
     def _on_width_changed(self, w: int) -> None:
         self._current_width_tiles = w
         if self._current_idx is not None:
             self._width_overrides[self._current_idx] = w
         self._refresh_preview_only()
+
+    def _on_preview_tab_changed(self, idx: int) -> None:
+        if idx == 1 and self._cells_dirty:
+            self._refresh_cells_preview()
+
+    def _on_cells_columns_changed(self, value: int) -> None:
+        if self._current_idx is not None:
+            self._cells_columns_overrides[self._current_idx] = value
+        self._cells_dirty = True
+        if self._preview_tabs.currentIndex() == 1:
+            self._refresh_cells_preview()
+
+    def _refresh_cells_preview(self) -> None:
+        """Render the OAM-composed cells grid into the Cells tab.
+
+        Column count comes from the per-entry override (if the user has
+        adjusted the spinner for this sprite this session), else from
+        the current spinner value clamped to ``[1, n_cells]``. Single-
+        cell sprites still render — useful for portraits/icons where
+        seeing the composed cell side-by-side with the tile grid helps
+        explain the OAM layout. Caller is responsible for calling this
+        only when the Cells tab is actually visible / dirty.
+        """
+        self._cells_dirty = False
+        self._refresh_conflict_label()
+        if self._current_idx is None:
+            self._cells_label.setText("Select a sprite to preview.")
+            return
+        ctx = self._cell_ctx()
+        layout = self._cell_layout()
+        if ctx is None or layout is None:
+            self._cells_label.setText("(no cells)")
+            return
+        n_cells = len(ctx.ncer.cells)
+        # Spinner sync: use the per-entry override if present, otherwise
+        # cap the live value at n_cells so a sprite with fewer cells
+        # than the previous one doesn't render a half-empty grid.
+        if self._current_idx in self._cells_columns_overrides:
+            columns = max(1, min(n_cells, self._cells_columns_overrides[self._current_idx]))
+        else:
+            columns = max(1, min(n_cells, self._cells_columns_spin.value()))
+        # Block signals so updating the spinner to match clamped value
+        # doesn't fire _on_cells_columns_changed → re-render loop.
+        self._cells_columns_spin.blockSignals(True)
+        self._cells_columns_spin.setValue(columns)
+        self._cells_columns_spin.blockSignals(False)
+        img = shared_render_cells_qimage(ctx, columns)
+        if img is None:
+            self._cells_label.setText("(empty render)")
+            return
+        pm = QPixmap.fromImage(img)
+        # Match the tile preview's 2× zoom for small sprites.
+        if max(pm.width(), pm.height()) < 256:
+            pm = pm.scaled(
+                pm.width() * 2, pm.height() * 2,
+                Qt.KeepAspectRatio, Qt.FastTransformation,
+            )
+        self._cells_label.setPixmap(pm)
+        self._cells_label.setMinimumSize(pm.size())
+
+    def _recompute_current_conflicts(self) -> None:
+        """Refresh ``_current_conflicts`` from the currently-cached NCER.
+
+        Called on selection change. The cached NCER is populated by
+        ``_refresh_meta_and_preview``; if it isn't there (no cells, parse
+        failed) treat the sprite as conflict-free so the cell buttons
+        fall through their other gating (which will still disable them
+        when ``_cell_ctx`` returns ``None``).
+        """
+        ctx = self._cell_ctx()
+        if ctx is None:
+            self._current_conflicts = None
+            return
+        self._current_conflicts = detect_oam_tile_conflicts(
+            ctx.ncer, is_8bpp=ctx.is_8bpp,
+        )
+
+    def _refresh_conflict_label(self) -> None:
+        """Update the cells-footer warning to match the cached conflicts.
+
+        Shows nothing for conflict-free sprites; otherwise shows the
+        shared-tile count with a hint about which tile-mode buttons to
+        use instead. The text reads slightly differently depending on
+        whether the user has overridden the safety gate via the Edit
+        menu (so they can tell the buttons are actually clickable now).
+        """
+        conflicts = self._current_conflicts
+        if conflicts is None or not conflicts.has_any:
+            self._cells_conflict_label.setText("")
+            return
+        if allow_shared_tile_exports():
+            msg = (
+                f"{conflicts.shared_tiles} shared tiles: per-cell edits "
+                f"may not round-trip cleanly. Prefer Export/Import tiles "
+                f"PNG for this sprite."
+            )
+        else:
+            msg = (
+                f"{conflicts.shared_tiles} shared tiles: per-cell edits "
+                f"disabled. Use Export/Import tiles PNG to edit this sprite."
+            )
+        self._cells_conflict_label.setText(msg)
+
+    def _refresh_cell_export_button_states(self) -> None:
+        """Gate the four cell-mode export/import buttons.
+
+        Buttons stay visible (so users can see they exist) but are
+        disabled when the sprite has shared tiles *and* the Edit-menu
+        override is off. Selection must also be set, and import buttons
+        additionally require an undo stack (read-only mode hides them
+        outright, see ``__init__``).
+        """
+        has_selection = self._current_idx is not None
+        conflicts = self._current_conflicts
+        blocked_by_conflicts = (
+            conflicts is not None
+            and conflicts.has_any
+            and not allow_shared_tile_exports()
+        )
+        cells_ok = has_selection and not blocked_by_conflicts
+        self._export_cells_png_btn.setEnabled(cells_ok)
+        self._export_per_cell_btn.setEnabled(cells_ok)
+        if self._undo_stack is not None:
+            self._import_cells_png_btn.setEnabled(cells_ok)
+            self._import_per_cell_btn.setEnabled(cells_ok)
+
+    def _on_cell_policy_changed(self, _enabled: bool) -> None:
+        """Menu fired — re-evaluate button gating + warning text.
+
+        Self-pruning callback: if the widget has been Qt-deleted the
+        policy module catches the ``RuntimeError`` and drops the
+        registration, so we don't need an explicit deregister hook.
+        """
+        self._refresh_cell_export_button_states()
+        self._refresh_conflict_label()
 
     def _refresh_palette_combo(self) -> None:
         if self._current_idx is None:
@@ -1010,7 +1296,7 @@ class SpriteBrowser(QWidget):
                 return
         default = f"sprite_0x{self._current_idx:04x}.png"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export PNG", default, "PNG image (*.png)"
+            self, "Export tiles PNG", default, "PNG image (*.png)"
         )
         if not path:
             return
@@ -1173,7 +1459,7 @@ class SpriteBrowser(QWidget):
             return
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import from PNG", "", "PNG image (*.png);;All files (*)",
+            self, "Import tiles from PNG", "", "PNG image (*.png);;All files (*)",
         )
         if not path:
             return
@@ -1279,7 +1565,7 @@ class SpriteBrowser(QWidget):
         _tile_bytes, bit_depth, palettes, _is_bitmap = cached
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import from PNG (rebuild palette)", "",
+            self, "Import tiles from PNG (rebuild palette)", "",
             "PNG image (*.png);;All files (*)",
         )
         if not path:
@@ -1515,6 +1801,420 @@ class SpriteBrowser(QWidget):
         cmd = ReplaceSpriteCommand(
             self._session, replacements,
             description=f"Replace sprite 0x{ix:04x} from NCGR+NCLR",
+            on_change=self._reload_current_entry,
+        )
+        self._undo_stack.push(cmd)
+
+    # ---- cell-mode PNG IO ----------------------------------------------
+
+    def _cell_ctx(self) -> Optional[CellPngContext]:
+        """Build a CellPngContext over the current SPR_* sprite.
+
+        Picks the effective palette the same way the preview does
+        (concatenate 4bpp banks when the CHR is 8bpp, otherwise use
+        the displayed bank), and tags ``is_8bpp`` from the NCGR's
+        bit-depth field so the OAM-tile geometry comes out right.
+        Returns ``None`` when no entry is loaded or the NCLR is empty.
+        """
+        cached = getattr(self, "_cached", None)
+        ncer_obj = getattr(self, "_cached_ncer", None)
+        if cached is None or ncer_obj is None:
+            return None
+        tile_bytes, bit_depth, palettes, _is_bitmap = cached
+        if not palettes:
+            return None
+        palette, chr_8bpp = self._current_effective_palette(palettes, bit_depth)
+        bytes_per_tile = 64 if chr_8bpp else 32
+        n_tiles = len(tile_bytes) // bytes_per_tile
+        return CellPngContext(
+            ncer=ncer_obj,
+            tile_bytes=tile_bytes,
+            n_tiles=n_tiles,
+            palette=list(palette),
+            is_8bpp=chr_8bpp,
+        )
+
+    def _cell_layout(self):
+        ncer_obj = getattr(self, "_cached_ncer", None)
+        if ncer_obj is None:
+            return None
+        return shared_cell_layout(ncer_obj)
+
+    def _render_cells_qimage(self, columns: int) -> Optional[QImage]:
+        ctx = self._cell_ctx()
+        if ctx is None:
+            return None
+        return shared_render_cells_qimage(ctx, columns)
+
+    def _render_one_cell_qimage(self, cell_idx: int) -> Optional[QImage]:
+        ctx = self._cell_ctx()
+        if ctx is None:
+            return None
+        return shared_render_one_cell_qimage(ctx, cell_idx)
+
+    def _on_export_cells_png(self) -> None:
+        """Composite all cells into a single PNG laid out as one row.
+
+        Embeds ``spr_mode=cells`` + ``spr_columns`` so re-import recovers
+        the layout regardless of how the user resized the file. One row
+        is the simplest default — sprite_browser has no preview-side
+        column knob, and users can re-arrange in their image editor
+        before re-import (the metadata stays attached on save).
+        """
+        if self._current_idx is None:
+            return
+        ctx = self._cell_ctx()
+        layout = self._cell_layout()
+        if ctx is None or layout is None:
+            QMessageBox.critical(
+                self, "Export failed",
+                "Current entry has no cells — nothing to export.",
+            )
+            return
+        n_cells = len(ctx.ncer.cells)
+        columns = n_cells
+        img = shared_render_cells_qimage(ctx, columns)
+        if img is None:
+            QMessageBox.critical(self, "Export failed", "Render failed.")
+            return
+        img.setText("spr_mode", "cells")
+        img.setText("spr_columns", str(columns))
+        default = f"sprite_0x{self._current_idx:04x}_cells.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export cells PNG", default, "PNG (*.png)",
+        )
+        if not path:
+            return
+        if not img.save(path, "PNG"):
+            QMessageBox.critical(self, "Export failed", f"Could not write {path}.")
+
+    def _on_export_per_cell_pngs(self) -> None:
+        """Write each cell to ``<base>_cell_<K>.png`` sized to the union bbox.
+
+        Uniform per-cell size lets users swap cells between sprites
+        without manual cropping, mirroring BTCHR's per-cell convention.
+        Cells that previously rendered as a tighter sub-rect of the
+        union bbox keep alpha=0 in the unused gutter.
+        """
+        if self._current_idx is None:
+            return
+        ctx = self._cell_ctx()
+        if ctx is None:
+            QMessageBox.critical(
+                self, "Export failed",
+                "Current entry has no cells — nothing to export.",
+            )
+            return
+        n_cells = len(ctx.ncer.cells)
+        suggested = f"sprite_0x{self._current_idx:04x}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export per-cell PNGs (pick base name)",
+            suggested, "PNG (*.png)",
+        )
+        if not path:
+            return
+        base = path[:-4] if path.lower().endswith(".png") else path
+        m = re.match(r"^(.*)_cell_\d+$", base)
+        if m:
+            base = m.group(1)
+        for ci in range(n_cells):
+            img = shared_render_one_cell_qimage(ctx, ci)
+            if img is None:
+                QMessageBox.critical(
+                    self, "Export failed", f"Could not render cell {ci}.",
+                )
+                return
+            img.setText("spr_mode", "per_cell")
+            img.setText("spr_cell", str(ci))
+            img.setText("spr_n_cells", str(n_cells))
+            out_path = f"{base}_cell_{ci}.png"
+            if not img.save(out_path, "PNG"):
+                QMessageBox.critical(
+                    self, "Export failed", f"Could not write {out_path}.",
+                )
+                return
+
+    def _cells_bank_replacements(
+        self,
+        new_flat_palette: List[Tuple[int, int, int]],
+        palettes: List[sprite.Palette],
+        bit_depth: int,
+    ) -> dict:
+        """NCLR bank replacements for a rebuilt cells-mode palette.
+
+        Mirrors ``_on_replace_png_new_palette``'s split logic so cells
+        and tile-mode rebuilds produce identical NCLR layouts:
+        8bpp+banked → 16 banks of 16; 8bpp single → one 256-entry bank;
+        4bpp → only the displayed bank gets rebuilt (others belong to
+        other animations and must stay byte-identical).
+        """
+        chr_8bpp = (bit_depth == 4)
+        banks_are_16 = bool(palettes) and len(palettes[0]) == 16
+        if chr_8bpp and banks_are_16:
+            return {bi: new_flat_palette[bi * 16:(bi + 1) * 16] for bi in range(16)}
+        if chr_8bpp:
+            return {0: new_flat_palette}
+        bank_idx = min(self._current_palette_bank, len(palettes) - 1)
+        return {bank_idx: new_flat_palette}
+
+    def _on_import_cells_png(self) -> None:
+        """Round-trip a composite cells PNG back into the tile bank.
+
+        Same checkbox semantics as tile-mode import — off → quantize
+        against the existing effective palette; on → rebuild from the
+        PNG and write NCLR alongside.
+        """
+        if self._current_idx is None or self._undo_stack is None:
+            return
+        ix = self._current_idx
+        cached = getattr(self, "_cached", None)
+        if cached is None:
+            return
+        _tile_bytes, bit_depth, palettes, _is_bitmap = cached
+        if not palettes:
+            QMessageBox.warning(
+                self, "Cannot import",
+                "Entry has no NCLR to anchor cell rendering on.",
+            )
+            return
+        layout = self._cell_layout()
+        if layout is None:
+            QMessageBox.critical(
+                self, "Import failed",
+                "Current entry has no cells — nothing to import.",
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import cells PNG", "", "PNG (*.png);;All files (*)",
+        )
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.critical(self, "Cannot read PNG", f"Could not load {path}")
+            return
+
+        # Columns from embedded tag, capped at n_cells so over-large
+        # values don't produce 0 rows. Falls back to a single row for
+        # PNGs made externally (no metadata).
+        n_cells = len(layout[0])
+        embedded_columns = img.text("spr_columns") or img.text("btchr_columns")
+        if embedded_columns:
+            try:
+                columns = max(1, min(n_cells, int(embedded_columns)))
+            except ValueError:
+                columns = n_cells
+        else:
+            columns = n_cells
+
+        chr_8bpp = (bit_depth == 4)
+        total_slots = 256 if chr_8bpp else 16
+
+        use_indexed = img.format() == QImage.Format_Indexed8
+        checkbox_on = self._import_pal_with_sheet_cb.isChecked()
+        pal_from_plte = (
+            use_indexed and checkbox_on and len(img.colorTable()) >= 2
+        )
+        pal_from_quant = (not use_indexed) and checkbox_on
+        rebuild_palette = pal_from_plte or pal_from_quant
+        if rebuild_palette:
+            built = build_palette_from_png(img, total_slots=total_slots)
+            if built is None:
+                QMessageBox.critical(
+                    self, "PNG is fully transparent",
+                    "Cannot rebuild a palette from a PNG with no opaque pixels.",
+                )
+                return
+            new_palette: List[Tuple[int, int, int]] = list(built)
+        else:
+            current_palette, _ = self._current_effective_palette(palettes, bit_depth)
+            new_palette = list(current_palette)
+
+        bytes_per_tile = 64 if chr_8bpp else 32
+        n_tiles = len(_tile_bytes) // bytes_per_tile
+        ctx = CellPngContext(
+            ncer=self._cached_ncer,
+            tile_bytes=_tile_bytes,
+            n_tiles=n_tiles,
+            palette=new_palette,
+            is_8bpp=chr_8bpp,
+        )
+        try:
+            new_tiles = import_cells_to_tiles(
+                img, ctx=ctx, layout=layout,
+                columns=columns, palette=new_palette,
+            )
+        except CellPngError as exc:
+            QMessageBox.critical(self, exc.title, exc.message)
+            return
+
+        try:
+            new_ncgr = sprite.build_ncgr_from_template(
+                new_tiles, self._chr_pak.entries[ix],
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Build failed", str(exc))
+            return
+        replacements: List[Tuple[str, int, bytes]] = [
+            (SPR_CHR, ix, sprite.compress_rle30(new_ncgr)),
+        ]
+        if rebuild_palette:
+            bank_replacements = self._cells_bank_replacements(
+                new_palette, palettes, bit_depth,
+            )
+            try:
+                new_nclr = sprite.build_nclr_from_template(
+                    self._pal_pak.entries[ix], bank_replacements,
+                )
+            except ValueError as exc:
+                QMessageBox.critical(self, "Build failed", f"NCLR rebuild: {exc}")
+                return
+            replacements.append((SPR_PAL, ix, sprite.compress_rle30(new_nclr)))
+            desc = f"Import SPR cells + palette 0x{ix:04x}"
+        else:
+            desc = f"Import SPR cells 0x{ix:04x}"
+
+        cmd = ReplaceSpriteCommand(
+            self._session, replacements,
+            description=desc,
+            on_change=self._reload_current_entry,
+        )
+        self._undo_stack.push(cmd)
+
+    def _on_import_per_cell_pngs(self) -> None:
+        """Read N per-cell PNGs and rebuild the tile bank from them.
+
+        User picks any ``<base>_cell_<K>.png``; siblings for the other
+        cells are located by stripping the suffix and re-applying each
+        index. Palette decision matches the composite path's checkbox.
+        """
+        if self._current_idx is None or self._undo_stack is None:
+            return
+        ix = self._current_idx
+        cached = getattr(self, "_cached", None)
+        if cached is None:
+            return
+        _tile_bytes, bit_depth, palettes, _is_bitmap = cached
+        if not palettes:
+            QMessageBox.warning(
+                self, "Cannot import",
+                "Entry has no NCLR to anchor cell rendering on.",
+            )
+            return
+        layout = self._cell_layout()
+        if layout is None:
+            QMessageBox.critical(
+                self, "Import failed",
+                "Current entry has no cells — nothing to import.",
+            )
+            return
+        _, max_w, max_h = layout
+        n_cells = len(layout[0])
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import per-cell PNGs (pick any cell)",
+            "", "PNG (*.png)",
+        )
+        if not path:
+            return
+        m = re.match(r"^(.*)_cell_(\d+)\.png$", path, re.IGNORECASE)
+        if not m:
+            QMessageBox.critical(
+                self, "Bad filename",
+                "Per-cell PNGs must follow the pattern "
+                "'<name>_cell_<N>.png'.\n"
+                f"Got: {os.path.basename(path)}",
+            )
+            return
+        base = m.group(1)
+        pngs: List[QImage] = []
+        for ci in range(n_cells):
+            sibling = f"{base}_cell_{ci}.png"
+            if not os.path.exists(sibling):
+                QMessageBox.critical(
+                    self, "Missing cell PNG",
+                    f"Expected file not found:\n{sibling}",
+                )
+                return
+            cell_img = QImage(sibling)
+            if cell_img.isNull():
+                QMessageBox.critical(
+                    self, "Import failed", f"Could not read {sibling}.",
+                )
+                return
+            pngs.append(cell_img)
+
+        chr_8bpp = (bit_depth == 4)
+        total_slots = 256 if chr_8bpp else 16
+
+        first_indexed = pngs[0].format() == QImage.Format_Indexed8
+        checkbox_on = self._import_pal_with_sheet_cb.isChecked()
+        pal_from_plte = (
+            first_indexed and checkbox_on and len(pngs[0].colorTable()) >= 2
+        )
+        pal_from_quant = (not first_indexed) and checkbox_on
+        rebuild_palette = pal_from_plte or pal_from_quant
+        if rebuild_palette:
+            built = build_palette_for_per_cell_import(
+                pngs, total_slots=total_slots, max_w=max_w, max_h=max_h,
+            )
+            if built is None:
+                QMessageBox.critical(
+                    self, "PNG is fully transparent",
+                    "Cannot rebuild a palette from PNGs with no opaque "
+                    "pixels.",
+                )
+                return
+            new_palette: List[Tuple[int, int, int]] = list(built)
+        else:
+            current_palette, _ = self._current_effective_palette(palettes, bit_depth)
+            new_palette = list(current_palette)
+
+        bytes_per_tile = 64 if chr_8bpp else 32
+        n_tiles = len(_tile_bytes) // bytes_per_tile
+        ctx = CellPngContext(
+            ncer=self._cached_ncer,
+            tile_bytes=_tile_bytes,
+            n_tiles=n_tiles,
+            palette=new_palette,
+            is_8bpp=chr_8bpp,
+        )
+        try:
+            new_tiles = import_per_cell_to_tiles(
+                pngs, ctx=ctx, layout=layout, palette=new_palette,
+            )
+        except CellPngError as exc:
+            QMessageBox.critical(self, exc.title, exc.message)
+            return
+
+        try:
+            new_ncgr = sprite.build_ncgr_from_template(
+                new_tiles, self._chr_pak.entries[ix],
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Build failed", str(exc))
+            return
+        replacements: List[Tuple[str, int, bytes]] = [
+            (SPR_CHR, ix, sprite.compress_rle30(new_ncgr)),
+        ]
+        if rebuild_palette:
+            bank_replacements = self._cells_bank_replacements(
+                new_palette, palettes, bit_depth,
+            )
+            try:
+                new_nclr = sprite.build_nclr_from_template(
+                    self._pal_pak.entries[ix], bank_replacements,
+                )
+            except ValueError as exc:
+                QMessageBox.critical(self, "Build failed", f"NCLR rebuild: {exc}")
+                return
+            replacements.append((SPR_PAL, ix, sprite.compress_rle30(new_nclr)))
+            desc = f"Import SPR per-cell + palette 0x{ix:04x}"
+        else:
+            desc = f"Import SPR per-cell 0x{ix:04x}"
+
+        cmd = ReplaceSpriteCommand(
+            self._session, replacements,
+            description=desc,
             on_change=self._reload_current_entry,
         )
         self._undo_stack.push(cmd)

@@ -50,6 +50,16 @@ from ..commands import (
     ReplaceSpriteCommand,
 )
 from ._png_palette import build_palette_from_png, nearest_idx_opaque
+from .cell_png_io import (
+    CellPngContext,
+    CellPngError,
+    build_palette_for_per_cell_import,
+    cell_layout as shared_cell_layout,
+    import_cells_to_tiles,
+    import_per_cell_to_tiles,
+    render_cells_qimage as shared_render_cells_qimage,
+    render_one_cell_qimage as shared_render_one_cell_qimage,
+)
 from .record_list_panel import RecordListPanel
 from .transparent_picker import TransparentColorPicker
 
@@ -168,6 +178,8 @@ def compute_btchr_group_labels(session) -> List[str]:
 class BtchrBrowser(QWidget):
     """Read-only browser for BTCHR battle sprites."""
 
+    _CURSOR_KEY = "btchr_browser"
+
     def __init__(self, session, undo_stack: Optional[QUndoStack] = None, parent=None):
         super().__init__(parent)
         self._session = session
@@ -247,7 +259,9 @@ class BtchrBrowser(QWidget):
         self._labels: List[str] = self._build_labels()
 
         self._build_ui()
-        self._list.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list.select_index(int(remembered)):
+            self._list.select_first()
 
     # ---- labels ---------------------------------------------------------
 
@@ -491,12 +505,13 @@ class BtchrBrowser(QWidget):
         self._meta_name = QLabel("—")
         self._meta_cells = QLabel("—")
         self._meta_tiles = QLabel("—")
+        self._meta_cell_size = QLabel("—")
         self._meta_idle = QLabel("—")
         self._meta_attack = QLabel("—")
         self._meta_defend = QLabel("—")
         for lbl in (
             self._meta_name,
-            self._meta_cells, self._meta_tiles,
+            self._meta_cells, self._meta_tiles, self._meta_cell_size,
             self._meta_idle, self._meta_attack, self._meta_defend,
         ):
             lbl.setMinimumWidth(280)
@@ -514,6 +529,7 @@ class BtchrBrowser(QWidget):
         self._hdr_loading = False
         self._hdr_scale_spin = QSpinBox()
         self._hdr_scale_spin.setRange(0, 0xFFFF)
+        self._hdr_scale_spin.setMaximumWidth(110)
         self._hdr_scale_spin.setToolTip(
             "footprint_scale (u16) — scales with sprite size; affects "
             "render footprint."
@@ -523,6 +539,7 @@ class BtchrBrowser(QWidget):
         )
         self._hdr_y_pivot_a_spin = QSpinBox()
         self._hdr_y_pivot_a_spin.setRange(-0x8000, 0x7FFF)
+        self._hdr_y_pivot_a_spin.setMaximumWidth(110)
         self._hdr_y_pivot_a_spin.setToolTip(
             "y_pivot_a (i16) — top pivot; vanilla values are always ≤ 0."
         )
@@ -531,6 +548,7 @@ class BtchrBrowser(QWidget):
         )
         self._hdr_x_pivot_spin = QSpinBox()
         self._hdr_x_pivot_spin.setRange(-0x8000, 0x7FFF)
+        self._hdr_x_pivot_spin.setMaximumWidth(110)
         self._hdr_x_pivot_spin.setToolTip(
             "x_pivot (i16) — horizontal pivot offset."
         )
@@ -539,6 +557,7 @@ class BtchrBrowser(QWidget):
         )
         self._hdr_y_pivot_b_spin = QSpinBox()
         self._hdr_y_pivot_b_spin.setRange(-0x8000, 0x7FFF)
+        self._hdr_y_pivot_b_spin.setMaximumWidth(110)
         self._hdr_y_pivot_b_spin.setToolTip(
             "y_pivot_b (i16) — bottom pivot; vanilla values are always ≤ 0."
         )
@@ -550,6 +569,7 @@ class BtchrBrowser(QWidget):
         meta_form.addRow("Name", self._meta_name)
         meta_form.addRow("Cells", self._meta_cells)
         meta_form.addRow("NCGR tiles", self._meta_tiles)
+        meta_form.addRow("Per-cell PNG size", self._meta_cell_size)
         meta_form.addRow("Footprint scale", self._hdr_scale_spin)
         meta_form.addRow("Y pivot (top)", self._hdr_y_pivot_a_spin)
         meta_form.addRow("X pivot", self._hdr_x_pivot_spin)
@@ -723,6 +743,7 @@ class BtchrBrowser(QWidget):
 
     def _on_group_selected(self, g: int) -> None:
         self._current_group = g
+        self._session.remember_selection(self._CURSOR_KEY, g)
         self._cell_pixmaps = []
         try:
             digimon_id = (
@@ -749,6 +770,12 @@ class BtchrBrowser(QWidget):
         self._meta_name.setText(name if name else "—")
         self._meta_cells.setText(str(len(d.ncer.cells)))
         self._meta_tiles.setText(f"{d.n_tiles} tiles (8bpp)")
+        layout = self._cell_layout()
+        if layout is None:
+            self._meta_cell_size.setText("—")
+        else:
+            _, max_w, max_h = layout
+            self._meta_cell_size.setText(f"{max_w}×{max_h} px")
         self._load_header_spinboxes(h)
         self._meta_idle.setText(_format_track(h.idle))
         self._meta_attack.setText(_format_track(h.attack))
@@ -927,148 +954,41 @@ class BtchrBrowser(QWidget):
                     img.setPixel(tx0 + px, ty0 + py, tile[py * 8 + px])
         return img
 
-    def _cell_layout(self) -> Optional[Tuple[List[Tuple[int, int, int, int]], int, int]]:
-        """Cell-mode layout: list of ``(xmin, ymin, w, h)`` per cell + the
-        per-slot ``(max_w, max_h)`` used for uniform placement.
+    def _cell_ctx(self) -> Optional[CellPngContext]:
+        """Build a CellPngContext over the current BTCHR sprite.
 
-        Returns ``None`` when the current digimon has no cells or every
-        cell's bbox collapses to zero (sentinel groups, decode error).
-        Centralised because export, preview, and import all need the
-        same numbers to agree.
+        BTCHR is always 8bpp with a single 256-entry palette, so the
+        bit-depth / palette decisions are trivial — they all collapse
+        into a fixed context the shared cell_png_io helpers consume.
         """
         if self._current_decoded is None:
             return None
         d = self._current_decoded
-        if not d.ncer.cells:
-            return None
-        rects: List[Tuple[int, int, int, int]] = []
-        max_w = max_h = 0
-        for cell in d.ncer.cells:
-            xmin, ymin, xmax, ymax = btchr.cell_bbox(cell)
-            w = xmax - xmin
-            h = ymax - ymin
-            rects.append((xmin, ymin, w, h))
-            if w > max_w:
-                max_w = w
-            if h > max_h:
-                max_h = h
-        if max_w <= 0 or max_h <= 0:
-            return None
-        return rects, max_w, max_h
+        return CellPngContext(
+            ncer=d.ncer,
+            tile_bytes=d.tile_bytes,
+            n_tiles=d.n_tiles,
+            palette=list(d.palette),
+            is_8bpp=True,
+        )
 
-    def _make_indexed8_canvas(self, w: int, h: int) -> QImage:
-        """Indexed8 QImage sized ``w × h`` with the live NCLR as the colour
-        table and slot 0 set to alpha=0 — same shape composite and per-cell
-        exports both paint into."""
-        d = self._current_decoded
-        assert d is not None  # callers gate on this
-        img = QImage(w, h, QImage.Format_Indexed8)
-        ctable = [
-            qRgba(r, g, b, 0 if pi == 0 else 255)
-            for pi, (r, g, b) in enumerate(d.palette)
-        ]
-        img.setColorTable(ctable)
-        img.fill(0)
-        return img
-
-    def _paint_cell_indexed8(
-        self,
-        img: QImage,
-        cell,
-        slot_x: int,
-        slot_y: int,
-        xmin: int,
-        ymin: int,
-    ) -> None:
-        """Walk one cell's OAMs and write palette indices into ``img`` at
-        ``(slot_x, slot_y)``. ``xmin/ymin`` is the cell's bbox origin —
-        the per-OAM ``x/y`` are relative to those so the cell content
-        lands at the slot's top-left."""
-        d = self._current_decoded
-        assert d is not None
-        tile_mult = d.ncer.boundary_bytes // btchr.BYTES_PER_TILE_8BPP
-        n_tiles = d.n_tiles
-        img_w = img.width()
-        img_h = img.height()
-        for o in cell.oams:
-            first_tile = o.tile * tile_mult
-            ox = o.x - xmin
-            oy = o.y - ymin
-            ntw = o.w // 8
-            nth = o.h // 8
-            for ty in range(nth):
-                for tx in range(ntw):
-                    idx = first_tile + ty * ntw + tx
-                    if idx >= n_tiles:
-                        continue
-                    tile_off = idx * btchr.BYTES_PER_TILE_8BPP
-                    for r in range(8):
-                        sr = (7 - r) if o.vflip else r
-                        src_row = tile_off + sr * 8
-                        dst_y = slot_y + oy + ty * 8 + r
-                        if not (0 <= dst_y < img_h):
-                            continue
-                        for c in range(8):
-                            sc = (7 - c) if o.hflip else c
-                            pi = d.tile_bytes[src_row + sc]
-                            if pi == 0:
-                                continue
-                            dst_x = slot_x + ox + tx * 8 + c
-                            if not (0 <= dst_x < img_w):
-                                continue
-                            img.setPixel(dst_x, dst_y, pi)
+    def _cell_layout(self):
+        """Thin wrapper around shared_cell_layout, gated on the current sprite."""
+        if self._current_decoded is None:
+            return None
+        return shared_cell_layout(self._current_decoded.ncer)
 
     def _render_cells_qimage(self, columns: int) -> Optional[QImage]:
-        """Compose each NCER cell into one Indexed8 slot, ``columns`` slots
-        per row. Slot size = ``(max_cell_w, max_cell_h)`` so the grid is
-        uniform and round-trip slicing on import is deterministic. Each
-        cell sits at the top-left of its slot (origin = its xmin/ymin)
-        — fixes the cell's pixel positions to a known offset.
-
-        Indexed8 + 256-colour table mirrors the raw-tiles export, so PNG
-        round-trips through Aseprite/GIMP without losing the palette.
-        """
-        if self._current_decoded is None:
+        ctx = self._cell_ctx()
+        if ctx is None:
             return None
-        d = self._current_decoded
-        layout = self._cell_layout()
-        if layout is None:
-            return None
-        rects, max_w, max_h = layout
-        n_cells = len(d.ncer.cells)
-        columns = max(1, min(columns, n_cells))
-        rows = (n_cells + columns - 1) // columns
-
-        img = self._make_indexed8_canvas(max_w * columns, max_h * rows)
-        for ci, cell in enumerate(d.ncer.cells):
-            col = ci % columns
-            row = ci // columns
-            xmin, ymin, _, _ = rects[ci]
-            self._paint_cell_indexed8(
-                img, cell, col * max_w, row * max_h, xmin, ymin,
-            )
-        return img
+        return shared_render_cells_qimage(ctx, columns)
 
     def _render_one_cell_qimage(self, cell_idx: int) -> Optional[QImage]:
-        """Single cell rendered at the union slot size (max_w × max_h
-        over all 5 cells). Cell content top-left aligned; the rest is
-        transparent gutter. Same Indexed8 + colour table as the
-        composite renderer so the two formats are pixel-compatible."""
-        if self._current_decoded is None:
+        ctx = self._cell_ctx()
+        if ctx is None:
             return None
-        d = self._current_decoded
-        layout = self._cell_layout()
-        if layout is None:
-            return None
-        rects, max_w, max_h = layout
-        if not (0 <= cell_idx < len(d.ncer.cells)):
-            return None
-        img = self._make_indexed8_canvas(max_w, max_h)
-        xmin, ymin, _, _ = rects[cell_idx]
-        self._paint_cell_indexed8(
-            img, d.ncer.cells[cell_idx], 0, 0, xmin, ymin,
-        )
-        return img
+        return shared_render_one_cell_qimage(ctx, cell_idx)
 
     def _refresh_sheet_preview(self) -> None:
         if self._current_decoded is None:
@@ -1385,18 +1305,10 @@ class BtchrBrowser(QWidget):
     def _import_cells_png(self, img: QImage, d: btchr.BtchrDigimon) -> None:
         """Round-trip a cells-mode PNG back into the tile bank.
 
-        The PNG is sliced into the same uniform grid the cell exporter
-        produced (slot size = max bbox over all cells), and for each cell
-        every OAM's pixel rectangle is decoded straight into its target
-        tile range using the inverse of render_cell_rgba's flip + tile
-        formulas.
-
-        Tiles not referenced by any OAM are preserved from the live tile
-        bytes so editing one cell doesn't accidentally wipe storage that
-        only other (possibly never-visualised) sub-bank tiles use. Tiles
-        referenced by multiple OAMs are last-write-wins — matching the
-        engine's behaviour where shared tiles render identically wherever
-        they're sampled.
+        Delegates the OAM-inverse decode to ``cell_png_io``; this method
+        handles BTCHR-specific bits: reading the embedded column count,
+        deciding whether to rebuild the palette (the checkbox), and
+        wrapping the result in a ReplaceSpriteCommand.
         """
         layout = self._cell_layout()
         if layout is None:
@@ -1405,7 +1317,6 @@ class BtchrBrowser(QWidget):
                 "Current digimon has no cells — nothing to import.",
             )
             return
-        rects, max_w, max_h = layout
         n_cells = len(d.ncer.cells)
 
         # Columns comes from the PNG when available, else the live spinner.
@@ -1418,24 +1329,9 @@ class BtchrBrowser(QWidget):
                 columns = max(1, min(n_cells, self._sheet_columns_spin.value()))
         else:
             columns = max(1, min(n_cells, self._sheet_columns_spin.value()))
-        rows = (n_cells + columns - 1) // columns
-        expected_w = max_w * columns
-        expected_h = max_h * rows
-        if img.width() != expected_w or img.height() != expected_h:
-            QMessageBox.critical(
-                self, "Bad image size",
-                f"Cells PNG should be {expected_w}×{expected_h} for "
-                f"{n_cells} cells in {columns} columns; got "
-                f"{img.width()}×{img.height()}.",
-            )
-            return
 
+        # Palette decision — same checkbox semantics as the raw-tiles path.
         use_indexed = img.format() == QImage.Format_Indexed8
-        if not use_indexed:
-            img = img.convertToFormat(QImage.Format_RGBA8888)
-
-        # Same palette-source decision as the raw-tiles importer — see
-        # the comment block there for the full rationale.
         checkbox_on = self._import_pal_with_sheet_cb.isChecked()
         pal_from_plte = (
             use_indexed and checkbox_on and len(img.colorTable()) >= 2
@@ -1454,60 +1350,27 @@ class BtchrBrowser(QWidget):
         else:
             new_palette = list(d.palette)
 
-        # Start from the existing tile bytes so cells with overlapping
-        # tiles and any tiles outside every OAM keep their old contents.
-        new_tiles = bytearray(d.tile_bytes)
-        n_tiles = d.n_tiles
-        tile_mult = d.ncer.boundary_bytes // btchr.BYTES_PER_TILE_8BPP
-
-        for ci, cell in enumerate(d.ncer.cells):
-            col = ci % columns
-            row = ci // columns
-            slot_x = col * max_w
-            slot_y = row * max_h
-            xmin, ymin, _, _ = rects[ci]
-            for o in cell.oams:
-                first_tile = o.tile * tile_mult
-                ox = o.x - xmin
-                oy = o.y - ymin
-                ntw = o.w // 8
-                nth = o.h // 8
-                for ty in range(nth):
-                    for tx in range(ntw):
-                        tile_idx = first_tile + ty * ntw + tx
-                        if tile_idx >= n_tiles:
-                            continue
-                        tile_off = tile_idx * btchr.BYTES_PER_TILE_8BPP
-                        for r in range(8):
-                            sr = (7 - r) if o.vflip else r
-                            dst_y = slot_y + oy + ty * 8 + r
-                            if not (0 <= dst_y < img.height()):
-                                continue
-                            for c in range(8):
-                                sc = (7 - c) if o.hflip else c
-                                dst_x = slot_x + ox + tx * 8 + c
-                                if not (0 <= dst_x < img.width()):
-                                    continue
-                                if use_indexed:
-                                    idx = img.pixelIndex(dst_x, dst_y)
-                                else:
-                                    color = img.pixelColor(dst_x, dst_y)
-                                    if color.alpha() < 128:
-                                        idx = 0
-                                    else:
-                                        idx = nearest_idx_opaque(
-                                            color.red(), color.green(),
-                                            color.blue(), new_palette,
-                                        )
-                                new_tiles[tile_off + sr * 8 + sc] = idx & 0xFF
+        ctx = CellPngContext(
+            ncer=d.ncer,
+            tile_bytes=d.tile_bytes,
+            n_tiles=d.n_tiles,
+            palette=new_palette,
+            is_8bpp=True,
+        )
+        try:
+            new_tiles = import_cells_to_tiles(
+                img, ctx=ctx, layout=layout,
+                columns=columns, palette=new_palette,
+            )
+        except CellPngError as exc:
+            QMessageBox.critical(self, exc.title, exc.message)
+            return
 
         group = self._current_group
         orig_ncgr_raw = sprite.decompress_rle30(
             self._pak.entries[self._ncgr_entry_idx(group)]
         )
-        new_ncgr = sprite.build_ncgr_from_template(
-            bytes(new_tiles), orig_ncgr_raw,
-        )
+        new_ncgr = sprite.build_ncgr_from_template(new_tiles, orig_ncgr_raw)
         compressed = sprite.compress_rle30(new_ncgr)
         replacements = [(BTCHR_PAK, self._ncgr_entry_idx(group), compressed)]
 
@@ -1598,12 +1461,9 @@ class BtchrBrowser(QWidget):
 
         User picks any one ``<base>_cell_<K>.png`` file; siblings for the
         other cells are located by stripping the suffix and re-applying
-        each index. Each cell's pixels are decoded straight into its
-        OAMs' tile ranges (same inverse render path as the composite
-        cells importer). Format and dimensions must match across the
-        set — mixed Indexed8/RGB or off-size cells would require either
-        per-cell palettes (impossible: one NCLR covers all 5) or
-        ambiguous slot layouts.
+        each index. The OAM-inverse decode is delegated to
+        ``cell_png_io.import_per_cell_to_tiles``; this method handles
+        file discovery, palette-rebuild dispatch, and undo wrapping.
         """
         if self._current_decoded is None or self._current_group is None:
             return
@@ -1615,7 +1475,7 @@ class BtchrBrowser(QWidget):
                 "Current digimon has no cells — nothing to import.",
             )
             return
-        rects, max_w, max_h = layout
+        _, max_w, max_h = layout
         n_cells = len(d.ncer.cells)
         path, _ = QFileDialog.getOpenFileName(
             self, "Import per-cell PNGs (pick any cell)",
@@ -1649,56 +1509,22 @@ class BtchrBrowser(QWidget):
                     f"Could not read {sibling}.",
                 )
                 return
-            if cell_img.width() != max_w or cell_img.height() != max_h:
-                QMessageBox.critical(
-                    self, "Bad image size",
-                    f"{os.path.basename(sibling)} is "
-                    f"{cell_img.width()}×{cell_img.height()}; expected "
-                    f"{max_w}×{max_h}.",
-                )
-                return
             pngs.append(cell_img)
 
-        # Format consistency: all 5 cells must agree, because the NCLR is
-        # a single 256-entry table shared by every cell. Indexed PNGs
-        # with diverging palettes would silently produce wrong colours
-        # for cells 1–4 if we used cell 0's table; refusing forces the
-        # user to flatten externally.
-        use_indexed = pngs[0].format() == QImage.Format_Indexed8
-        for ci, p in enumerate(pngs):
-            if (p.format() == QImage.Format_Indexed8) != use_indexed:
-                QMessageBox.critical(
-                    self, "Mixed PNG formats",
-                    f"Cell {ci} PNG format differs from cell 0. Convert "
-                    "all cells to the same format before importing.",
-                )
-                return
-        if not use_indexed:
-            pngs = [p.convertToFormat(QImage.Format_RGBA8888) for p in pngs]
-
-        # Palette source — same checkbox semantics as the composite path,
-        # but the RGB case median-cuts across all 5 cells composited
-        # side-by-side so a colour that only appears in cell 3 still
-        # makes it into the palette.
+        # Palette decision — same checkbox semantics as the composite path.
+        # ``rebuild_palette`` path delegates to the shared helper so the
+        # RGB strip composite stays in one place.
+        first_indexed = pngs[0].format() == QImage.Format_Indexed8
         checkbox_on = self._import_pal_with_sheet_cb.isChecked()
         pal_from_plte = (
-            use_indexed and checkbox_on and len(pngs[0].colorTable()) >= 2
+            first_indexed and checkbox_on and len(pngs[0].colorTable()) >= 2
         )
-        pal_from_quant = (not use_indexed) and checkbox_on
+        pal_from_quant = (not first_indexed) and checkbox_on
         rebuild_palette = pal_from_plte or pal_from_quant
         if rebuild_palette:
-            if pal_from_plte:
-                built = build_palette_from_png(pngs[0], total_slots=256)
-            else:
-                strip = QImage(
-                    max_w * n_cells, max_h, QImage.Format_RGBA8888,
-                )
-                strip.fill(0)
-                painter = QPainter(strip)
-                for ci, p in enumerate(pngs):
-                    painter.drawImage(ci * max_w, 0, p)
-                painter.end()
-                built = build_palette_from_png(strip, total_slots=256)
+            built = build_palette_for_per_cell_import(
+                pngs, total_slots=256, max_w=max_w, max_h=max_h,
+            )
             if built is None:
                 QMessageBox.critical(
                     self, "PNG is fully transparent",
@@ -1710,55 +1536,26 @@ class BtchrBrowser(QWidget):
         else:
             new_palette = list(d.palette)
 
-        new_tiles = bytearray(d.tile_bytes)
-        n_tiles = d.n_tiles
-        tile_mult = d.ncer.boundary_bytes // btchr.BYTES_PER_TILE_8BPP
-
-        for ci, cell in enumerate(d.ncer.cells):
-            src_img = pngs[ci]
-            xmin, ymin, _, _ = rects[ci]
-            for o in cell.oams:
-                first_tile = o.tile * tile_mult
-                ox = o.x - xmin
-                oy = o.y - ymin
-                ntw = o.w // 8
-                nth = o.h // 8
-                for ty in range(nth):
-                    for tx in range(ntw):
-                        tile_idx = first_tile + ty * ntw + tx
-                        if tile_idx >= n_tiles:
-                            continue
-                        tile_off = tile_idx * btchr.BYTES_PER_TILE_8BPP
-                        for r in range(8):
-                            sr = (7 - r) if o.vflip else r
-                            dst_y = oy + ty * 8 + r
-                            if not (0 <= dst_y < src_img.height()):
-                                continue
-                            for c in range(8):
-                                sc = (7 - c) if o.hflip else c
-                                dst_x = ox + tx * 8 + c
-                                if not (0 <= dst_x < src_img.width()):
-                                    continue
-                                if use_indexed:
-                                    idx = src_img.pixelIndex(dst_x, dst_y)
-                                else:
-                                    color = src_img.pixelColor(dst_x, dst_y)
-                                    if color.alpha() < 128:
-                                        idx = 0
-                                    else:
-                                        idx = nearest_idx_opaque(
-                                            color.red(), color.green(),
-                                            color.blue(), new_palette,
-                                        )
-                                new_tiles[tile_off + sr * 8 + sc] = idx & 0xFF
+        ctx = CellPngContext(
+            ncer=d.ncer,
+            tile_bytes=d.tile_bytes,
+            n_tiles=d.n_tiles,
+            palette=new_palette,
+            is_8bpp=True,
+        )
+        try:
+            new_tiles = import_per_cell_to_tiles(
+                pngs, ctx=ctx, layout=layout, palette=new_palette,
+            )
+        except CellPngError as exc:
+            QMessageBox.critical(self, exc.title, exc.message)
+            return
 
         group = self._current_group
         orig_ncgr_raw = sprite.decompress_rle30(
             self._pak.entries[self._ncgr_entry_idx(group)]
         )
-        new_ncgr = sprite.build_ncgr_from_template(
-            bytes(new_tiles), orig_ncgr_raw,
-        )
+        new_ncgr = sprite.build_ncgr_from_template(new_tiles, orig_ncgr_raw)
         compressed = sprite.compress_rle30(new_ncgr)
         replacements = [(BTCHR_PAK, self._ncgr_entry_idx(group), compressed)]
 

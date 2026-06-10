@@ -61,11 +61,15 @@ class StringEditor(QWidget):
         undo_stack: QUndoStack,
         *,
         growable: bool = False,
+        session=None,
+        cursor_key: Optional[str] = None,
     ):
         super().__init__()
         self._strings = strings_in_region
         self._undo_stack = undo_stack
         self._growable = growable
+        self._session = session
+        self._cursor_key = cursor_key
         self._current: Optional[model.GameString] = None
 
         # Debounce the undo-stack push so each keystroke doesn't trigger a
@@ -79,7 +83,15 @@ class StringEditor(QWidget):
         self._build_ui()
         self._populate_string_list()
         if self._strings:
-            self._string_list.setCurrentRow(0)
+            remembered = (
+                self._session.recall_selection(self._cursor_key)
+                if self._session is not None and self._cursor_key is not None
+                else None
+            )
+            if remembered is not None and 0 <= int(remembered) < len(self._strings):
+                self._string_list.setCurrentRow(int(remembered))
+            else:
+                self._string_list.setCurrentRow(0)
 
     # ---- UI construction ---------------------------------------------------
 
@@ -188,6 +200,8 @@ class StringEditor(QWidget):
         if not (0 <= row < len(self._strings)):
             self._set_current(None)
             return
+        if self._session is not None and self._cursor_key is not None:
+            self._session.remember_selection(self._cursor_key, row)
         self._set_current(self._strings[row])
 
     def _set_current(self, s: Optional[model.GameString]) -> None:

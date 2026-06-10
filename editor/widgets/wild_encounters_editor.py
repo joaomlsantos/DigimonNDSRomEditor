@@ -85,17 +85,21 @@ class _EncounterRow:
 
 
 class WildEncountersEditor(QWidget):
+    _CURSOR_KEY = "wild_encounter_areas"
+
     def __init__(
         self,
         version: str,
         areas: List[model.WildEncounterArea],
         undo_stack: QUndoStack,
+        session,
         parent=None,
     ):
         super().__init__(parent)
         self._version = version
         self._areas = areas
         self._undo_stack = undo_stack
+        self._session = session
         self._labels = _build_area_labels(version, areas)
         self._current_ix: int = -1
         self._encounter_rows: List[_EncounterRow] = []
@@ -122,7 +126,9 @@ class WildEncountersEditor(QWidget):
 
         undo_stack.indexChanged.connect(self._on_undo_redo)
         undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
-        self._list_panel.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list_panel.select_index(int(remembered)):
+            self._list_panel.select_first()
 
     def _build_detail_container(self) -> QWidget:
         self._title = QLabel("—")
@@ -167,6 +173,7 @@ class WildEncountersEditor(QWidget):
         if not (0 <= ix < len(self._areas)):
             return
         self._current_ix = ix
+        self._session.remember_selection(self._CURSOR_KEY, ix)
         area = self._areas[ix]
         self._title.setText(f"{self._labels[ix]}    (offset 0x{area.offset:08x})")
 

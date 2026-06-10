@@ -14,6 +14,11 @@ from PySide6.QtWidgets import (
 )
 
 from digimon_core import constants, model
+from digimon_core.stat_progression import (
+    PROGRESSION_STATS,
+    ProgressionMode,
+    compute_expected_stats,
+)
 
 from .._perf import span
 from .digimon_list_panel import DigimonListPanel
@@ -97,8 +102,9 @@ _MOVE_FIELDS: List[Tuple[str, str]] = [
 # is_scannable is rendered as a checkbox (see _build_detail_container);
 # the rest of the misc block are plain spinboxes.
 # (attr, label, byte_width, hex_display, warn_above, warn_message)
+# Level lives in the Stats box (it gates the progression formula and
+# pairs visually with the six combat stats), not Misc.
 _MISC_FIELDS: List[Tuple[str, str, int, bool, Optional[int], str]] = [
-    ("level", "Level", 1, False, _LEVEL_CAP, _CAP_MESSAGE_LEVEL),
     ("dex_habitat", "Dex Habitat", 1, False, None, ""),
     ("exp_curve", "Exp Curve", 4, False, _EXP_CURVE_MAX, _CAP_MESSAGE_EXP_CURVE),
     ("unknown_0x26", "Unknown 0x26", 2, True, None, ""),
@@ -110,6 +116,10 @@ _MISC_FIELDS: List[Tuple[str, str, int, bool, Optional[int], str]] = [
 
 
 class BaseDigimonEditor(QWidget):
+    # Matches the dispatch key in main_window._build_editor_for; used to
+    # save/restore the cursor across editor switches within a session.
+    _CURSOR_KEY = "base_digimon"
+
     def __init__(
         self,
         entries: Dict[int, model.BaseDataDigimon],
@@ -129,8 +139,17 @@ class BaseDigimonEditor(QWidget):
 
         with span("BaseDigimonEditor.__init__"):
             with span("DigimonListPanel"):
+                # Non-Scannable base records are unused slots — the engine
+                # never recruits or scans them, so flag them visually so the
+                # user can tell at a glance which rows carry live data.
                 self._list_panel = DigimonListPanel(
-                    entries, label_for=self._list_label_for, dirty_aware=True,
+                    entries,
+                    label_for=self._list_label_for,
+                    dirty_aware=True,
+                    dim_for=lambda did: not bool(
+                        getattr(entries.get(did), "is_scannable", 0)
+                    ),
+                    legend="dim = not Scannable (unused slot)",
                 )
             self._list_panel.digimonSelected.connect(self._on_selection)
 
@@ -162,8 +181,10 @@ class BaseDigimonEditor(QWidget):
             undo_stack.indexChanged.connect(self._refresh_list_label_for_current)
             undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
 
-            with span("select_first"):
-                self._list_panel.select_first()
+            with span("restore_selection"):
+                remembered = self._session.recall_selection(self._CURSOR_KEY)
+                if remembered is None or not self._list_panel.select_by_id(int(remembered)):
+                    self._list_panel.select_first()
 
     def select_by_id(self, digimon_id: int) -> bool:
         return self._list_panel.select_by_id(digimon_id)
@@ -198,24 +219,48 @@ class BaseDigimonEditor(QWidget):
         identity_form.addRow("Species", self._species_combo)
         identity_form.addRow("Type", self._type_combo)
 
+        # Reverse link to the enemy editor — counts enemy records that
+        # advertise this base's species, plus how many have stats
+        # outside the ±10% band the enemy editor uses as its
+        # divergence cue. The label is muted because it's an
+        # informational footer, not a knob.
+        self._used_by_label = QLabel("—")
+        self._used_by_label.setStyleSheet("color: palette(mid);")
+        self._used_by_label.setWordWrap(True)
+        identity_form.addRow("Used by", self._used_by_label)
+
         with span("SpriteMapRow"):
             self._sprite_row = SpriteMapRow(
                 self._sprite_map, self._battle_strings, self._undo_stack, self._session,
             )
 
-        # Stats and resistances are 8 fields each — laid out as 2 rows × 4
-        # label+value pairs so the entire detail form fits on one screen.
+        # Stats laid out as 2 label+value pairs per row (4 rows of 2)
+        # plus Level on its own top row — Level drives the progression
+        # formula, so visually anchoring it above the stats it gates
+        # reads cleaner than burying it in Misc.
         self._stat_widgets: Dict[str, BoundSpinBox] = {}
         stats_box = QGroupBox("Stats")
-        stats_grid = _make_compact_grid(stats_box, cols=4)
+        stats_grid = _make_compact_grid(stats_box, cols=2)
+        # Misc-style "level" widget kept in _misc_widgets for callers
+        # that still index it by name (the sidecar's live-update hook).
+        self._misc_widgets: Dict[str, object] = {}
+        level_spin = BoundSpinBox(
+            first, "level", 1, self._undo_stack,
+            warn_above=_LEVEL_CAP, warn_message=_CAP_MESSAGE_LEVEL,
+        )
+        self._misc_widgets["level"] = level_spin
+        stats_grid.addWidget(QLabel("Level"), 0, 0)
+        stats_grid.addWidget(level_spin, 0, 1)
         for ix, (attr, label, width, hex_disp, warn_cap, warn_msg) in enumerate(_STAT_FIELDS):
             spin = BoundSpinBox(
                 first, attr, width, self._undo_stack,
                 hex_display=hex_disp, warn_above=warn_cap, warn_message=warn_msg,
             )
             self._stat_widgets[attr] = spin
-            stats_grid.addWidget(QLabel(label), ix // 4, (ix % 4) * 2)
-            stats_grid.addWidget(spin, ix // 4, (ix % 4) * 2 + 1)
+            row = 1 + ix // 2
+            col = (ix % 2) * 2
+            stats_grid.addWidget(QLabel(label), row, col)
+            stats_grid.addWidget(spin, row, col + 1)
 
         self._res_widgets: Dict[str, BoundSpinBox] = {}
         res_box = QGroupBox("Resistances")
@@ -255,7 +300,6 @@ class BaseDigimonEditor(QWidget):
                 self._move_rows[attr] = row
                 moves_form.addRow(label, row)
 
-        self._misc_widgets: Dict[str, object] = {}
         misc_box = QGroupBox("Misc")
         misc_form = make_form(misc_box)
         scannable_check = BoundCheckBox(first, "is_scannable", self._undo_stack)
@@ -292,6 +336,12 @@ class BaseDigimonEditor(QWidget):
         content_layout.addWidget(misc_box)
         content_layout.addStretch(1)
 
+        # Per-stat edits move the divergence count against the matched
+        # enemy entry. Cheaper to refresh just the footer than to redo
+        # the whole form refresh.
+        for spin in self._stat_widgets.values():
+            spin.valueChanged.connect(lambda _v: self._refresh_used_by_label())
+
         with span("wrap_in_scroll"):
             return wrap_in_scroll(content)
 
@@ -302,6 +352,7 @@ class BaseDigimonEditor(QWidget):
         if target is None:
             return
         self._current_id = digimon_id
+        self._session.remember_selection(self._CURSOR_KEY, digimon_id)
         self._title.setText(self._title_for(target))
 
         self._id_spin.rebind(target)
@@ -318,6 +369,7 @@ class BaseDigimonEditor(QWidget):
             row.rebind(target)
         for spin in self._misc_widgets.values():
             spin.rebind(target)
+        self._refresh_used_by_label()
 
     def _refresh_form(self, _index: int) -> None:
         target = self._entries.get(self._current_id)
@@ -338,6 +390,49 @@ class BaseDigimonEditor(QWidget):
             row.refresh()
         for spin in self._misc_widgets.values():
             spin.refresh()
+        self._refresh_used_by_label()
+
+    def _refresh_used_by_label(self) -> None:
+        """Recompute the "Enemy entry: in sync / N stats diverge" line.
+
+        Enemy and base records share an id space (per the sprite-map
+        memory note), so the link is 1:1 — there's at most one enemy
+        entry for each base id. Divergence counts how many of the six
+        progression stats fall outside the ±10% band when the level-up
+        formula is walked from the base at FIXED_AVG. HP buff is
+        intentionally *not* applied here so the count doesn't depend on
+        the enemy-editor's display toggle.
+        """
+        target = self._entries.get(self._current_id)
+        if target is None:
+            self._used_by_label.setText("—")
+            return
+        enemy = self._session.enemy_digimon.get(self._current_id)
+        if enemy is None:
+            self._used_by_label.setText("No matching enemy entry")
+            return
+        avg = compute_expected_stats(
+            target, int(enemy.level),
+            mode=ProgressionMode.FIXED_AVG,
+            apply_hp_buff=False,
+        )
+        diverge = 0
+        for stat in PROGRESSION_STATS:
+            expected = avg.stats[stat]
+            if expected <= 0:
+                continue
+            actual = int(getattr(enemy, stat))
+            if abs(actual - expected) / expected > 0.10:
+                diverge += 1
+        if diverge == 0:
+            self._used_by_label.setText(
+                f"Enemy entry @ L{int(enemy.level)}: in sync with base"
+            )
+        else:
+            self._used_by_label.setText(
+                f"Enemy entry @ L{int(enemy.level)}: "
+                f"{diverge}/{len(PROGRESSION_STATS)} stats diverge from base"
+            )
 
     def _list_label_for(self, digimon_id: int) -> str:
         """Decorate the left-pane label with a [displayed-as] suffix.
@@ -399,6 +494,16 @@ def base_digimon_issues(entries: Dict[int, model.BaseDataDigimon]) -> List[Valid
                     editor_key="base_digimon",
                     record_id=did,
                 ))
+        # Level lives in the Stats box visually but the widget table
+        # doesn't carry it — apply the cap inline.
+        if rec.level > _LEVEL_CAP:
+            issues.append(ValidationIssue(
+                section="Base Digimon",
+                category="Level",
+                message=f"{name} — Level {rec.level} exceeds the cap of {_LEVEL_CAP}.",
+                editor_key="base_digimon",
+                record_id=did,
+            ))
         for attr, label, _w, _h, cap, _msg in _MISC_FIELDS:
             if cap is None:
                 continue

@@ -130,6 +130,8 @@ def compute_mchr_labels(session) -> List[str]:
 class MchrBrowser(QWidget):
     """Read-only browser for the MCHR_CHR + MCHR_PAL overworld-sprite pair."""
 
+    _CURSOR_KEY = "mchr_browser"
+
     def __init__(self, session, undo_stack: Optional[QUndoStack] = None, parent=None):
         super().__init__(parent)
         self._session = session
@@ -173,7 +175,9 @@ class MchrBrowser(QWidget):
         self._labels: List[str] = self._build_index_labels()
 
         self._build_ui()
-        self._list.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list.select_index(int(remembered)):
+            self._list.select_first()
 
     # ---- labels ---------------------------------------------------------
 
@@ -278,9 +282,9 @@ class MchrBrowser(QWidget):
         # horizontal strip) and a companion palette PNG (16×1 RGB888). Two
         # separate buttons rather than one combined export — users editing
         # only the palette shouldn't have to round-trip the whole sheet.
-        self._export_btn = QPushButton("Export PNG…")
+        self._export_btn = QPushButton("Export frames sheet PNG…")
         self._export_btn.clicked.connect(self._on_export_png)
-        self._import_btn = QPushButton("Import PNG…")
+        self._import_btn = QPushButton("Import frames sheet PNG…")
         self._import_btn.clicked.connect(self._on_import_png)
         self._export_pal_btn = QPushButton("Export palette PNG…")
         self._export_pal_btn.clicked.connect(self._on_export_palette_png)
@@ -382,6 +386,7 @@ class MchrBrowser(QWidget):
 
     def _on_index_selected(self, ix: int) -> None:
         self._current_idx = ix
+        self._session.remember_selection(self._CURSOR_KEY, ix)
         self._current_frame = 0
         # Default palette tracks sprite index — correct for 0..662, an
         # informed guess past that until the user picks a better one.
@@ -538,7 +543,7 @@ class MchrBrowser(QWidget):
             return
         suggested = f"mchr_chr_0x{self._current_idx:04x}.png"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export sprite PNG", suggested, "PNG (*.png)"
+            self, "Export frames sheet PNG", suggested, "PNG (*.png)"
         )
         if not path:
             return

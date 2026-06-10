@@ -35,15 +35,19 @@ def _record_label(_ix: int, rec: model.Consumable) -> str:
 
 
 class ConsumableEditor(QWidget):
+    _CURSOR_KEY = "consumables"
+
     def __init__(
         self,
         records: List[model.Consumable],
         undo_stack: QUndoStack,
+        session,
         parent=None,
     ):
         super().__init__(parent)
         self._records = records
         self._undo_stack = undo_stack
+        self._session = session
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
@@ -65,7 +69,9 @@ class ConsumableEditor(QWidget):
 
         undo_stack.indexChanged.connect(self._refresh_form)
         undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
-        self._list_panel.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list_panel.select_index(int(remembered)):
+            self._list_panel.select_first()
 
     def select_by_id(self, item_id: int) -> bool:
         for ix, rec in enumerate(self._records):
@@ -124,6 +130,7 @@ class ConsumableEditor(QWidget):
         if not (0 <= ix < len(self._records)):
             return
         self._current_ix = ix
+        self._session.remember_selection(self._CURSOR_KEY, ix)
         target = self._records[ix]
         self._title.setText(
             f"{_item_name(target.id)}    (offset 0x{target.offset:08x}, id 0x{target.id:03x})"

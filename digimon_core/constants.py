@@ -241,6 +241,59 @@ EQUIPMENT_OFFSETS = {
 
 STAGE_NAMES = ["IN-TRAINING", "ROOKIE", "CHAMPION", "ULTIMATE", "MEGA"]
 
+# Stage windows over the base-data id space. The 0xBA hole inside the
+# Champion range is the only known carve-out (lifted verbatim from
+# DWDDRandomizer/src/utils.py:getDigimonStage). Ids outside every
+# window fall back to "" so callers can treat that as "unstaged" rather
+# than mis-classify NPC slots that happen to land in a numeric range.
+STAGE_ID_RANGES = (
+    ("IN-TRAINING", 0x41, 0x57, ()),
+    ("ROOKIE",      0x61, 0x9D, ()),
+    ("CHAMPION",    0xA8, 0x115, (0xBA,)),
+    ("ULTIMATE",    0x120, 0x188, ()),
+    ("MEGA",        0x191, 0x1F4, ()),
+)
+
+
+# Per-DigimonType level-up gains, mirrored from DWDDRandomizer (the
+# table is documented in-ROM at LVLUP_TYPE_TABLE_OFFSET but the editor
+# doesn't read it yet — we ship the constant verbatim so the "expected
+# stats" sidecar agrees with the randomizer formula). Rows index by
+# DigimonType.value (BALANCE=0..MPTYPE=6). Each row holds six
+# [max_gain, base_gain] pairs in stat order (HP, MP, attack, defense,
+# spirit, speed). Per-level update: stat += (roll + base) // 10 where
+# roll is in [1, max] for the random mode and clamped to min/avg/max
+# for the deterministic modes the editor uses for previewing.
+LEVEL_UP_TABLE = (
+    # BALANCE
+    ((60, 90), (45, 75), (12, 14), (12, 14), (12, 14), (11, 16)),
+    # ATTACKER
+    ((75, 85), (55, 65), (14, 20), (12, 15), (10, 14), (14, 13)),
+    # TANK
+    ((55, 125), (30, 85), (11, 15), (13, 21), (12, 10), (14, 14)),
+    # TECHNICAL
+    ((45, 100), (40, 100), (11, 13), (11, 13), (12, 21), (11, 17)),
+    # SPEED
+    ((50, 90), (40, 75), (10, 12), (10, 15), (12, 18), (12, 22)),
+    # HPTYPE
+    ((60, 150), (45, 65), (9, 17), (15, 15), (10, 15), (13, 15)),
+    # MPTYPE
+    ((50, 95), (55, 120), (10, 14), (9, 14), (11, 20), (8, 18)),
+)
+
+# Optional HP multiplier per stage. Mirrors WILD_DIGIMON_HP_BUFF_BY_STAGE
+# from the randomizer's configs.py — the editor surfaces this as a toggle
+# so users previewing expected stats can match the randomizer's output
+# (which scales boss/wild HP up so higher stages feel meatier). Default
+# (toggle off) treats every stage as 1×.
+HP_BUFF_BY_STAGE = {
+    "IN-TRAINING": 1,
+    "ROOKIE": 1,
+    "CHAMPION": 3,
+    "ULTIMATE": 4,
+    "MEGA": 5,
+}
+
 DIGIMON_ID_TO_STR = {
     0x41: "Chicchimon",
     0x42: "Koromon",

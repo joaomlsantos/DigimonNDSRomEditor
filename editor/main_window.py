@@ -33,6 +33,10 @@ from .changelog import changelog_dir, changelog_root, record_save, rom_hash
 from .prefs import prefs
 from .session import RomSession
 from digimon_core import rom as rom_module
+from .widgets.cell_export_policy import (
+    allow_shared_tile_exports,
+    set_allow_shared_tile_exports,
+)
 from .widgets.form_helpers import (
     clear_details_providers,
     clear_nav_handlers,
@@ -208,6 +212,24 @@ class MainWindow(QMainWindow):
         self.action_show_unknowns.setChecked(unknown_fields_visible())
         self.action_show_unknowns.toggled.connect(set_unknown_fields_visible)
 
+        # Off by default — shared-tile sprites can't be round-tripped
+        # through cell-mode IO. Persisted in the .ini via
+        # ``cell_export_policy.set_allow_shared_tile_exports``. The
+        # confirm dialog *always* fires when enabling (per the user's
+        # spec), not "first time only" — there's no muscle-memory path
+        # to flipping this on without being reminded what it means.
+        self.action_allow_cell_shared = QAction(
+            "Allow cell exports for shared-tile sprites", self,
+        )
+        self.action_allow_cell_shared.setCheckable(True)
+        self.action_allow_cell_shared.setChecked(allow_shared_tile_exports())
+        # `triggered(bool)` fires after the check state has already
+        # flipped, so the dialog opens with the action visually checked
+        # — and we can roll the check back if the user cancels.
+        self.action_allow_cell_shared.triggered.connect(
+            self._on_toggle_allow_cell_shared,
+        )
+
         self.action_open_changelog = QAction("Open &Changelog Folder", self)
         self.action_open_changelog.triggered.connect(self._on_open_changelog)
 
@@ -252,6 +274,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.action_redo)
         edit_menu.addSeparator()
         edit_menu.addAction(self.action_show_unknowns)
+        edit_menu.addAction(self.action_allow_cell_shared)
 
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction(self.action_about)
@@ -482,6 +505,38 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot open changelog folder", str(exc))
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def _on_toggle_allow_cell_shared(self, checked: bool) -> None:
+        """Edit-menu hook for the shared-tile cell-export policy.
+
+        The confirm dialog always fires when enabling (per spec) so
+        there's no muscle-memory path to flipping the policy on without
+        being reminded the round-trip is unsafe. Cancel rolls the menu
+        check back to its prior state via ``blockSignals`` so the
+        rollback ``setChecked`` doesn't re-enter this handler.
+        """
+        if checked:
+            choice = QMessageBox.warning(
+                self,
+                "Allow cell exports for shared-tile sprites?",
+                "Cell-mode export/import treats each OAM as an "
+                "independent tile region. Sprites that reuse tile data "
+                "across OAMs (common for icons and portraits) can't be "
+                "round-tripped this way — re-importing an edited PNG "
+                "will produce visual artifacts on the cells that share "
+                "the affected tiles.\n\n"
+                "Use \"Export tiles PNG\" / \"Import tiles PNG\" instead "
+                "for these sprites whenever possible.\n\n"
+                "Enable cell exports on shared-tile sprites anyway?",
+                QMessageBox.Ok | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if choice != QMessageBox.Ok:
+                self.action_allow_cell_shared.blockSignals(True)
+                self.action_allow_cell_shared.setChecked(False)
+                self.action_allow_cell_shared.blockSignals(False)
+                return
+        set_allow_shared_tile_exports(checked)
 
     def _show_about(self) -> None:
         dlg = QDialog(self)
@@ -998,9 +1053,9 @@ class MainWindow(QMainWindow):
                 self.session,
             )
         if key == "moves":
-            return MoveEditor(self.session.moves, self.undo_stack)
+            return MoveEditor(self.session.moves, self.undo_stack, self.session)
         if key == "standard_digivolutions":
-            widget = StandardDigivolutionEditor(self.session.standard_digivolutions, self.undo_stack)
+            widget = StandardDigivolutionEditor(self.session.standard_digivolutions, self.undo_stack, self.session)
             widget.treeRequested.connect(self.navigate_to_digivolution_tree)
             return widget
         if key == "digivolution_trees":
@@ -1010,11 +1065,11 @@ class MainWindow(QMainWindow):
             )
             return widget
         if key == "armor_digivolutions":
-            return ArmorDigivolutionEditor(self.session.armor_digivolutions, self.undo_stack)
+            return ArmorDigivolutionEditor(self.session.armor_digivolutions, self.undo_stack, self.session)
         if key == "dna_digivolutions":
-            return DNADigivolutionEditor(self.session.dna_digivolutions, self.undo_stack)
+            return DNADigivolutionEditor(self.session.dna_digivolutions, self.undo_stack, self.session)
         if key == "quests":
-            return QuestEditor(self.session.quests, self.undo_stack)
+            return QuestEditor(self.session.quests, self.undo_stack, self.session)
         if key == "starters":
             return StartersEditor(self.session.starters, self.undo_stack)
         if key == "wild_encounter_areas":
@@ -1022,19 +1077,20 @@ class MainWindow(QMainWindow):
                 self.session.version,
                 self.session.wild_encounter_areas,
                 self.undo_stack,
+                self.session,
             )
         if key == "encounter_rewards":
-            return EncounterRewardsEditor(self.session.encounter_rewards, self.undo_stack)
+            return EncounterRewardsEditor(self.session.encounter_rewards, self.undo_stack, self.session)
         if key == "habitats_worldmap":
-            return HabitatsWorldmapEditor(self.session.habitats_worldmap, self.undo_stack)
+            return HabitatsWorldmapEditor(self.session.habitats_worldmap, self.undo_stack, self.session)
         if key == "farm_terrains":
-            return FarmTerrainsEditor(self.session.farm_terrains, self.undo_stack)
+            return FarmTerrainsEditor(self.session.farm_terrains, self.undo_stack, self.session)
         if key == "equipment":
-            return EquipmentEditor(self.session.equipment, self.undo_stack)
+            return EquipmentEditor(self.session.equipment, self.undo_stack, self.session)
         if key == "consumables":
-            return ConsumableEditor(self.session.consumables, self.undo_stack)
+            return ConsumableEditor(self.session.consumables, self.undo_stack, self.session)
         if key == "farm_items":
-            return FarmItemEditor(self.session.farm_items, self.undo_stack)
+            return FarmItemEditor(self.session.farm_items, self.undo_stack, self.session)
         if key == "qol_settings":
             return QolEditor(self.session.qol, self.undo_stack)
         if key == "sprite_browser":
@@ -1056,7 +1112,13 @@ class MainWindow(QMainWindow):
             # MSG.PAK rides the §12 grow path on save, so over-budget edits
             # aren't an error here — let the editor show informational text
             # rather than a red warning.
-            return StringEditor(merged, self.undo_stack, growable=(bucket == "msgpak"))
+            return StringEditor(
+                merged,
+                self.undo_stack,
+                growable=(bucket == "msgpak"),
+                session=self.session,
+                cursor_key=key,
+            )
         return None
 
     # ---- cross-reference navigation --------------------------------------

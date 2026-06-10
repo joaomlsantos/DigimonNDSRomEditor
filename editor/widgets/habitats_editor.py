@@ -108,15 +108,19 @@ class _SpeciesFlagsRow(QWidget):
 
 
 class HabitatsWorldmapEditor(QWidget):
+    _CURSOR_KEY = "habitats_worldmap"
+
     def __init__(
         self,
         records: List[model.HabitatWorldmap],
         undo_stack: QUndoStack,
+        session,
         parent=None,
     ):
         super().__init__(parent)
         self._records = records
         self._undo_stack = undo_stack
+        self._session = session
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
@@ -138,7 +142,9 @@ class HabitatsWorldmapEditor(QWidget):
 
         undo_stack.indexChanged.connect(self._refresh_form)
         undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
-        self._list_panel.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list_panel.select_index(int(remembered)):
+            self._list_panel.select_first()
 
     def _add_field(self, form, label: str, widget) -> None:
         form.addRow(label, widget)
@@ -202,6 +208,7 @@ class HabitatsWorldmapEditor(QWidget):
         if not (0 <= ix < len(self._records)):
             return
         self._current_ix = ix
+        self._session.remember_selection(self._CURSOR_KEY, ix)
         target = self._records[ix]
         self._title.setText(f"{_location_name(ix)}    (offset 0x{target.offset:08x})")
         for w in self._all_widgets:

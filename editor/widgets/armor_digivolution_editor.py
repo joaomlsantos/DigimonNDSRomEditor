@@ -96,15 +96,19 @@ class _ConditionRow(QWidget):
 
 
 class ArmorDigivolutionEditor(QWidget):
+    _CURSOR_KEY = "armor_digivolutions"
+
     def __init__(
         self,
         records: List[model.ArmorDigivolution],
         undo_stack: QUndoStack,
+        session,
         parent=None,
     ):
         super().__init__(parent)
         self._records = records
         self._undo_stack = undo_stack
+        self._session = session
         self._current_ix: int = -1
 
         self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
@@ -125,7 +129,9 @@ class ArmorDigivolutionEditor(QWidget):
 
         undo_stack.indexChanged.connect(self._refresh_form)
         undo_stack.indexChanged.connect(self._list_panel.refresh_dirty_state)
-        self._list_panel.select_first()
+        remembered = self._session.recall_selection(self._CURSOR_KEY)
+        if remembered is None or not self._list_panel.select_index(int(remembered)):
+            self._list_panel.select_first()
 
     def _build_detail_container(self) -> QWidget:
         first = self._records[0]
@@ -200,6 +206,7 @@ class ArmorDigivolutionEditor(QWidget):
         if not (0 <= ix < len(self._records)):
             return
         self._current_ix = ix
+        self._session.remember_selection(self._CURSOR_KEY, ix)
         target = self._records[ix]
         self._title.setText(self._title_for(ix, target))
         for w in (self._digimon_row, self._item_row, self._evo_row, self._degen_row):
