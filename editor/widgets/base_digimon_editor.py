@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QSplitter,
@@ -18,6 +19,7 @@ from digimon_core.stat_progression import (
     PROGRESSION_STATS,
     ProgressionMode,
     compute_expected_stats,
+    per_level_gain_by_type,
 )
 
 from .._perf import span
@@ -29,7 +31,6 @@ from .form_helpers import (
     BoundIdCombo,
     BoundIdComboRow,
     BoundSpinBox,
-    _make_compact_grid,
     add_unknown_form_row,
     make_form,
     wrap_in_scroll,
@@ -113,6 +114,28 @@ _MISC_FIELDS: List[Tuple[str, str, int, bool, Optional[int], str]] = [
 ]
 
 
+# Stats whose per-level gain is ≥ this fraction of the cross-type mean
+# are colored as a StatType "specialization" in the Growth row. 1.15
+# keeps the BALANCE archetype unhighlighted (it's the average by
+# construction) while still surfacing each non-BALANCE type's
+# signature stat(s). Tuned empirically against LEVEL_UP_TABLE.
+_GROWTH_EMPHASIS_RATIO = 1.15
+
+
+def _cross_type_mean_gains() -> Dict[str, float]:
+    """Per-stat mean of average per-level gain across all DigimonType rows.
+
+    Used as the baseline for the Growth row's emphasis: a stat whose
+    gain is notably above this mean is what that StatType is for. Cheap
+    enough to recompute on demand; if it ever becomes hot we can
+    @lru_cache it.
+    """
+    sums: Dict[str, float] = {name: 0.0 for name in PROGRESSION_STATS}
+    n_types = len(constants.LEVEL_UP_TABLE)
+    for type_ix in range(n_types):
+        for name, gain in per_level_gain_by_type(type_ix).items():
+            sums[name] += gain
+    return {name: total / n_types for name, total in sums.items()}
 
 
 class BaseDigimonEditor(QWidget):
@@ -211,13 +234,14 @@ class BaseDigimonEditor(QWidget):
 
         self._id_spin = BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True)
         self._species_combo = BoundEnumCombo(first, "species", model.Species, self._undo_stack)
+        # StatType lives in the Stats box next to Level — it pairs with
+        # the per-stat values rather than the species/identity row.
         self._type_combo = BoundEnumCombo(first, "digimon_type", model.DigimonType, self._undo_stack)
 
         identity_box = QGroupBox("Identity")
         identity_form = make_form(identity_box)
         identity_form.addRow("ID", self._id_spin)
         identity_form.addRow("Species", self._species_combo)
-        identity_form.addRow("Type", self._type_combo)
 
         # Reverse link to the enemy editor — counts enemy records that
         # advertise this base's species, plus how many have stats
@@ -234,42 +258,25 @@ class BaseDigimonEditor(QWidget):
                 self._sprite_map, self._battle_strings, self._undo_stack, self._session,
             )
 
-        # Stats laid out as 2 label+value pairs per row (4 rows of 2)
-        # plus Level on its own top row — Level drives the progression
-        # formula, so visually anchoring it above the stats it gates
-        # reads cleaner than burying it in Misc.
+        # Stats laid out as a horizontal table — one column per stat,
+        # values in a single row underneath the stat-name headers. Mirrors
+        # the enemy editor's structure for visual parity. Level drives the
+        # progression formula and sits on its own header row above the
+        # table, like the enemy editor. Aptitude is kept in the table
+        # alongside the combat stats (it gates starter level caps, but
+        # visually belongs with the per-stat values).
         self._stat_widgets: Dict[str, BoundSpinBox] = {}
-        stats_box = QGroupBox("Stats")
-        stats_grid = _make_compact_grid(stats_box, cols=2)
+        # Per-level average gain shown muted below each stat — only the
+        # StatType drives these, so the row updates whenever the type
+        # combo changes (makes the gameplay impact of StatType obvious).
+        self._gain_labels: Dict[str, QLabel] = {}
         # Misc-style "level" widget kept in _misc_widgets for callers
         # that still index it by name (the sidecar's live-update hook).
         self._misc_widgets: Dict[str, object] = {}
-        level_spin = BoundSpinBox(
-            first, "level", 1, self._undo_stack,
-            warn_above=_LEVEL_CAP, warn_message=_CAP_MESSAGE_LEVEL,
-        )
-        self._misc_widgets["level"] = level_spin
-        stats_grid.addWidget(QLabel("Level"), 0, 0)
-        stats_grid.addWidget(level_spin, 0, 1)
-        for ix, (attr, label, width, hex_disp, warn_cap, warn_msg) in enumerate(_STAT_FIELDS):
-            spin = BoundSpinBox(
-                first, attr, width, self._undo_stack,
-                hex_display=hex_disp, warn_above=warn_cap, warn_message=warn_msg,
-            )
-            self._stat_widgets[attr] = spin
-            row = 1 + ix // 2
-            col = (ix % 2) * 2
-            stats_grid.addWidget(QLabel(label), row, col)
-            stats_grid.addWidget(spin, row, col + 1)
+        stats_box = self._build_stats_box(first)
 
         self._res_widgets: Dict[str, BoundSpinBox] = {}
-        res_box = QGroupBox("Resistances")
-        res_grid = _make_compact_grid(res_box, cols=4)
-        for ix, (attr, label) in enumerate(_RES_FIELDS):
-            spin = BoundSpinBox(first, attr, 2, self._undo_stack)
-            self._res_widgets[attr] = spin
-            res_grid.addWidget(QLabel(label), ix // 4, (ix % 4) * 2)
-            res_grid.addWidget(spin, ix // 4, (ix % 4) * 2 + 1)
+        res_box = self._build_resistances_box(first)
 
         # Sentinel values for "no trait" / "no move" slots — all-bits-set for
         # the field's byte width. Base digimon trait fields are 1 byte → 0xFF;
@@ -345,6 +352,183 @@ class BaseDigimonEditor(QWidget):
         with span("wrap_in_scroll"):
             return wrap_in_scroll(content)
 
+    def _build_stats_box(self, first: model.BaseDataDigimon) -> QWidget:
+        """Stats box laid out as a horizontal table — one column per
+        stat with the editable value in a single row underneath the
+        stat-name header. Level sits on its own header row above the
+        table since it gates the progression formula (mirrors the
+        enemy editor's layout).
+        """
+        box = QGroupBox("Stats")
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(4)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
+        top_row.addWidget(QLabel("Level"))
+        level_spin = BoundSpinBox(
+            first, "level", 1, self._undo_stack,
+            warn_above=_LEVEL_CAP, warn_message=_CAP_MESSAGE_LEVEL,
+        )
+        self._misc_widgets["level"] = level_spin
+        top_row.addWidget(level_spin)
+        top_row.addSpacing(16)
+        top_row.addWidget(QLabel("StatType"))
+        top_row.addWidget(self._type_combo)
+        top_row.addStretch(1)
+        outer.addLayout(top_row)
+
+        table = QGridLayout()
+        table.setContentsMargins(0, 4, 0, 0)
+        table.setHorizontalSpacing(8)
+        table.setVerticalSpacing(2)
+
+        # Column 0 is the row-label column ("Current" / "Growth"),
+        # matching the enemy editor's Current/Expected/Range layout.
+        # Stat columns start at 1.
+        for ix, (attr, label, _w, _h, _cap, _msg) in enumerate(_STAT_FIELDS):
+            header = QLabel(label)
+            header.setAlignment(Qt.AlignCenter)
+            header.setStyleSheet("font-weight: bold;")
+            table.addWidget(header, 0, 1 + ix)
+
+        cur_lbl = QLabel("Current")
+        cur_lbl.setStyleSheet("color: palette(mid);")
+        table.addWidget(cur_lbl, 1, 0)
+        for ix, (attr, label, width, hex_disp, warn_cap, warn_msg) in enumerate(_STAT_FIELDS):
+            spin = BoundSpinBox(
+                first, attr, width, self._undo_stack,
+                hex_display=hex_disp, warn_above=warn_cap, warn_message=warn_msg,
+            )
+            spin.setAlignment(Qt.AlignCenter)
+            self._stat_widgets[attr] = spin
+            table.addWidget(spin, 1, 1 + ix)
+
+        # Per-level avg gain row — muted, centred. Evasion and Aptitude
+        # don't grow, so their cells stay as em-dashes. Whichever stats
+        # the active StatType specializes in get an accent color (see
+        # _refresh_growth_preview) so the archetype's identity reads at
+        # a glance — that's the whole reason to expose the row.
+        # Reads "<StatType> Growth" (e.g. "ATTACKER Growth") and
+        # re-renders as the combo changes — keeps the connection
+        # between archetype and per-level gains explicit at a glance.
+        self._growth_row_label = QLabel("Growth")
+        self._growth_row_label.setStyleSheet("color: palette(mid);")
+        self._growth_row_label.setToolTip(
+            "Average stat gain per level under the current StatType. "
+            "Specialized stats (notably above the cross-type average) "
+            "are highlighted."
+        )
+        table.addWidget(self._growth_row_label, 2, 0)
+
+        # Pin column 0 to the widest possible label so swapping
+        # "<StatType> Growth" text doesn't reflow the spinboxes when
+        # switching between digimon with different StatTypes.
+        fm = self._growth_row_label.fontMetrics()
+        widest = max(
+            (fm.horizontalAdvance(f"{t.name} Growth") for t in model.DigimonType),
+            default=fm.horizontalAdvance("Current"),
+        )
+        table.setColumnMinimumWidth(0, widest + 8)
+        for ix, (attr, _l, _w, _h, _cap, _msg) in enumerate(_STAT_FIELDS):
+            gain_lbl = QLabel("—")
+            gain_lbl.setAlignment(Qt.AlignCenter)
+            gain_lbl.setStyleSheet("color: palette(mid);")
+            self._gain_labels[attr] = gain_lbl
+            table.addWidget(gain_lbl, 2, 1 + ix)
+
+        # Anchor flush-left; QGridLayout otherwise even-distributes the
+        # leftover horizontal slack across all columns.
+        table.setColumnStretch(1 + len(_STAT_FIELDS), 1)
+        outer.addLayout(table)
+
+        # Re-render the gain row whenever StatType changes — the combo
+        # is the sole input, so this is the cheapest live-update hook.
+        self._type_combo.currentIndexChanged.connect(
+            lambda _ix: self._refresh_growth_preview()
+        )
+        return box
+
+    def _refresh_growth_preview(self) -> None:
+        """Update the per-level-gain row from the current StatType.
+
+        StatType is the sole driver of growth, so this reads
+        ``self._type_combo`` rather than the bound record (the combo's
+        value is what BoundEnumCombo pushed onto the record; either
+        source agrees, but the combo is cheaper to query and works
+        before the first ``rebind``). Stats without a growth curve
+        (Evasion, Aptitude) stay as em-dashes. Stats this StatType
+        specializes in (gain notably above the cross-type average for
+        that stat — see :data:`_GROWTH_EMPHASIS_RATIO`) get an accent
+        color so the archetype's identity is readable at a glance.
+        """
+        type_value = self._type_combo.currentData()
+        if type_value is None:
+            self._growth_row_label.setText("StatType Growth")
+            for lbl in self._gain_labels.values():
+                lbl.setText("—")
+                lbl.setStyleSheet("color: palette(mid);")
+            return
+        # BoundEnumCombo stores the Enum member as item data; unwrap to
+        # its underlying int for the LEVEL_UP_TABLE row index.
+        type_ix = type_value.value if hasattr(type_value, "value") else int(type_value)
+        type_name = (
+            type_value.name if hasattr(type_value, "name")
+            else self._type_combo.currentText()
+        )
+        self._growth_row_label.setText(f"{type_name} Growth")
+        gains = per_level_gain_by_type(int(type_ix))
+        baselines = _cross_type_mean_gains()
+        for attr, lbl in self._gain_labels.items():
+            avg = gains.get(attr)
+            if avg is None:
+                lbl.setText("—")
+                lbl.setStyleSheet("color: palette(mid);")
+                continue
+            lbl.setText(f"+{avg:.1f}")
+            baseline = baselines.get(attr, 0.0)
+            if baseline > 0 and avg >= baseline * _GROWTH_EMPHASIS_RATIO:
+                # Soft green — semantically "specialization" / above the
+                # crowd. Bold so the emphasized cells pop without making
+                # the unemphasized ones look washed out.
+                lbl.setStyleSheet("color: #3d8b3d; font-weight: bold;")
+            else:
+                lbl.setStyleSheet("color: palette(mid);")
+
+    def _build_resistances_box(self, first: model.BaseDataDigimon) -> QWidget:
+        """Resistance table — column per element, single editable row.
+
+        Mirrors the enemy editor's resistance table without the Base
+        comparison row (this *is* the base record).
+        """
+        box = QGroupBox("Resistances")
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(4)
+
+        table = QGridLayout()
+        table.setContentsMargins(0, 0, 0, 0)
+        table.setHorizontalSpacing(8)
+        table.setVerticalSpacing(2)
+
+        for ix, (attr, label) in enumerate(_RES_FIELDS):
+            header = QLabel(label)
+            header.setAlignment(Qt.AlignCenter)
+            header.setStyleSheet("font-weight: bold;")
+            table.addWidget(header, 0, ix)
+
+        for ix, (attr, label) in enumerate(_RES_FIELDS):
+            spin = BoundSpinBox(first, attr, 2, self._undo_stack)
+            spin.setAlignment(Qt.AlignCenter)
+            self._res_widgets[attr] = spin
+            table.addWidget(spin, 1, ix)
+
+        table.setColumnStretch(len(_RES_FIELDS), 1)
+        outer.addLayout(table)
+        return box
+
     # ---- selection / refresh --------------------------------------------
 
     def _on_selection(self, digimon_id: int) -> None:
@@ -369,6 +553,9 @@ class BaseDigimonEditor(QWidget):
             row.rebind(target)
         for spin in self._misc_widgets.values():
             spin.rebind(target)
+        # BoundEnumCombo.rebind silences signals, so the auto-hook
+        # we set up in _build_stats_box doesn't fire here.
+        self._refresh_growth_preview()
         self._refresh_used_by_label()
 
     def _refresh_form(self, _index: int) -> None:
@@ -390,6 +577,10 @@ class BaseDigimonEditor(QWidget):
             row.refresh()
         for spin in self._misc_widgets.values():
             spin.refresh()
+        # Undo/redo of a StatType change won't fire the combo's signal
+        # (refresh() runs silenced); refresh the gain row explicitly so
+        # the preview tracks the undo stack.
+        self._refresh_growth_preview()
         self._refresh_used_by_label()
 
     def _refresh_used_by_label(self) -> None:

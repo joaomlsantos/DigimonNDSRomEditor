@@ -160,6 +160,25 @@ def _per_level_gain(mode: ProgressionMode, max_gain: int, base_gain: int) -> flo
     return total / max_gain
 
 
+def per_level_gain_by_type(digimon_type_value: int) -> Dict[str, float]:
+    """Average per-level gain for each stat under a given DigimonType.
+
+    Returns a mapping from :data:`PROGRESSION_STATS` name to the
+    closed-form mean of ``(roll + base_gain) // 10`` for that stat's
+    ``(max_gain, base_gain)`` pair in :data:`LEVEL_UP_TABLE`. Only the
+    StatType controls these numbers — there's no dependency on the
+    base record's level or current stats — so the editor can preview
+    "this type grants ~X HP/level" without walking the formula.
+    """
+    row = LEVEL_UP_TABLE[digimon_type_value]
+    return {
+        name: _per_level_gain(
+            ProgressionMode.FIXED_AVG, int(row[ix][0]), int(row[ix][1]),
+        )
+        for ix, name in enumerate(PROGRESSION_STATS)
+    }
+
+
 def expected_range(
     base,
     target_level: int,

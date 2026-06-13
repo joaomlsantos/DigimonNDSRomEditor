@@ -161,6 +161,77 @@ class ReplaceSpriteCommand(QUndoCommand):
             self._on_change()
 
 
+class ReplaceBtmapFileCommand(QUndoCommand):
+    """Atomic swap of one ``DAT/btmap/*`` FAT file's bytes.
+
+    Records the bytes that were live when ``__init__`` ran so redo/undo
+    flip between the new content and whatever existed before — vanilla
+    FAT bytes or a prior edit. ``on_change`` is invoked after each flip
+    so the browser can drop its parsed NaXn cache and re-render.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        path: str,
+        new_bytes: bytes,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._path = path
+        self._on_change = on_change
+        # Snapshot before push() so old_bytes reflects the live state.
+        self._old_bytes = bytes(session.btmap_file_bytes(path))
+        self._new_bytes = bytes(new_bytes)
+
+    def redo(self) -> None:
+        self._session.replace_btmap_file_bytes(self._path, self._new_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        self._session.replace_btmap_file_bytes(self._path, self._old_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class ReplaceMapFileCommand(QUndoCommand):
+    """Atomic swap of one ``DAT/map/*`` FAT file's bytes.
+
+    Same shape as :class:`ReplaceBtmapFileCommand` — used by the field-
+    map paint tools (``.0t`` walkability in Phase C, the tilemap
+    painter in Phase D). ``on_change`` lets the browser re-render after
+    each redo/undo flip.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        path: str,
+        new_bytes: bytes,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._path = path
+        self._on_change = on_change
+        self._old_bytes = bytes(session.map_file_bytes(path))
+        self._new_bytes = bytes(new_bytes)
+
+    def redo(self) -> None:
+        self._session.replace_map_file_bytes(self._path, self._new_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        self._session.replace_map_file_bytes(self._path, self._old_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+
 # FAT path for BTCHR.PAK — duplicated here (also defined in btchr_browser)
 # so commands.py doesn't reach back into the UI layer.
 _BTCHR_PAK = "DAT/BTCHR.PAK"

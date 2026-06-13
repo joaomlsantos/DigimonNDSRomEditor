@@ -26,6 +26,8 @@ from __future__ import annotations
 import struct
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 
 # ---- RLE-0x30 -------------------------------------------------------------
 
@@ -407,7 +409,7 @@ def build_nclr_from_template(
 
 
 def quantize_palette(
-    colors: List[Tuple[int, int, int]], k: int,
+    colors, k: int,
 ) -> List[Tuple[int, int, int]]:
     """Median-cut reduction of ``colors`` to at most ``k`` representatives.
 
@@ -418,43 +420,83 @@ def quantize_palette(
 
     Caller is expected to handle the reserved transparent slot separately
     — this function only sees opaque colors and only emits ``k`` slots.
+
+    ``colors`` may be a list of ``(r, g, b)`` tuples or a numpy ndarray
+    of shape ``(N, 3)``. The ndarray path skips the Python-tuple round-trip
+    for the hot multi-bank import callers.
     """
     if k <= 0:
         return []
-    unique = sorted(set(colors))
-    if len(unique) <= k:
-        return unique
+    if isinstance(colors, np.ndarray):
+        if colors.size == 0:
+            return []
+        arr = colors.astype(np.int32, copy=False)
+    else:
+        if not colors:
+            return []
+        arr = np.asarray(colors, dtype=np.int32)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(
+            f"quantize_palette expected (N, 3) colors, got shape {arr.shape}"
+        )
 
-    boxes: List[List[Tuple[int, int, int]]] = [list(colors)]
+    unique_rows = np.unique(arr, axis=0)
+    if len(unique_rows) <= k:
+        return [(int(r), int(g), int(b)) for r, g, b in unique_rows]
+
+    # Each box is an int32 ndarray of shape (M, 3). Track min/max/range so
+    # we can pick the next box to split in O(B) instead of rescanning every
+    # box's pixels every iteration.
+    boxes: List[np.ndarray] = [arr]
+    box_mins = [arr.min(axis=0)]
+    box_maxs = [arr.max(axis=0)]
+    box_max_ranges = [int((box_maxs[0] - box_mins[0]).max())]
+
     while len(boxes) < k:
-        best_i, best_range = -1, -1
-        for i, box in enumerate(boxes):
-            if len(box) < 2:
+        # Original Python version picks the (box, axis) pair with the
+        # largest single-axis range, iterating outer→inner and tiebreaking
+        # by strict ``>`` (i.e. first encountered wins). The equivalent on
+        # the cached per-box max-range list is the first argmax.
+        best_i = -1
+        best_range = -1
+        for i, r in enumerate(box_max_ranges):
+            if len(boxes[i]) < 2:
                 continue
-            for axis in range(3):
-                vals = [c[axis] for c in box]
-                rng = max(vals) - min(vals)
-                if rng > best_range:
-                    best_range, best_i = rng, i
+            if r > best_range:
+                best_range = r
+                best_i = i
         if best_i < 0 or best_range <= 0:
-            # Remaining boxes are all single-point — no further split helps.
             break
+
         box = boxes[best_i]
-        ranges = [
-            max(c[a] for c in box) - min(c[a] for c in box) for a in range(3)
-        ]
-        axis = ranges.index(max(ranges))
-        box.sort(key=lambda c, _a=axis: c[_a])
+        ranges = box_maxs[best_i] - box_mins[best_i]
+        axis = int(ranges.argmax())
+        # Stable sort matches Python ``list.sort``'s tiebreaking semantics
+        # so the split is bit-identical to the original on tied pivots.
+        order = np.argsort(box[:, axis], kind="stable")
+        sorted_box = box[order]
         mid = len(box) // 2
-        boxes[best_i:best_i + 1] = [box[:mid], box[mid:]]
+        lower = sorted_box[:mid]
+        upper = sorted_box[mid:]
+
+        boxes[best_i] = lower
+        box_mins[best_i] = lower.min(axis=0)
+        box_maxs[best_i] = lower.max(axis=0)
+        box_max_ranges[best_i] = int((box_maxs[best_i] - box_mins[best_i]).max())
+
+        boxes.insert(best_i + 1, upper)
+        upper_min = upper.min(axis=0)
+        upper_max = upper.max(axis=0)
+        box_mins.insert(best_i + 1, upper_min)
+        box_maxs.insert(best_i + 1, upper_max)
+        box_max_ranges.insert(best_i + 1, int((upper_max - upper_min).max()))
 
     out: List[Tuple[int, int, int]] = []
     for box in boxes:
-        if not box:
+        if len(box) == 0:
             continue
         n = len(box)
-        r = sum(c[0] for c in box) // n
-        g = sum(c[1] for c in box) // n
-        b = sum(c[2] for c in box) // n
-        out.append((r, g, b))
+        s = box.sum(axis=0)
+        # Match the original integer-divided per-channel mean.
+        out.append((int(s[0]) // n, int(s[1]) // n, int(s[2]) // n))
     return out

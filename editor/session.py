@@ -105,6 +105,23 @@ class RomSession:
     # iterates this on save to splice the rebuilt pak over its FAT slot.
     _dirty_sprite_paks: Set[str] = field(default_factory=set)
 
+    # Lazy file_table built from original_rom_data — shared across read-only
+    # browsers that don't need to follow the post-edit FAT layout (btmap
+    # Phase B/C reads vanilla bytes only; the FAT-splice path lands in
+    # Phase E with its own write-side resolver).
+    _file_table_cache: Optional[fnt.FileTable] = field(default=None)
+
+    # Per-FAT-path overrides for btmap edits (Phase D). Path → uncompressed
+    # bytes that supersede the vanilla FAT slot. Cleared on session reset;
+    # serialize_all (Phase E) will splice these back over the ROM.
+    _dirty_btmap_files: Dict[str, bytes] = field(default_factory=dict)
+
+    # Same shape as ``_dirty_btmap_files``, but for ``DAT/map/*`` field-map
+    # edits (PLAN.md §14.5 Phase C onwards). The FAT splice lands in
+    # Phase F; reads route through :meth:`map_file_bytes` so paint tools
+    # see their own edits immediately.
+    _dirty_map_files: Dict[str, bytes] = field(default_factory=dict)
+
     # Per-group edits to BTCHR/CHRSIZE.BIN and BTCHR/BTCHRSIZE.BIN. Both
     # files are fixed-size (1660B = 415 × u32) and never resize, so edits
     # ride the byte diff channel instead of a sprite-style splice: writes
@@ -393,7 +410,13 @@ class RomSession:
         session._build_combo_pools()
         return session
 
-    def serialize_all(self, *, skip_sprite_splice: bool = False) -> bytearray:
+    def serialize_all(
+        self,
+        *,
+        skip_sprite_splice: bool = False,
+        skip_btmap_splice: bool = False,
+        skip_map_splice: bool = False,
+    ) -> bytearray:
         """Write every model back onto a copy of the original ROM bytes.
 
         ``skip_sprite_splice`` leaves sprite paks at their vanilla bytes
@@ -467,6 +490,19 @@ class RomSession:
         # that don't exist. Project save skips both; the next ROM export
         # writes the consistent triple.
         self._apply_btchr_size_edits(out, skip_sidecar_resize=skip_sprite_splice)
+        # Btmap edits ride the same channel pattern as sprite edits —
+        # ROM save splices, project save (Phase F) skips and persists
+        # per-path bytes so a single grown btmap doesn't shift every
+        # downstream file in the byte diff.
+        if not skip_btmap_splice:
+            self._apply_btmap_splice(out)
+        # Field-map edits (PLAN.md §14.5 Phase F) ride the same channel
+        # pattern: ROM save splices, project save (handled by callers
+        # passing ``skip_map_splice=True``) persists per-path bytes via
+        # ``map_file_edits`` so a single grown ``.s`` or ``.c`` doesn't
+        # shift every downstream file in the byte diff.
+        if not skip_map_splice:
+            self._apply_map_splice(out)
         return out
 
     def serialize_all_with_qol(self) -> bytearray:
@@ -481,6 +517,66 @@ class RomSession:
         self._apply_msgpak_resize(out)
         self._trim_trailing_padding(out)
         return out
+
+    def vanilla_file_table(self) -> fnt.FileTable:
+        """Lazy ``FileTable`` over ``original_rom_data``.
+
+        Used by read-only browsers (currently the btmap browser per
+        PLAN.md §14.4 Phase B) that need path → FAT range lookups without
+        following the post-edit splice layout. Cached for the session
+        lifetime since vanilla bytes don't change.
+        """
+        if self._file_table_cache is None:
+            self._file_table_cache = fnt.FileTable.from_rom(self.original_rom_data)
+        return self._file_table_cache
+
+    def btmap_file_bytes(self, path: str) -> bytes:
+        """Resolve ``path`` (e.g. ``"DAT/btmap/0ac"``) to bytes.
+
+        Checks the per-session dirty cache first (Phase D import edits);
+        falls back to the vanilla FAT slot if no override is recorded.
+        Codec call sites pass the result through ``maybe_decompress`` so
+        the cache may store either uncompressed or RLE-30 bytes — the
+        import path currently emits uncompressed, which is what the
+        read path consumes regardless of compression.
+        """
+        cached = self._dirty_btmap_files.get(path)
+        if cached is not None:
+            return cached
+        return self.vanilla_file_table().slice(self.original_rom_data, path)
+
+    def replace_btmap_file_bytes(self, path: str, new_bytes: bytes) -> bytes:
+        """Install ``new_bytes`` as the override for ``path`` and return
+        whatever was there before — vanilla FAT bytes or a prior edit.
+
+        Used by :class:`commands.ReplaceBtmapFileCommand` to make the
+        flip undoable. Mutates only the dirty cache; ``original_rom_data``
+        and the cached vanilla file table are not touched.
+        """
+        previous = self.btmap_file_bytes(path)
+        self._dirty_btmap_files[path] = bytes(new_bytes)
+        return previous
+
+    def map_file_bytes(self, path: str) -> bytes:
+        """Resolve ``path`` (e.g. ``"DAT/map/100.0t"``) to bytes.
+
+        Mirrors :meth:`btmap_file_bytes`: dirty cache first, vanilla FAT
+        fallback. The dirty cache holds *uncompressed* bytes; the FAT
+        splice (Phase F) re-encodes via the shared RLE-30 wrapper on
+        save.
+        """
+        cached = self._dirty_map_files.get(path)
+        if cached is not None:
+            return cached
+        return self.vanilla_file_table().slice(self.original_rom_data, path)
+
+    def replace_map_file_bytes(self, path: str, new_bytes: bytes) -> bytes:
+        """Install ``new_bytes`` as the override for ``path`` and return
+        the prior bytes — vanilla or a previous edit. Mutates only the
+        dirty cache."""
+        previous = self.map_file_bytes(path)
+        self._dirty_map_files[path] = bytes(new_bytes)
+        return previous
 
     def sprite_pak(self, pak_name: str) -> pak.PakFile:
         """Lazy-load and cache one of the sprite pak directories.
@@ -547,6 +643,82 @@ class RomSession:
             content_delta = len(new_bytes) - (pak_end - pak_start)
             aligned_shift = fat.splice_range(
                 out, pak_start, pak_end, ce, new_bytes
+            )
+            fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
+
+    def _apply_btmap_splice(self, out: bytearray) -> None:
+        """Splice every dirty btmap FAT file back into the ROM.
+
+        Re-compresses each entry with RLE-30 — vanilla btmap files are
+        RLE-30 wrapped and the engine calls SWI 0x14 on them, so the
+        replacement must use the same framing or the BIOS decompressor
+        will read garbage. The dirty cache may hold uncompressed bytes
+        (the typical import-path output) or already-compressed bytes;
+        we normalize via ``maybe_decompress`` then re-encode so the ROM
+        sees consistent framing regardless of caller.
+
+        Same descending-offset ordering as the sprite splice: each
+        splice shifts everything past its container's old end, so
+        higher-offset files are processed first to keep lower-offset
+        pre-resolved bounds valid.
+        """
+        if not self._dirty_btmap_files:
+            return
+        from digimon_core.sprite import compress_rle30, maybe_decompress
+
+        file_table = fnt.FileTable.from_rom(bytes(out))
+        dirty: List[Tuple[int, int, str, bytes]] = []
+        for path, new_bytes in self._dirty_btmap_files.items():
+            try:
+                file_start, file_end = file_table.resolve(path)
+            except KeyError:
+                continue
+            raw = maybe_decompress(new_bytes)
+            compressed = compress_rle30(raw)
+            dirty.append((file_start, file_end, path, compressed))
+        for file_start, file_end, _path, compressed in sorted(
+            dirty, key=lambda x: x[0], reverse=True,
+        ):
+            idx, _cs, ce = fat.find_container(out, file_start, file_end)
+            content_delta = len(compressed) - (file_end - file_start)
+            aligned_shift = fat.splice_range(
+                out, file_start, file_end, ce, compressed,
+            )
+            fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
+
+    def _apply_map_splice(self, out: bytearray) -> None:
+        """Splice every dirty field-map FAT file back into the ROM.
+
+        Mirrors :meth:`_apply_btmap_splice`. Field-map files (``DAT/map/
+        <id>{a,b}.{c,p,s}`` and ``<id>.{d,0t,a}``) are RLE-30 wrapped on
+        disk and the engine decompresses them via SWI 0x14, so the
+        replacement re-runs compress_rle30 on the (decompressed) dirty
+        bytes. The dirty cache may hold either form — paint tools store
+        the uncompressed payload, but external callers (project load)
+        can pass already-compressed bytes; ``maybe_decompress`` normalizes
+        both.
+        """
+        if not self._dirty_map_files:
+            return
+        from digimon_core.sprite import compress_rle30, maybe_decompress
+
+        file_table = fnt.FileTable.from_rom(bytes(out))
+        dirty: List[Tuple[int, int, str, bytes]] = []
+        for path, new_bytes in self._dirty_map_files.items():
+            try:
+                file_start, file_end = file_table.resolve(path)
+            except KeyError:
+                continue
+            raw = maybe_decompress(new_bytes)
+            compressed = compress_rle30(raw)
+            dirty.append((file_start, file_end, path, compressed))
+        for file_start, file_end, _path, compressed in sorted(
+            dirty, key=lambda x: x[0], reverse=True,
+        ):
+            idx, _cs, ce = fat.find_container(out, file_start, file_end)
+            content_delta = len(compressed) - (file_end - file_start)
+            aligned_shift = fat.splice_range(
+                out, file_start, file_end, ce, compressed,
             )
             fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
 
@@ -1586,6 +1758,59 @@ class RomSession:
                     f"{pak_name} (count={pak_obj.count})"
                 )
             self.mark_sprite_pak_dirty(pak_name)
+
+    def btmap_file_edits(self) -> List[Tuple[str, bytes]]:
+        """Snapshot per-path btmap overrides for the .romproj btmap_edits channel.
+
+        One tuple per dirty FAT path; the bytes are whatever the dirty
+        cache currently holds (uncompressed from the import path, possibly
+        already-compressed from external callers — _apply_btmap_splice
+        normalizes either form on save).
+
+        Mirrors :meth:`sprite_pak_edits`: project save skips the FAT
+        splice and routes the actual file bytes through this channel
+        so a grown btmap doesn't shift every later file into the byte
+        diff. ``apply_btmap_file_edits`` replays them at load.
+        """
+        return [
+            (path, bytes(data))
+            for path, data in sorted(self._dirty_btmap_files.items())
+        ]
+
+    def apply_btmap_file_edits(self, edits: List[Tuple[str, bytes]]) -> None:
+        """Replay btmap file overrides from a .romproj onto the dirty cache.
+
+        Each tuple is ``(fat_path, file_bytes)``. The bytes go straight
+        into ``_dirty_btmap_files`` so the next ``serialize_all`` runs
+        them through ``_apply_btmap_splice``. Idempotent — project load
+        runs once on a fresh session.
+        """
+        for path, data in edits:
+            self._dirty_btmap_files[path] = bytes(data)
+
+    def map_file_edits(self) -> List[Tuple[str, bytes]]:
+        """Snapshot per-path field-map overrides for the .romproj map_edits
+        channel.
+
+        Mirrors :meth:`btmap_file_edits`. Project save skips the field-map
+        FAT splice (``skip_map_splice=True``) and routes the dirty bytes
+        through this channel so a grown ``.s`` / ``.0t`` / ``.d`` doesn't
+        shift every later file into the byte diff.
+        """
+        return [
+            (path, bytes(data))
+            for path, data in sorted(self._dirty_map_files.items())
+        ]
+
+    def apply_map_file_edits(self, edits: List[Tuple[str, bytes]]) -> None:
+        """Replay field-map file overrides from a .romproj onto the dirty cache.
+
+        Each tuple is ``(fat_path, file_bytes)``. The bytes go straight
+        into ``_dirty_map_files`` so the next ``serialize_all`` runs them
+        through ``_apply_map_splice``. Idempotent.
+        """
+        for path, data in edits:
+            self._dirty_map_files[path] = bytes(data)
 
     def apply_string_edits(self, edits: List[Tuple[str, int, str]]) -> None:
         """Replay logical string edits from a .romproj onto the parsed model.

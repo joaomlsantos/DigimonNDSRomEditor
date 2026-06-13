@@ -656,3 +656,147 @@ Caveats:
 - ARM9 / Overlay string edits the patch made are still subject to the original byte budgets (§4.17) — editor edits on top stay capped there.
 - Patches that fundamentally rearrange overlay layout (uncommon for translations) remain out of scope; this is about layout-tolerant *loading*, not arbitrary ROM forensics.
 - Header version detection still requires the patch to leave the title/gamecode bytes intact, which translations typically do.
+
+---
+
+## 14. Plan: Battle backgrounds (`/btmap/`) and field maps (`/map/`)
+
+**Goal.** Edit DWDD's battle backgrounds and field maps from inside the editor. Two separate nav pages because the data shape diverges entirely past the shared RLE wrapper: `/btmap/` is NDS-Nitro (NCGR/NCLR/NSCR + animation frames) and reuses the sprite editor's flow; `/map/` is raw NDS BG payload that wants a Porymap-style in-tool tilemap painter plus walkability-mask paint and a `.d` tuple editor.
+
+Reconnaissance is already complete in [`research_docs/claude_notes/btmap_map_recon.md`](../research_docs/claude_notes/btmap_map_recon.md): wrapper format, per-suffix payload layout, multi-SCB tilemap rearrangement, `.0t` bit polarity, `.a` ships all-zero, `.d` 6-u16 tuple stride. Standalone PNG renderers (`btmap_render.py`, `map_render.py`) drive both pages' read path.
+
+§12 (FAT shifts) + §13 (FAT-driven loading) cover the save-side mechanics. Every file in both directories is its own FAT entry (no internal pak directory like SPR_*.PAK), so the splice path is *simpler* than the sprite editor — no per-file directory rewrite, just `decompress → edit → recompress → fat.splice_range + fat.resize_fat_entry`.
+
+### 14.1 Editable surfaces and what's confirmed
+
+| Surface | Format | Editable? | Notes |
+|---|---|---|---|
+| **btmap** layer A NCGR/NCLR/NSCR | RLE-wrapped Nitro | ✓ | Same shape as `SPR_*.PAK` entries; reuses `digimon_core/sprite.py` parsers + builders |
+| **btmap** layer B NCGR/NSCR | RLE-wrapped Nitro (shares A's palette) | ✓ | Often empty/sparse on maps that don't use a second plane |
+| **btmap** NaXc / NaXn animation overlays | RLE-wrapped (NCGR + custom cell list) | deferred | NaXc decoded as Nitro NCGR; NaXn schema partially decoded (leading u16 pairs are x/y, trailing block unclear) |
+| **map** `.c` tile graphics | RLE-wrapped raw (4-byte size header + 4bpp tiles) | ✓ | Per-layer (a/b); 32 bytes/tile |
+| **map** `.p` palette | RLE-wrapped raw (4-byte size + 8 × 16 × BGR555) | ✓ | Per-layer (a/b); 8 banks × 16 colors |
+| **map** `.s` BG tilemap | RLE-wrapped raw (4-byte w/h header + u16 entries) | ✓ | Standard NDS BG entry bits (10 tile / 1 hflip / 1 vflip / 4 bank) |
+| **map** `.0t` walkability | RLE-wrapped raw (8-byte w/h header + 1-bit/pixel) | ✓ | Bit=1 blocked, bit=0 walkable. Pixel resolution, not tile resolution |
+| **map** `.d` descriptor (138 B) | RLE-wrapped raw | ✓ | 42-byte header (mostly constant) + up to 7 × 6-u16 tuples + 12-byte trailer. Tuple semantics: `kind` 0..7 enum + 5 params; **`kind` labels not pinned** — edit as raw integers |
+| **map** `.a` attribute grid | RLE-wrapped raw (8-byte w/h header + byte/tile) | deferred | All-zero in every shipped map; engine read-site not identified |
+
+### 14.2 Architecture
+
+Two pure-function modules in `digimon_core/` plus two browser widgets. Both modules wrap the existing RLE-30 codec from `digimon_core/sprite.py` (the wrapper format is shared).
+
+**`digimon_core/btmap.py`** — battle-background codec:
+- `BTMAP_DIR = "DAT/btmap/"` and a `BtmapFiles(map_id)` helper that names the up-to-15 expected FAT paths (`{id}ac`, `{id}ap`, `{id}as`, `{id}bc`, `{id}bs`, `{id}a0c`..`{id}a4c`, `{id}a0n`..`{id}a4n`). Animation frames are sparse: vanilla maps ship anywhere from 1 frame (e.g. id 30) to 5 (e.g. id 12).
+- `discover_map_ids(file_table) → List[str]` — numeric-sorted ids present in the ROM.
+- `parse_layer(ncgr, nclr, nscr) → LayerImage` — composes the existing `sprite.parse_ncgr` / `parse_nclr` parsers with an SCB-aware NSCR parser (the bug we fixed in `btmap_render.py`). Returns rendered RGBA bytes + dimensions for preview.
+- `render_btmap(map_id, file_table, rom) → (rgba, w, h)` — full two-layer composite with B cropped to A's footprint (matches the standalone renderer's behavior).
+- `build_btmap_layer_from_png(png_bytes, template_ncgr, template_nclr) → (ncgr, nclr, nscr)` — symmetric to the sprite editor's PNG-import path; quantizes against the current palette by default.
+
+**`digimon_core/map.py`** — field-map codec (deferred to map editor phase; specification kept here for the read-path browser):
+- Raw `.c/.p/.s/.0t/.a/.d` parsers + symmetric encoders. Encoders are 1:1 with parsers since the formats are flat (no padding, no internal pointers).
+- `MapTilemap` dataclass: layers A/B as `(tiles, palettes, entries, w_tiles, h_tiles)` for the tilemap painter; `walkability` as a 1-bpp `bytearray` for the `.0t` paint tool; `tuples` as a `List[Tuple[int, int, int, int, int, int]]` for the `.d` editor.
+
+**`editor/widgets/btmap_browser.py`** — battle-background browser, modeled after `sprite_browser.py`:
+- Left: filterable index list (76 ids).
+- Right: composite preview (the rendered PNG from §A), layer A/B toggle, palette bank metadata, file sizes (compressed / uncompressed for each component), import/export controls.
+
+**`editor/widgets/map_browser.py`** — field-map browser (deferred). Same shape but with the Porymap-style tilemap painter described in §14.5.
+
+**Session integration.** Mirrors the sprite editor:
+- `RomSession.btmap_file(path) → bytes` — lazy load + cache of *decompressed* bytes per FAT path. Cache mutations are the "dirty" state.
+- `RomSession.mark_btmap_dirty(path)` — flag a FAT path for re-splice on next `serialize_all`.
+- `RomSession._apply_btmap_splice(out)` — iterates dirty paths in **descending ROM-offset order** (same constraint as `_apply_sprite_pak_splice`), recompresses each, calls `fat.splice_range` + `fat.resize_fat_entry`. Symmetric helpers for `/map/` land with phase D.
+
+### 14.3 UI patterns
+
+**Btmap browser.** Single page driven by map id, all the suffixes paired by id. Layout:
+
+```
+┌─ Map: 0042 ──────────────────────────────────────────┐
+│ ┌── ids ──┐ ┌─ preview (composited render) ───────┐  │
+│ │ 0000    │ │ [512×256 RGBA, layer A + cropped B] │  │
+│ │ 0001    │ └────────────────────────────────────┘  │
+│ │ ...     │ Layer: [A▼] [B▼] [Composite▼]           │
+│ │ 0042 ◄  │ Palette banks: 6 of 8 used               │
+│ │ ...     │ ┌─ Components ──────────────────────┐    │
+│ └─────────┘ │ 0042ac   NCGR 32832 B (4bpp)      │    │
+│             │ 0042ap   NCLR 260 B (6 banks)     │    │
+│             │ 0042as   NSCR 4132 B (512×256)    │    │
+│             │ 0042bc   NCGR 2212 B              │    │
+│             │ 0042bs   NSCR 8228 B (512×512)    │    │
+│             └───────────────────────────────────┘    │
+│ [Export composite PNG…] [Export NCGR+NCLR…]          │
+│ [Import composite PNG…] [Import NCGR+NCLR…]          │
+└──────────────────────────────────────────────────────┘
+```
+
+**Field-map browser** (deferred). The Porymap-style canvas described in §14.5.
+
+### 14.4 Phasing — btmap (active milestone)
+
+| Phase | Output | Effort |
+|---|---|---|
+| **A — Codec + tests** | `digimon_core/btmap.py` with `discover_map_ids`, `parse_layer`, `render_btmap`, SCB-aware NSCR parser. Tests cover wrapper round-trip on every vanilla btmap, layer-B crop semantics, and the SCB rearrangement against `btmap_render.py`'s known-good output. | 0.5 d |
+| **B — Read-only browser** | `BtmapBrowser` widget; nav-tree entry under "Sprites" → "Battle Backgrounds" (folded under Sprites since the file format is Nitro and users will look there first). Preview, metadata, no import/export yet. | 0.5 d |
+| **C — PNG export** | Composite render via `QImage.save`. Layer A only / B only / composite options. Warns when the resolved palette bank count is < 8 (avoid surprising the user that the exported PNG can't fully round-trip if they edit colors outside the used banks). | 0.25 d |
+| **D — PNG / NCGR+NCLR import (per layer)** | Two paths, mirroring sprite editor §11.4 D: PNG (quantize against current NCLR; warn on color drift past 16 per bank) and NCGR+NCLR (lossless engine-native swap). Wired through a new `ReplaceBtmapFileCommand` for undo. | 0.5 d |
+| **E — FAT splice on save** | `RomSession._apply_btmap_splice` runs after sprite splices in `serialize_all`. Per-file recompress + `fat.splice_range` + `fat.resize_fat_entry`. Multi-file grow ordered descending-offset like sprite path. | 0.5 d |
+| **F — `.romproj` btmap_edits channel** | Bumps format_version to 5. Snapshots `(path, decompressed_bytes)` triples for every dirty btmap file. Save runs `serialize_all(skip_btmap_splice=True)` so a grown btmap doesn't fat-shift every later file into the byte diff. Backward-compat load: v1–v4 still load, with the channel empty. | 0.25 d |
+| **G — Animation overlay editing** | Deferred. NaXn trailing cell-attribute block needs schema decode work first; tracking issue in `research_docs/claude_notes/btmap_map_recon.md` open questions. | — |
+
+A–C land a useful read-only browser with PNG export. D–F land the round-trip edit path. G stays open.
+
+### 14.5 Phasing — field maps (queued)
+
+Will follow the btmap editor once it lands and the codec patterns are validated. Indicative shape:
+
+| Phase | Output |
+|---|---|
+| **A — Codec + tests** | `digimon_core/map.py` raw-payload parsers + encoders for every suffix |
+| **B — Read-only browser** | Composite render via `map_render.py` logic, walkability overlay toggle, `.d` tuple table |
+| **C — Walkability `.0t` paint tool** | Pixel- and tile-aligned brushes; proves the canvas/overlay infra before D |
+| **D — Tilemap painter** | Porymap-style: tile picker (left), canvas (center), bank/H-flip/V-flip controls. Edits `.s` entries — does NOT re-author the tileset. Tile graphics swap-in is a separate PNG-replace action on `.c` |
+| **E — `.d` tuple editor** | Table of up to 7 × `(kind, param_a, param_b, flag, reserved, weight)`. `kind` shown as raw 0..7 per `feedback_no_fabricated_game_mechanics.md` |
+| **F — FAT splice on save** ✅ **Done** | `_apply_map_splice` mirrors `_apply_btmap_splice`; paint edits to `.s` / `.0t` / `.d` re-serialize through RLE-30 and re-pin the FAT entry on save. |
+| **G — `.romproj` map_edits channel** ✅ **Done** | Project format v6 adds a `map_edits` channel mirroring `btmap_edits`. `session.map_file_edits()` / `apply_map_file_edits()` route per-path bytes around the byte diff; `serialize_all(skip_map_splice=True)` keeps grown field-map files off the diff. Verified by `test_map_codec.ProjectRoundtripTests`. |
+| **H — `.a` attribute grid** | Deferred until engine read-site found |
+
+§14.5 is design-level only at this point; the actual implementation timeline starts after §14.4 D ships.
+
+### 14.6 Risks
+
+- **NCGR vs raw-BG palette layout difference.** btmap NCLR carries 6 banks on average (PMCP says so), but the layer A renderer historically assumed 8 — the standalone renderer dodges this by reading the section size. The codec must read the actual bank count rather than hardcoding 8 so editor PNG export reflects the engine's view.
+- **NaXc/NaXn pairing.** Recon doc flags this as still uncertain. The btmap browser must not promise animation editing until §G; the metadata panel can surface "5 animation frames present" without claiming the editor can author them.
+- **Palette-bank reuse across maps.** btmap palettes are per-map, so unlike SPR_*.PAK there's no cross-entry palette sharing concern. The first-pass import is therefore simpler than the sprite-editor "new palette also affects sibling sprites" case.
+- **/map `.d` `kind` semantics.** Editing as raw integers is intentional (memory `feedback_no_fabricated_game_mechanics.md`); when the enum is pinned in-game, the tuple editor gets a labeled dropdown without a schema change.
+- **SCB rearrangement is load-bearing.** The btmap fix landed in `btmap_render.py` after a visible row-interleave artifact (commit context: "intercalated quadrants"). The codec must apply the same rearrangement on both parse and *build* — otherwise import would write back a tilemap that paints correctly in the editor but renders as the broken-quadrant image in-game.
+- **Cropping layer B for preview vs. preserving it for save.** Preview crops B to A's footprint; save must keep B's full extent — the engine uses the off-screen area for scroll/animation. The dirty-cache layer stores full uncropped data; only the rendered RGBA is cropped.
+
+### 14.7 Acceptance criteria — btmap
+
+- **Phase A/B (read).** Every vanilla btmap id renders in the browser visually matching `btmap_render.py`'s PNG (±1 per channel — the standalone uses bit-replication BGR555→RGB while the editor's existing `digimon_core/sprite.parse_nclr` uses linear scaling; keeping the editor convention for cross-module consistency). Phase A unit tests round-trip every btmap file through `decompress → parse → build → compress` and verify byte-identical output on a no-edit pass.
+- **Phase C (export).** PNG export of any map id produces the same image as the standalone renderer.
+- **Phase D (import).** PNG import (with no actual changes to the file) round-trips byte-identically through `ReplaceBtmapFileCommand` undo/redo. NCGR+NCLR import warns when RAHC+0x12 differs from the original (project memory `project_ncgr_rahc_header_preserve.md`).
+- **Phase E (save).** A modified btmap saved to ROM boots in DeSmuME and shows the edited art in the target battle. No regressions in adjacent files (verified by re-loading the saved ROM and parsing every FAT-listed file).
+- **Phase F (project).** A project with btmap edits saves and re-opens cleanly with the edits intact. Round-trip vs. the live session is byte-identical.
+
+### 14.8 Status — btmap import polish (paused 2026-06-12)
+
+Phases A–F ship; this subsection tracks the import-quality follow-ups landed after §14.7's first-pass acceptance and the threads that remain open.
+
+**Done.**
+
+- *Import performance* — `quantize_palette` vectorised via numpy median-cut (`digimon_core/sprite.py`); `cluster_tiles_to_max` rewritten as BLAS-GEMM-based weighted k-medoids (`digimon_core/btmap_import.py`). Synthetic 512×256 high-variety PNG: 11.0s → 2.66s end-to-end.
+- *k-means++ seeded clustering* — `cluster_tiles_to_max` init replaced with ref-count-weighted k-means++ (greedy `ref_count[t] · min_dist²(t, chosen)` seeding). Dramatically improves quality on mixed-density images (flat regions stop crowding out distinct detail tiles). Cost: ~0.08s added to import.
+- *Layer A backdrop picker* — collapsible section on the Layer A tab with 16 bank swatches + an eyedropper bound to the live preview. Lets users tint bank 0 slot 0 (the off-camera filler / camera-bound strip colour) without leaving the editor (`editor/widgets/btmap_browser.py`).
+- *Filler-slot reservation* — Layer A imports now pass `is_transparent_layer=True`, mirroring Layer B. Slot 0 of every bank is reserved for pixels painted `alpha=0` in the source PNG, so the backdrop picker only repaints the strip cells instead of leaking across content.
+- *A/B bank partition detection* — replaced the wrong hardcoded "bank 1 is Layer B" convention with per-map detection from each layer's NSCR. Layer A imports now exclude every bank Layer B references (keeping shared bank 0); Layer B imports route to whichever bank Layer B already used. Memory: `project_btmap_ab_bank_partition.md`.
+- *Debug tooling* — `_debug_import_overlay.py` emits side-by-side `imported.png` + `overlay.png` (source upscaled with tile-index labels) for any PNG against any map's templates. Useful for A/B-testing future clustering changes.
+
+**Pending / next session.**
+
+- *Stale-import cleanup guidance* — existing user maps imported before the `is_transparent_layer=True` flip + the A/B partition fix have polluted bank 0 slot 0 and may have content in Layer B's true bank. The picker UI works on these maps but recolouring leaks. Resolution: re-import the source PNG (with the off-camera strip painted alpha=0). No editor-side migration is planned — too map-specific.
+- *Layer B import quality* — Layer B is still single-bank (`use_multi_bank=False`). Multi-bank would lift its colour ceiling from 16 to ~3×16 = 48 within the banks Layer A doesn't claim. Worth doing if a user complains; not blocking.
+- *Per-layer palette view* — proposed as a UI follow-up to the bank-detection work: a Layer A / Layer B tab on the NCLR panel that hides banks owned by the other layer. Not built. Cheap to add once we want it.
+- *NaXn animation editing* — §14.4 G still deferred. The "none"-schema frames (the unknown OBJ-overlay path) still render as static base in the browser; the `dominant_bank` mitigation is in place for "all"/"dominant_bank" frames. Memory: `project_btmap_anim_schemas.md`.
+- *Clustering quality tuning* — k-means++ landed with `refine_iters=3`. Worth re-running the debug overlay on production maps to see whether more Lloyd iterations or a tweaked weighting helps the lowest-budget regions (bottom of the courtroom map etc.). Not urgent.

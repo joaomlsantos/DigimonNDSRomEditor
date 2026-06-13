@@ -68,6 +68,8 @@ from .widgets.move_editor import MoveEditor, move_issues
 from .widgets.qol_editor import QolEditor
 from .widgets.quest_editor import QuestEditor
 from .widgets.btchr_browser import BtchrBrowser
+from .widgets.btmap_browser import BtmapBrowser
+from .widgets.map_browser import MapBrowser
 from .widgets.mchr_browser import MchrBrowser
 from .widgets.sprite_browser import SpriteBrowser
 from .widgets.standard_digivolution_editor import (
@@ -135,10 +137,12 @@ NAV_GROUPS = [
         ("Overlays", "strings_bucket:overlay"),
         ("MSG.PAK", "strings_bucket:msgpak"),
     ]),
-    ("Sprites", [
+    ("Graphics", [
         ("Icons/Portraits/UI", "sprite_browser"),
-        ("Overworld", "mchr_browser"),
-        ("Battle", "btchr_browser"),
+        ("Overworld Sprites", "mchr_browser"),
+        ("Battle Sprites", "btchr_browser"),
+        ("Battle Backgrounds", "btmap_browser"),
+        ("Field Maps", "map_browser"),
     ]),
     ("Settings", [
         ("QoL Toggles", "qol_settings"),
@@ -724,6 +728,12 @@ class MainWindow(QMainWindow):
             session.apply_btchr_appended_sidecars(
                 project.get("btchr_appended_sidecars", [])
             )
+            # Per-path btmap file overrides land in the dirty cache; the
+            # next ROM save runs them through the btmap FAT splice.
+            session.apply_btmap_file_edits(project.get("btmap_edits", []))
+            # Same channel for DAT/map/* field-map file overrides — paint
+            # tool edits (walkability, tilemap) round-trip via here.
+            session.apply_map_file_edits(project.get("map_edits", []))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Failed to load project", str(exc))
             return
@@ -764,12 +774,18 @@ class MainWindow(QMainWindow):
                 rom_version=self.session.version,
                 vanilla_rom_data=self.session.original_rom_data,
                 edited_rom_data=bytes(
-                    self.session.serialize_all(skip_sprite_splice=True)
+                    self.session.serialize_all(
+                        skip_sprite_splice=True,
+                        skip_btmap_splice=True,
+                        skip_map_splice=True,
+                    )
                 ),
                 qol=self.session.qol,
                 string_edits=self.session.msgpak_string_edits(),
                 sprite_edits=self.session.sprite_pak_edits(),
                 btchr_appended_sidecars=self.session.btchr_appended_sidecars(),
+                btmap_edits=self.session.btmap_file_edits(),
+                map_edits=self.session.map_file_edits(),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Failed to save project", str(exc))
@@ -1099,6 +1115,10 @@ class MainWindow(QMainWindow):
             return MchrBrowser(self.session, self.undo_stack)
         if key == "btchr_browser":
             return BtchrBrowser(self.session, self.undo_stack)
+        if key == "btmap_browser":
+            return BtmapBrowser(self.session, self.undo_stack)
+        if key == "map_browser":
+            return MapBrowser(self.session, self.undo_stack)
         if key.startswith("strings_bucket:"):
             bucket = key.split(":", 1)[1]
             prefix = _STRING_BUCKET_PREFIXES.get(bucket)

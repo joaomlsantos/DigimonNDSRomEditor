@@ -33,15 +33,24 @@ from digimon_core import qol as qol_module
 # v4: adds btchr_appended_sidecars channel — chrsize/btchrsize u32 pairs
 #     for BTCHR groups appended past vanilla 415. The corresponding PAK
 #     entries ride sprite_edits at idx >= vanilla.count.
+# v5: adds btmap_edits channel — per-FAT-path replacement bytes for
+#     battle background (DAT/btmap/...) files edited via the Animations
+#     tab import path. Keeps grown btmaps off the byte diff.
+# v6: adds map_edits channel — per-FAT-path replacement bytes for field
+#     map (DAT/map/...) files edited via the field-map browser's paint
+#     tools. Same shape as btmap_edits; routed through the field-map FAT
+#     splice on save.
 # Loader accepts every prior version; saver always writes the current version.
-FORMAT_VERSION = 4
-_ACCEPTED_VERSIONS = (1, 2, 3, 4)
+FORMAT_VERSION = 6
+_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6)
 EDITOR_VERSION = "0.1.0"
 
 
 StringEdit = Tuple[str, int, str]  # (region_id, vanilla_offset, new_text)
 SpriteEdit = Tuple[str, int, bytes]  # (pak_name, entry_idx, new_entry_bytes)
 BtchrAppendedSidecar = Tuple[int, int]  # (chrsize_word, btchrsize_value)
+BtmapEdit = Tuple[str, bytes]  # (fat_path, file_bytes)
+MapEdit = Tuple[str, bytes]  # (fat_path, file_bytes) — DAT/map/* overrides
 
 
 def vanilla_sha256(rom_bytes: bytes) -> str:
@@ -104,15 +113,21 @@ def save_project(
     string_edits: List[StringEdit] = (),
     sprite_edits: List[SpriteEdit] = (),
     btchr_appended_sidecars: List[BtchrAppendedSidecar] = (),
+    btmap_edits: List[BtmapEdit] = (),
+    map_edits: List[MapEdit] = (),
 ) -> None:
     """Write a .romproj at `path`.
 
-    `edited_rom_data` should be `session.serialize_all(skip_sprite_splice=True)`
-    — i.e. without QoL patches and without sprite PAK splices applied — so QoL
-    state lives only in the `qol` field, sprite changes live only in
-    `sprite_edits`, and the byte diff captures only deliberate model edits.
-    Skipping the sprite splice keeps the diff small even when a grown sprite
-    would otherwise trigger a fat-shift across every later file.
+    `edited_rom_data` should be
+    `session.serialize_all(skip_sprite_splice=True, skip_btmap_splice=True,
+    skip_map_splice=True)`
+    — i.e. without QoL patches and without sprite PAK, btmap, or field-map
+    splices applied — so QoL state lives only in the `qol` field, sprite
+    changes live only in `sprite_edits`, btmap changes live only in
+    `btmap_edits`, field-map changes live only in `map_edits`, and the byte
+    diff captures only deliberate model edits. Skipping all three FAT splices
+    keeps the diff small even when a grown file would otherwise trigger a
+    fat-shift across every later file.
 
     `string_edits` carries over-budget MSG.PAK strings as
     ``(region_id, vanilla_offset, new_text)`` triples. ``serialize_all`` skips
@@ -132,6 +147,17 @@ def save_project(
     groups appended past vanilla 415 — parallel to the BTCHR.PAK appended
     entries in `sprite_edits`. Required so the (PAK count, chrsize length,
     btchrsize length) triple stays consistent on reload.
+
+    `btmap_edits` carries per-path battle-background overrides as
+    ``(fat_path, file_bytes)`` tuples. On reopen they're applied to the
+    session via ``apply_btmap_file_edits`` after the byte diff, sprite,
+    and string edits land; the next ROM save runs them through the btmap
+    FAT splice path.
+
+    `map_edits` carries per-path field-map overrides as
+    ``(fat_path, file_bytes)`` tuples — same shape as ``btmap_edits``,
+    routed through ``_apply_map_splice`` on save and replayed via
+    ``apply_map_file_edits`` on load.
     """
     diffs = compute_byte_diff(vanilla_rom_data, edited_rom_data)
     payload = {
@@ -156,6 +182,14 @@ def save_project(
             {"chrsize": chrsize_word, "btchrsize": btchrsize_value}
             for chrsize_word, btchrsize_value in btchr_appended_sidecars
         ],
+        "btmap_edits": [
+            {"path": path, "bytes": base64.b64encode(data).decode("ascii")}
+            for path, data in btmap_edits
+        ],
+        "map_edits": [
+            {"path": path, "bytes": base64.b64encode(data).decode("ascii")}
+            for path, data in map_edits
+        ],
     }
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -164,9 +198,12 @@ def load_project(path: str) -> dict:
     """Read the project JSON. Returns a dict with diffs decoded into bytes,
     qol parsed into a QolSettings instance, string_edits as a list of
     ``(region_id, vanilla_offset, new_text)`` tuples (empty for v1 projects),
-    and sprite_edits as a list of ``(pak_name, entry_idx, new_entry_bytes)``
-    tuples (empty for v1/v2 projects). Caller resolves the vanilla ROM and
-    verifies the hash separately."""
+    sprite_edits as a list of ``(pak_name, entry_idx, new_entry_bytes)``
+    tuples (empty for v1/v2 projects), btmap_edits as a list of
+    ``(fat_path, file_bytes)`` tuples (empty for v1-v4 projects), and
+    map_edits as a list of ``(fat_path, file_bytes)`` tuples (empty for
+    v1-v5 projects). Caller resolves the vanilla ROM and verifies the
+    hash separately."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     fmt = data.get("format_version")
     if fmt not in _ACCEPTED_VERSIONS:
@@ -190,5 +227,13 @@ def load_project(path: str) -> dict:
     data["btchr_appended_sidecars"] = [
         (entry["chrsize"], entry["btchrsize"])
         for entry in data.get("btchr_appended_sidecars", [])
+    ]
+    data["btmap_edits"] = [
+        (entry["path"], base64.b64decode(entry["bytes"]))
+        for entry in data.get("btmap_edits", [])
+    ]
+    data["map_edits"] = [
+        (entry["path"], base64.b64decode(entry["bytes"]))
+        for entry in data.get("map_edits", [])
     ]
     return data
