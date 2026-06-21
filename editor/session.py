@@ -14,7 +14,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from digimon_core import constants, fat, fnt, loaders, model, msgpak, pak, qol as qol_module, rom
+from digimon_core import constants, fat, fnt, loaders, model, msgpak, overlay5 as overlay5_mod, overlay5_cutscenes as overlay5_cutscenes_mod, pak, qol as qol_module, rom
 
 
 # Every sprite pak the editor knows how to splice on save. Used by
@@ -122,6 +122,29 @@ class RomSession:
     # see their own edits immediately.
     _dirty_map_files: Dict[str, bytes] = field(default_factory=dict)
 
+    # Per-entry overrides for overlay5 (script overlay) — keyed by
+    # entry index, value is the full replacement entry payload. The
+    # Events tab on field maps (PLAN.md §14.9) populates this when the
+    # user drags an OVERWORLD_SPRITE marker; ``_apply_overlay5_splice``
+    # writes each edit back into the overlay file bytes on save.
+    # Length is invariant per edit (drag changes x/y only, never the
+    # body length), so no FAT resize is needed and the entries below
+    # this one in the overlay don't shift.
+    _dirty_overlay5_entries: Dict[int, bytes] = field(default_factory=dict)
+
+    # Lazy ``Overlay5Index`` over ``original_rom_data``. Built on first
+    # access; shared across the Events tab read path and the splice
+    # path so a save sees the same pointer table that the UI dragged
+    # against. Cleared via ``invalidate_overlay5_index`` only if the
+    # overlay layout ever changes (it doesn't, today).
+    _overlay5_index_cache: Optional[overlay5_mod.Overlay5Index] = field(default=None)
+
+    # Lazy cutscene chain index built atop the Overlay5Index. The Cutscenes
+    # tab takes O(1) ``chains_by_map[map_id]`` lookups off this; build is
+    # eager (single ~1s walk on first access, cached for session lifetime).
+    # No invalidation today — chain topology is structural, not editable.
+    _cutscene_index_cache: Optional[overlay5_cutscenes_mod.CutsceneIndex] = field(default=None)
+
     # Per-group edits to BTCHR/CHRSIZE.BIN and BTCHR/BTCHRSIZE.BIN. Both
     # files are fixed-size (1660B = 415 × u32) and never resize, so edits
     # ride the byte diff channel instead of a sprite-style splice: writes
@@ -149,6 +172,11 @@ class RomSession:
     # build, so the cache avoids the per-call dict rebuild.
     _digimon_name_cache: Dict[int, str] = field(default_factory=dict)
     _digimon_name_cache_valid: bool = False
+
+    # msgpak_all index of dialog msg_id 0. Lazy: ``dialog_msg_text``
+    # anchor-searches once and caches; ``None`` means uncomputed, ``-1``
+    # means anchor missing.
+    _dialog_msgpak_base: Optional[int] = None
 
     # Lazy QIcon cache for the digimon portrait sprite (SPR_CHR entry pointed
     # at by SpriteMapEntry.upperscreen_low). Populated on demand by
@@ -416,6 +444,7 @@ class RomSession:
         skip_sprite_splice: bool = False,
         skip_btmap_splice: bool = False,
         skip_map_splice: bool = False,
+        skip_overlay5_splice: bool = False,
     ) -> bytearray:
         """Write every model back onto a copy of the original ROM bytes.
 
@@ -503,6 +532,12 @@ class RomSession:
         # shift every downstream file in the byte diff.
         if not skip_map_splice:
             self._apply_map_splice(out)
+        # Overlay5 (script overlay) edits — same channel pattern as
+        # btmap/map: ROM save splices in place, project save (caller
+        # passes ``skip_overlay5_splice=True``) routes per-entry bytes
+        # through the ``overlay5_entry_edits`` channel instead.
+        if not skip_overlay5_splice:
+            self._apply_overlay5_splice(out)
         return out
 
     def serialize_all_with_qol(self) -> bytearray:
@@ -576,6 +611,64 @@ class RomSession:
         dirty cache."""
         previous = self.map_file_bytes(path)
         self._dirty_map_files[path] = bytes(new_bytes)
+        return previous
+
+    # ---- overlay5 (script overlay) -----------------------------------------
+
+    def overlay5_index(self) -> overlay5_mod.Overlay5Index:
+        """Lazy ``Overlay5Index`` over vanilla bytes.
+
+        Used by the Events tab to enumerate OVERWORLD_SPRITE placements
+        per map; also reused by :meth:`_apply_overlay5_splice` so the
+        save path sees the same pointer table the UI dragged against.
+        """
+        if self._overlay5_index_cache is None:
+            ft = self.vanilla_file_table()
+            self._overlay5_index_cache = overlay5_mod.Overlay5Index.from_file_table(
+                ft, self.original_rom_data,
+            )
+        return self._overlay5_index_cache
+
+    def cutscene_index(self) -> overlay5_cutscenes_mod.CutsceneIndex:
+        """Lazy :class:`CutsceneIndex` over the overlay5 chain graph.
+
+        Built once on first access and cached; subsequent calls are O(1).
+        Drives the Cutscenes tab's per-map browsing — `chains_for_map(id)`
+        returns every chain whose source entry maps to that field map.
+        """
+        if self._cutscene_index_cache is None:
+            self._cutscene_index_cache = overlay5_cutscenes_mod.build_cutscene_index(
+                self.overlay5_index(),
+            )
+        return self._cutscene_index_cache
+
+    def overlay5_entry_bytes(self, entry_ix: int) -> bytes:
+        """Bytes for overlay5 entry ``entry_ix`` — dirty cache first,
+        vanilla overlay payload otherwise. Mirrors the btmap / map
+        dirty-cache pattern."""
+        cached = self._dirty_overlay5_entries.get(entry_ix)
+        if cached is not None:
+            return cached
+        return self.overlay5_index().read_entry(entry_ix)
+
+    def replace_overlay5_entry_bytes(
+        self, entry_ix: int, new_bytes: bytes,
+    ) -> bytes:
+        """Install ``new_bytes`` as the override for entry ``entry_ix``
+        and return the prior bytes — vanilla or a previous edit.
+
+        Enforces the same-length invariant the codec also checks; the
+        splice path depends on it (length-shifting an entry would
+        re-flow every later entry's offset in the pointer table).
+        Raises ``ValueError`` on a length mismatch.
+        """
+        previous = self.overlay5_entry_bytes(entry_ix)
+        if len(new_bytes) != len(previous):
+            raise ValueError(
+                f"overlay5 entry {entry_ix:04d} length mismatch: "
+                f"{len(new_bytes)} vs {len(previous)}"
+            )
+        self._dirty_overlay5_entries[entry_ix] = bytes(new_bytes)
         return previous
 
     def sprite_pak(self, pak_name: str) -> pak.PakFile:
@@ -721,6 +814,29 @@ class RomSession:
                 out, file_start, file_end, ce, compressed,
             )
             fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
+
+    def _apply_overlay5_splice(self, out: bytearray) -> None:
+        """Stamp every dirty overlay5 entry back into the overlay file.
+
+        Same-length only (enforced by ``replace_overlay5_entry_bytes``)
+        so no FAT resize is needed — each entry's byte range stays
+        fixed and downstream entries don't shift. Resolves the overlay
+        file's location through :func:`overlay5.find_overlay_fat_range`
+        against the *current* ROM image so any earlier splice
+        (sprite / btmap / map) that shifted the overlay forward is
+        followed automatically.
+        """
+        if not self._dirty_overlay5_entries:
+            return
+        ovl_start, _ovl_end = overlay5_mod.find_overlay_fat_range(
+            bytes(out), overlay_id=5,
+        )
+        index = self.overlay5_index()
+        for entry_ix, new_entry in self._dirty_overlay5_entries.items():
+            entry_off = index.entry_starts[entry_ix]
+            # In-place write — length already verified at register time.
+            out[ovl_start + entry_off:
+                ovl_start + entry_off + len(new_entry)] = new_entry
 
     # ---- BTCHR sidecar edits ----------------------------------------------
 
@@ -872,6 +988,34 @@ class RomSession:
         held for the lifetime of the session.
         """
         self._digimon_name_cache_valid = False
+
+    def dialog_msg_text(self, msg_id: int) -> Optional[model.GameString]:
+        """Resolve a DIALOG-block ``msg_id`` to its MSG.PAK GameString.
+
+        The dialog group lives at a fixed run of msgpak_all entries: the
+        first dialog (``msg_id == 0``) is the string ending with
+        ``"Are you okay?[BR]...You were quite restless."``. Anchor-search
+        for it once and cache the base index so callers can compute
+        ``msgpak_all[base + msg_id]``. Returns ``None`` for out-of-range
+        ids or if the anchor isn't present (e.g. a heavily-modified
+        MSG.PAK that dropped the system messages).
+        """
+        if self._dialog_msgpak_base is None:
+            strings = self.string_regions.get("msgpak_all", [])
+            anchor = -1
+            for i, s in enumerate(strings):
+                if s.text.endswith("You were quite restless."):
+                    anchor = i
+                    break
+            self._dialog_msgpak_base = anchor
+        base = self._dialog_msgpak_base
+        if base < 0:
+            return None
+        strings = self.string_regions.get("msgpak_all", [])
+        idx = base + int(msg_id)
+        if 0 <= idx < len(strings):
+            return strings[idx]
+        return None
 
     def remember_selection(self, editor_key: str, selection_id: int) -> None:
         """Stash the active row id for ``editor_key`` so a later visit can
@@ -1047,21 +1191,28 @@ class RomSession:
             return None
         return self.spr_sprite_pixmap(spr_idx, max_size=max_size)
 
-    def mchr_sprite_pixmap(self, mchr_idx: int, max_size: int = 80):
-        """Lazy QPixmap of MCHR[mchr_idx] frame 0, or ``None`` on miss.
+    def mchr_sprite_pixmap(
+        self, mchr_idx: int, max_size: int = 80, frame: Optional[int] = None,
+    ):
+        """Lazy QPixmap of MCHR[mchr_idx], or ``None`` on miss.
 
-        Used by the sprite-map row's party-follower overworld preview.
-        Palette index tracks the entry index (the MCHR browser uses the
-        same default: ``min(ix, pal_count - 1)``).
+        ``frame=None`` picks the canonical front-facing pose (frame 3 when
+        available, frame 0 otherwise) — matches the digivolution-menu
+        render and the sprite-map row's party-follower preview. Passing
+        an explicit ``frame`` is used by the Events sidebar's Sprite
+        Frame editor so the marker shows the in-game placement's pose
+        instead of the canonical one.
         """
-        cache_key = (mchr_idx, max_size)
+        cache_key = (mchr_idx, max_size, frame)
         if cache_key in self._mchr_pixmap_cache:
             return self._mchr_pixmap_cache[cache_key]
-        pix = self._build_mchr_pixmap(mchr_idx, max_size)
+        pix = self._build_mchr_pixmap(mchr_idx, max_size, frame)
         self._mchr_pixmap_cache[cache_key] = pix
         return pix
 
-    def _build_mchr_pixmap(self, mchr_idx: int, max_size: int):
+    def _build_mchr_pixmap(
+        self, mchr_idx: int, max_size: int, frame: Optional[int] = None,
+    ):
         from digimon_core import mchr as mchr_mod, sprite
         from PySide6.QtCore import Qt
         from PySide6.QtGui import QImage, QPixmap
@@ -1088,8 +1239,16 @@ class RomSession:
             return None
         # Frame 3 is the canonical front-facing pose for most MCHR entries
         # (matches the in-game digivolution menu); fall back to frame 0 for
-        # short animations that don't have a frame 3.
-        frame_idx = 3 if entry.frame_count > 3 else 0
+        # short animations that don't have a frame 3. Explicit ``frame``
+        # overrides that default — Events sidebar uses it to render the
+        # in-game placement's pose. Out-of-range frame indexes clamp to
+        # the last available frame instead of returning None: the user
+        # may have typed a frame that exists on a different MCHR, and
+        # clamping is friendlier than going blank.
+        if frame is None:
+            frame_idx = 3 if entry.frame_count > 3 else 0
+        else:
+            frame_idx = max(0, min(int(frame), entry.frame_count - 1))
         try:
             rgba, w, h = mchr_mod.render_frame_rgba(entry.frames[frame_idx], palette)
         except (ValueError, IndexError):
@@ -1402,6 +1561,17 @@ class RomSession:
                 for did, name in sorted(
                     constants.DIGIMON_ID_TO_STR.items(), key=lambda kv: kv[0]
                 )
+            )
+        elif kind == "sprite_map":
+            # Every sprite_map slot (digimon + digieggs + bosses + NPCs),
+            # resolved through ``digimon_display_name`` which already
+            # covers all four categories uniformly. Used by editors that
+            # need to pick a sprite_map entry by id without distinguishing
+            # the slot's category — e.g. dialog portrait pickers (the
+            # portrait u16 indexes this same table).
+            rows.extend(
+                (base_id, f"0x{base_id:03x}  {self.digimon_display_name(base_id)}")
+                for base_id in range(len(getattr(self, "sprite_map", [])))
             )
         elif kind == "digimon_evo":
             # Standard-digivolution evo/degen target picker: NO_EVO_SENTINEL
@@ -1811,6 +1981,38 @@ class RomSession:
         """
         for path, data in edits:
             self._dirty_map_files[path] = bytes(data)
+
+    def overlay5_entry_edits(self) -> List[Tuple[int, bytes]]:
+        """Snapshot per-entry overlay5 overrides for the .romproj
+        ``overlay5_edits`` channel.
+
+        Mirrors :meth:`map_file_edits` shape: one tuple per dirty
+        entry, sorted by entry index for stable on-disk output.
+        Project save runs with ``skip_overlay5_splice=True`` and routes
+        the dirty bytes through this channel; on load
+        :meth:`apply_overlay5_entry_edits` re-populates the dirty cache
+        and the next ``serialize_all`` splices them back in.
+        """
+        return [
+            (entry_ix, bytes(data))
+            for entry_ix, data in sorted(self._dirty_overlay5_entries.items())
+        ]
+
+    def apply_overlay5_entry_edits(
+        self, edits: List[Tuple[int, bytes]],
+    ) -> None:
+        """Replay overlay5 entry overrides from a .romproj onto the
+        dirty cache. Same-length invariant is enforced — a project
+        carrying a length-mismatched edit would corrupt the overlay
+        on save, so fail loudly during load instead."""
+        for entry_ix, data in edits:
+            vanilla = self.overlay5_index().read_entry(entry_ix)
+            if len(data) != len(vanilla):
+                raise ValueError(
+                    f"overlay5 entry {entry_ix:04d} project edit length "
+                    f"mismatch: {len(data)} vs {len(vanilla)}"
+                )
+            self._dirty_overlay5_entries[entry_ix] = bytes(data)
 
     def apply_string_edits(self, edits: List[Tuple[str, int, str]]) -> None:
         """Replay logical string edits from a .romproj onto the parsed model.

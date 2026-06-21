@@ -734,6 +734,12 @@ class MainWindow(QMainWindow):
             # Same channel for DAT/map/* field-map file overrides — paint
             # tool edits (walkability, tilemap) round-trip via here.
             session.apply_map_file_edits(project.get("map_edits", []))
+            # Per-entry overlay5 overrides (Events tab x/y drags). The
+            # entries are same-length, so this doesn't grow overlay5;
+            # the next save splices them in through the overlay5 path.
+            session.apply_overlay5_entry_edits(
+                project.get("overlay5_entry_edits", [])
+            )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Failed to load project", str(exc))
             return
@@ -778,6 +784,7 @@ class MainWindow(QMainWindow):
                         skip_sprite_splice=True,
                         skip_btmap_splice=True,
                         skip_map_splice=True,
+                        skip_overlay5_splice=True,
                     )
                 ),
                 qol=self.session.qol,
@@ -786,6 +793,7 @@ class MainWindow(QMainWindow):
                 btchr_appended_sidecars=self.session.btchr_appended_sidecars(),
                 btmap_edits=self.session.btmap_file_edits(),
                 map_edits=self.session.map_file_edits(),
+                overlay5_entry_edits=self.session.overlay5_entry_edits(),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Failed to save project", str(exc))

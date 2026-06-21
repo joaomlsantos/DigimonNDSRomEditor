@@ -11,7 +11,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from PySide6.QtGui import QUndoCommand
 
-from digimon_core import btchr, btchrspr
+from digimon_core import btchr, btchrspr, overlay5 as overlay5_mod
 
 
 # All SetAttrCommands share one id so the QUndoStack will *attempt* to merge
@@ -230,6 +230,352 @@ class ReplaceMapFileCommand(QUndoCommand):
         self._session.replace_map_file_bytes(self._path, self._old_bytes)
         if self._on_change is not None:
             self._on_change()
+
+
+class MoveOverworldSpriteCommand(QUndoCommand):
+    """Atomic (x, y) flip of one OVERWORLD_SPRITE block in an overlay5 entry.
+
+    The block-level splice goes through ``overlay5.replace_sprite_xy``,
+    which only touches the 4-byte x/y window — every other byte of the
+    entry is preserved. The full entry bytes round-trip through
+    ``session.replace_overlay5_entry_bytes`` so undo restores the exact
+    same payload the user was looking at before the drag.
+
+    ``on_change(new_x, new_y)`` is called on both redo and undo so the
+    Events canvas can re-sync the marker position without rebuilding
+    every marker on the map.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        new_x: int,
+        new_y: int,
+        description: str,
+        on_change: Optional[Callable[[int, int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._on_change = on_change
+        # Snapshot the current placement so undo restores the exact x/y
+        # the user dragged away from. Sample the live block bytes at
+        # init time — pushing the command triggers redo, so this is the
+        # last moment we can see the pre-drag value.
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.OverworldSpritePlacement.from_bytes(
+            entry, block_offset,
+        )
+        self._old_xy = (prev.x, prev.y)
+        self._new_xy = (int(new_x), int(new_y))
+
+    def _apply(self, x: int, y: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_sprite_xy(
+            entry, self._block_offset, x, y,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(x, y)
+
+    def redo(self) -> None:
+        self._apply(*self._new_xy)
+
+    def undo(self) -> None:
+        self._apply(*self._old_xy)
+
+
+class EditOverworldSpriteIdCommand(QUndoCommand):
+    """Atomic sprite-id swap of one OVERWORLD_SPRITE block.
+
+    Only the u16 at block_offset+2 changes; ``overlay5.replace_sprite_id``
+    enforces the opcode guard. ``on_change(new_id)`` fires on redo/undo
+    so the Events sidebar + canvas can re-pull label/pixmap without
+    rebuilding the whole layer.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        new_sprite_id: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.OverworldSpritePlacement.from_bytes(
+            entry, block_offset,
+        )
+        self._old_id = prev.overworld_sprite_id
+        self._new_id = int(new_sprite_id) & 0xFFFF
+
+    def _apply(self, sprite_id: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_sprite_id(
+            entry, self._block_offset, sprite_id,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(sprite_id)
+
+    def redo(self) -> None:
+        self._apply(self._new_id)
+
+    def undo(self) -> None:
+        self._apply(self._old_id)
+
+
+class EditOverworldSpriteBehaviorCommand(QUndoCommand):
+    """Atomic behavior (= sprite frame) swap on one OVERWORLD_SPRITE block.
+
+    Mirrors :class:`EditOverworldSpriteIdCommand` for the u16 at
+    ``block_offset + 24``. ``on_change(new_behavior)`` fires on
+    redo/undo so the Events sidebar + canvas can re-render the marker
+    with the new frame without rebuilding the layer.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        new_behavior: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.OverworldSpritePlacement.from_bytes(
+            entry, block_offset,
+        )
+        self._old = prev.behavior
+        self._new = int(new_behavior) & 0xFFFF
+
+    def _apply(self, behavior: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_sprite_behavior(
+            entry, self._block_offset, behavior,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(behavior)
+
+    def redo(self) -> None:
+        self._apply(self._new)
+
+    def undo(self) -> None:
+        self._apply(self._old)
+
+
+class EditExitBoxCommand(QUndoCommand):
+    """Atomic bounding-box edit of one 0x001b exit-zone block.
+
+    Only the four u16 corners change; idx / flag / dst u32 are preserved
+    by ``overlay5.replace_exit_box``. ``on_change(x1, y1, x2, y2)`` fires
+    on redo/undo so the Events canvas can repaint the rectangle without
+    rebuilding the prologue.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        new_x1: int,
+        new_y1: int,
+        new_x2: int,
+        new_y2: int,
+        description: str,
+        on_change: Optional[Callable[[int, int, int, int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.ExitZone.from_bytes(entry, block_offset)
+        self._old = (prev.x1, prev.y1, prev.x2, prev.y2)
+        self._new = (
+            int(new_x1) & 0xFFFF, int(new_y1) & 0xFFFF,
+            int(new_x2) & 0xFFFF, int(new_y2) & 0xFFFF,
+        )
+
+    def _apply(self, box: tuple) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_exit_box(
+            entry, self._block_offset, *box,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(*box)
+
+    def redo(self) -> None:
+        self._apply(self._new)
+
+    def undo(self) -> None:
+        self._apply(self._old)
+
+
+class EditExitDestinationCommand(QUndoCommand):
+    """Atomic edit of an exit handler's CALL_SCRIPT_AT_OFFSET u32.
+
+    Repoints which destination entry the handler jumps to. Shared
+    handlers (multiple 0x001b blocks with the same ``dst_file_off``)
+    all observe the change — by design, since the editor can't grow
+    overlay5 to allocate a fresh handler. ``on_change(new_dest)`` fires
+    so the sidebar can re-resolve the destination map_id label.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        handler_rel_offset: int,
+        new_dest_file_off: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._handler_rel_offset = handler_rel_offset
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.ExitHandler.from_bytes(entry, handler_rel_offset)
+        if prev is None:
+            raise ValueError(
+                f"no exit handler at rel 0x{handler_rel_offset:04x} "
+                f"in entry {entry_ix}"
+            )
+        self._old_dest = prev.dest_file_off
+        self._new_dest = int(new_dest_file_off) & 0xFFFFFFFF
+
+    def _apply(self, dest: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_exit_handler_dest(
+            entry, self._handler_rel_offset, dest,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(dest)
+
+    def redo(self) -> None:
+        self._apply(self._new_dest)
+
+    def undo(self) -> None:
+        self._apply(self._old_dest)
+
+
+class EditExitSpawnArgCommand(QUndoCommand):
+    """Atomic edit of an exit handler's op 0x0002 u32 arg.
+
+    The arg's meaning is currently unknown (presumed spawn-side
+    selector in the destination map); the editor surfaces it as a raw
+    u32 so the user can tweak it manually. Same shared-handler caveat
+    as :class:`EditExitDestinationCommand`.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        handler_rel_offset: int,
+        new_spawn_arg: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._handler_rel_offset = handler_rel_offset
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.ExitHandler.from_bytes(entry, handler_rel_offset)
+        if prev is None:
+            raise ValueError(
+                f"no exit handler at rel 0x{handler_rel_offset:04x} "
+                f"in entry {entry_ix}"
+            )
+        self._old_arg = prev.spawn_arg
+        self._new_arg = int(new_spawn_arg) & 0xFFFFFFFF
+
+    def _apply(self, arg: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_exit_handler_spawn_arg(
+            entry, self._handler_rel_offset, arg,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(arg)
+
+    def redo(self) -> None:
+        self._apply(self._new_arg)
+
+    def undo(self) -> None:
+        self._apply(self._old_arg)
+
+
+class EditDialogFieldCommand(QUndoCommand):
+    """Atomic edit of one u16 field (target / msg_id / portrait) inside
+    a 12-byte DIALOG block.
+
+    Same-length splice so the entry's byte budget is untouched. Dialog
+    blocks can be reached from multiple objects (a sprite's string_ptr
+    and a nearby hitbox's dst can land on the same offset); changes are
+    observed by every caller — by design, since we can't allocate a
+    fresh block. ``on_change(new_value)`` fires after redo/undo so the
+    sidebar can refresh its label.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        field: str,
+        new_value: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._field = field
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.DialogBlock.from_bytes(entry, block_offset)
+        self._old_value = getattr(prev, field)
+        self._new_value = int(new_value) & 0xFFFF
+
+    def _apply(self, value: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_dialog_field(
+            entry, self._block_offset, self._field, value,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(value)
+
+    def redo(self) -> None:
+        self._apply(self._new_value)
+
+    def undo(self) -> None:
+        self._apply(self._old_value)
 
 
 # FAT path for BTCHR.PAK — duplicated here (also defined in btchr_browser)

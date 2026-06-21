@@ -40,9 +40,14 @@ from digimon_core import qol as qol_module
 #     map (DAT/map/...) files edited via the field-map browser's paint
 #     tools. Same shape as btmap_edits; routed through the field-map FAT
 #     splice on save.
+# v7: adds overlay5_entry_edits channel — per-entry replacement bytes for
+#     overlay 5 script entries edited via the field-map Events tab.
+#     Keyed by entry index (235..498); routed through the overlay5 splice
+#     on save. Entry length is invariant — only x/y windows flip — so
+#     this channel never grows the overlay5 file.
 # Loader accepts every prior version; saver always writes the current version.
-FORMAT_VERSION = 6
-_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6)
+FORMAT_VERSION = 7
+_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
 EDITOR_VERSION = "0.1.0"
 
 
@@ -51,6 +56,7 @@ SpriteEdit = Tuple[str, int, bytes]  # (pak_name, entry_idx, new_entry_bytes)
 BtchrAppendedSidecar = Tuple[int, int]  # (chrsize_word, btchrsize_value)
 BtmapEdit = Tuple[str, bytes]  # (fat_path, file_bytes)
 MapEdit = Tuple[str, bytes]  # (fat_path, file_bytes) — DAT/map/* overrides
+Overlay5EntryEdit = Tuple[int, bytes]  # (entry_ix, entry_bytes)
 
 
 def vanilla_sha256(rom_bytes: bytes) -> str:
@@ -115,6 +121,7 @@ def save_project(
     btchr_appended_sidecars: List[BtchrAppendedSidecar] = (),
     btmap_edits: List[BtmapEdit] = (),
     map_edits: List[MapEdit] = (),
+    overlay5_entry_edits: List[Overlay5EntryEdit] = (),
 ) -> None:
     """Write a .romproj at `path`.
 
@@ -158,6 +165,12 @@ def save_project(
     ``(fat_path, file_bytes)`` tuples — same shape as ``btmap_edits``,
     routed through ``_apply_map_splice`` on save and replayed via
     ``apply_map_file_edits`` on load.
+
+    `overlay5_entry_edits` carries per-entry overlay5 script overrides
+    as ``(entry_ix, entry_bytes)`` tuples. Entry length is invariant, so
+    these never grow the overlay5 file — they're skipped in the
+    serialize step and replayed via ``apply_overlay5_entry_edits`` on
+    load before the next save runs them through the overlay5 splice.
     """
     diffs = compute_byte_diff(vanilla_rom_data, edited_rom_data)
     payload = {
@@ -190,6 +203,10 @@ def save_project(
             {"path": path, "bytes": base64.b64encode(data).decode("ascii")}
             for path, data in map_edits
         ],
+        "overlay5_entry_edits": [
+            {"entry_ix": ix, "bytes": base64.b64encode(data).decode("ascii")}
+            for ix, data in overlay5_entry_edits
+        ],
     }
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -200,10 +217,11 @@ def load_project(path: str) -> dict:
     ``(region_id, vanilla_offset, new_text)`` tuples (empty for v1 projects),
     sprite_edits as a list of ``(pak_name, entry_idx, new_entry_bytes)``
     tuples (empty for v1/v2 projects), btmap_edits as a list of
-    ``(fat_path, file_bytes)`` tuples (empty for v1-v4 projects), and
+    ``(fat_path, file_bytes)`` tuples (empty for v1-v4 projects),
     map_edits as a list of ``(fat_path, file_bytes)`` tuples (empty for
-    v1-v5 projects). Caller resolves the vanilla ROM and verifies the
-    hash separately."""
+    v1-v5 projects), and overlay5_entry_edits as a list of
+    ``(entry_ix, entry_bytes)`` tuples (empty for v1-v6 projects).
+    Caller resolves the vanilla ROM and verifies the hash separately."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     fmt = data.get("format_version")
     if fmt not in _ACCEPTED_VERSIONS:
@@ -235,5 +253,9 @@ def load_project(path: str) -> dict:
     data["map_edits"] = [
         (entry["path"], base64.b64decode(entry["bytes"]))
         for entry in data.get("map_edits", [])
+    ]
+    data["overlay5_entry_edits"] = [
+        (entry["entry_ix"], base64.b64decode(entry["bytes"]))
+        for entry in data.get("overlay5_entry_edits", [])
     ]
     return data

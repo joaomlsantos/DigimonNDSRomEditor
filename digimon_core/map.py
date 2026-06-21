@@ -603,9 +603,9 @@ def apply_walkability_overlay(
     row; here we walk the overlap region at the walkability's own
     stride.
 
-    The overlay uses alpha-over so the underlying render is still legible
-    through the tint; default ``alpha=110`` matches the standalone
-    ``map_overlay.py`` script.
+    The overlay alpha-blends the tint over the source, then overlays a
+    diagonal hatch every 4 px so blocked tiles read as textured rather than
+    merely red-tinted — disambiguating from red-floored maps.
     """
     bytes_needed = (walk_width * walk_height + 7) // 8
     if len(bits) < bytes_needed:
@@ -617,6 +617,11 @@ def apply_walkability_overlay(
     out = bytearray(src)
     tr, tg, tb = tint
     inv = 255 - alpha
+    # Hatch line color: darker than the tint, fully opaque, so it
+    # contrasts against both tinted blocked tiles AND red-floored maps.
+    hr = max(0, tr - 120)
+    hg = max(0, tg - 30) if tg else 0
+    hb = max(0, tb - 30) if tb else 0
     overlap_w = min(walk_width, preview.width)
     overlap_h = min(walk_height, preview.height)
     pw = preview.width
@@ -628,11 +633,18 @@ def apply_walkability_overlay(
             if not ((bits[bit_ix >> 3] >> (bit_ix & 7)) & 1):
                 continue
             off = (comp_row + x) * 4
-            # alpha-over: out = src * (1 - a) + tint * a
-            out[off] = (src[off] * inv + tr * alpha) // 255
-            out[off + 1] = (src[off + 1] * inv + tg * alpha) // 255
-            out[off + 2] = (src[off + 2] * inv + tb * alpha) // 255
-            out[off + 3] = 255
+            if (x + y) & 3 == 0:
+                # diagonal hatch — solid dark-red line
+                out[off] = hr
+                out[off + 1] = hg
+                out[off + 2] = hb
+                out[off + 3] = 255
+            else:
+                # alpha-over: out = src * (1 - a) + tint * a
+                out[off] = (src[off] * inv + tr * alpha) // 255
+                out[off + 1] = (src[off + 1] * inv + tg * alpha) // 255
+                out[off + 2] = (src[off + 2] * inv + tb * alpha) // 255
+                out[off + 3] = 255
     return MapPreview(rgba=bytes(out), width=preview.width, height=preview.height)
 
 

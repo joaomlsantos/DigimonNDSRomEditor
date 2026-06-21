@@ -800,3 +800,188 @@ Phases A–F ship; this subsection tracks the import-quality follow-ups landed a
 - *Per-layer palette view* — proposed as a UI follow-up to the bank-detection work: a Layer A / Layer B tab on the NCLR panel that hides banks owned by the other layer. Not built. Cheap to add once we want it.
 - *NaXn animation editing* — §14.4 G still deferred. The "none"-schema frames (the unknown OBJ-overlay path) still render as static base in the browser; the `dominant_bank` mitigation is in place for "all"/"dominant_bank" frames. Memory: `project_btmap_anim_schemas.md`.
 - *Clustering quality tuning* — k-means++ landed with `refine_iters=3`. Worth re-running the debug overlay on production maps to see whether more Lloyd iterations or a tweaked weighting helps the lowest-budget regions (bottom of the courtroom map etc.). Not urgent.
+
+## 14.9 Plan: Field map Events tab (overworld sprite placement)
+
+### 14.9.1 Findings
+
+**`OVERWORLD_SPRITE` payload (overlay5 opcode `0x0150`).** Validated against Dark Market (map 29 ↔ overlay5 entry 0264, 7 NPCs — see `research_docs/claude_notes/_overlay5_annotated/0264_sprite_overlay.png` for the visual fit). Total 22 bytes:
+
+| Offset | Type | Field | Notes |
+|---:|---|---|---|
+| 0 | u16 | `digimon_id` | indexes `sprite_map`; → `sprite_map[id].unknown_0x4` → MCHR_CHR slot |
+| 2 | u16 | `x` | pixel-space, origin top-left of the rendered map |
+| 4 | u16 | `y` | pixel-space, top-left origin |
+| 6 | u16 | `slot` | 1-based instance slot used as `tgt` by DIALOG / REACTION_BALLOON opcodes for this sprite |
+| 8 | u16 | `facing` | constant `0x0100` across the corpus — likely initial facing |
+| 10 | u16 | `reserved` | constant `0x0000` |
+| 12 | u16 | `slot_again` | mirror of `slot` |
+| 14 | u32 | `string_ptr` | ARM9-text / overlay-5 pointer to NPC name string; `0` for tutorial NPCs |
+| 18 | u16 | `radius` | constant `0x0064` (= 100) — interaction radius or walk speed |
+| 20 | u16 | `slot_again2` | mirror of `slot` |
+| 22 | u16 | `behavior` | `0x0003` for counter-bound NPCs, `0x0004` for wandering NPCs (Braun/Tentomon class) |
+
+Editor scope for §14.9 is x/y only. Other fields are documented for later.
+
+**Entry → map mapping.** `entry_ix - 235` for entries 235..499. 265 field-map entries, 1-to-1 with map ids 0..264. Same offset can be shared by multiple entries (farm islands 0288..0304 all point at entry 0235's blob); for v1 each map picks its `235+map_id` entry directly. Multi-entry-per-map (alternate game states like "shop system down") is deferred.
+
+**`DAT/EC/ENCTBL.BIN` shape** (not for this milestone — captured here for the wild-encounter rework). Total 0x84c = 2124 bytes. Layout: `u32 header (0xffffffff) + 265 × 8-byte entries`. 265 = exact map count, so this is the map → encounter-area lookup. First record bytes `01 00 10 00 00 00 4a 00`. Decode TBD; do not edit until the table is decoded.
+
+### 14.9.2 Architecture
+
+- `digimon_core/overlay5.py` (new). `Overlay5Index.from_file_table(ft, rom)` resolves the overlay file via the FAT (overlay 5 = file id from the ARM9 overlay table at ROM `0x50`), reads the entry pointer table, and exposes:
+  - `read_entry(entry_ix) -> bytes` — entry bytes via the next-sorted-pointer boundary, mirroring the research splitter.
+  - `iter_overworld_sprites(entry_bytes) -> list[OverworldSpritePlacement]` — walks the script body, finds `0x0150` opcodes, returns per-occurrence `(byte_offset, digimon_id, x, y, slot, ...)`.
+  - `replace_sprite_xy(entry_bytes, sprite_offset, x, y) -> bytes` — pure-bytes splice at the known x/y offsets within the 22-byte block. No resize (memory `project_overlay5_resize_blocked.md`).
+  - `map_id_for(entry_ix)` / `entry_ix_for_map(map_id)`.
+- Session-side dirty cache mirrors the btmap pattern: `_dirty_overlay5_entries: dict[int, bytes]`, with `overlay5_entry_bytes(ix)` / `replace_overlay5_entry_bytes(ix, new_bytes) -> previous`, and `_apply_overlay5_splice(out)` writing each cached entry back at its overlay-5 offset. Splice runs inside `serialize_all()`; project-save passes `skip_overlay5_splice=True` and persists the per-entry diff in a new `overlay5_edits` channel.
+- `Overlay5Index` is built off `original_rom_data` and cached on the session next to `vanilla_file_table()`.
+
+### 14.9.3 UI
+
+- New `_build_events_tab` page in `editor/widgets/map_browser.py`, added between Walkability and Composite.
+- Composite map render on a `QGraphicsView`/`QGraphicsScene` (NOT the `PaintCanvas` — we need item-level drag, not pixel paint).
+- For each unique `digimon_id` in the entry, one `QGraphicsPixmapItem` subclass placed at `(x, y)` anchored at the sprite's foot (bottom-center for MCHR frames). First occurrence wins on duplicate ids — per the user, identical-id duplicates in the same entry are excluded.
+- Markers are `ItemIsMovable`; drag emits `positionChanged(sprite_offset, x, y)`. Release pushes `MoveOverworldSpriteCommand(QUndoCommand)` which calls `overlay5.replace_sprite_xy` + `session.replace_overlay5_entry_bytes`.
+- Sprites without a resolvable MCHR fall back to a coloured disc + hex id badge.
+- No sidebar list this milestone — markers carry their own label on hover.
+
+### 14.9.4 Phasing
+
+| Phase | Output |
+|---|---|
+| **A — Codec** | `digimon_core/overlay5.py` + tests against entry 0264 (7 sprites, exact x/y match) |
+| **B — Session integration** | `Overlay5Index` cached on session; `overlay5_entry_bytes` / `replace_overlay5_entry_bytes`; `_apply_overlay5_splice`; ROM round-trip test (no-edit pass byte-identical) |
+| **C — Events tab read-only** | tab renders composite map + coloured-disc markers at correct x/y |
+| **D — Marker art** | resolve digimon_id → MCHR pixmap via `session.mchr_sprite_pixmap`; fall back to disc + id |
+| **E — Drag** | `ItemIsMovable` + `MoveOverworldSpriteCommand`; drag persists through undo/redo |
+| **F — ROM save** | edited x/y survive `serialize_all` → re-open → reparse |
+| **G — `.romproj`** | `overlay5_edits` channel mirrors `map_edits` / `btmap_edits`; project save excludes splice, load replays it |
+
+### 14.9.5 Risks
+
+- **Same-id duplicates.** Some entries spawn the same digimon at multiple positions (Tournament audience etc.); first-occurrence rendering hides the rest. Acceptable for v1; a "show all instances" toggle is the obvious follow-up.
+- **Multi-entry per map.** Story states (Shine shop intro vs. Tournament vs. post-Tournament) share a map id with different overlay5 entries. `235+map_id` picks one; the others stay invisible until the planned "Game state" dropdown ships.
+- **Entry boundary heuristic.** Per `overlay5_annotate.py`, entry 0499's boundary overshoots into shared blob — flagged but harmless for read; **avoid editing entry 0499 sprites until the terminator is pinned** (its bytes after the real script end may belong to another entry).
+- **`.romproj` v6 → v7.** Adding `overlay5_edits` is a schema bump; load path must default-empty the channel for v6 saves.
+
+### 14.9.6 Acceptance criteria
+
+- Selecting map 29 in the Field Maps editor opens an Events tab with 7 markers laid out matching `0264_sprite_overlay.png`.
+- Dragging any marker updates its on-screen position; releasing pushes a `QUndoCommand` and `Ctrl+Z` reverts to the previous x/y.
+- Saving the ROM and re-opening shows the same dragged positions, verified by re-parsing entry 0264 and comparing bytes 2-5 of the dragged sprite against the dragged coords.
+- Re-opening a `.romproj` saved post-drag restores the edit without leaving the underlying ROM byte diff bloated by overlay5 shifts.
+
+## 14.10 Events tab — exit zones, spawn points, interaction hitboxes
+
+Extension of §14.9 once the sprite-drag flow shipped. Same tab, three new
+object kinds parsed from the `0x001b` (EXIT_ZONE) prologue blocks defined
+in `digimon_core/overlay5.py`. Visible directly in the editor sidebar; no
+new tab.
+
+### 14.10.1 Findings
+
+**Tile → pixel scale = 8, not 16.** EXIT_ZONE `x1/y1/x2/y2` are tile
+coordinates relative to the *rectilinear* map grid. The on-screen field
+map is rendered iso-projected so a naive x16 / x8 ambiguity exists; one
+round of experiments confirmed multiplying by 8 places boxes exactly on
+top of their visual triggers. `_TILE_PIXEL_SCALE = 8` in
+`editor/widgets/events_canvas.py`.
+
+**Three kinds of 0x001b block** (per-zone classification, not file-wide):
+
+1. **Spawn-arrival marker** — `dst_file_off == 0`. The engine drops the
+   player at `(x1, y1)` when entering this map from a different map's
+   exit. Box extent is usually degenerate (point boxes, single-axis
+   1-tile offset) and is ignored by the engine. `ExitZone.is_spawn` was
+   tightened from `dst==0 AND x1==x2 AND y1==y2` to plain `dst==0`
+   because entry 0259 idx=11 (`x1==x2, y1=y2+1`, dst=0) behaves as a
+   spawn in-game.
+
+2. **Standard map exit** — `dst_file_off != 0` AND the handler at
+   `dst_file_off` begins with the fade+call prefix
+   (`02 00 [u32 spawn_arg] 30 00 [u32 dest_file_off]`,
+   :class:`ExitHandler`). The handler is a plain script that fades out,
+   calls into the destination entry, and the destination's first SPAWN
+   marker (or one selected by `spawn_arg`) decides arrival position.
+   This is the kind we already supported.
+
+3. **Interaction hitbox** — `dst_file_off != 0` AND the handler does
+   NOT decode as fade+call. The handler is a bespoke script for a
+   locked gate, sign, NPC-trigger, etc. — too varied to model
+   generically. Surface as read-only.
+
+**The `flag` u16 is destination-specific, not load-bearing.** Entry
+0259 ships three real map exits at flags `0x03`, `0x06`, `0x09` (going
+to maps 23, 27, 28 respectively). Earlier code keyed "is real exit" off
+`flag == 0x0006` and mis-classified ⅔ of vanilla map exits. The
+classification now keys purely on `ExitHandler.from_bytes` success.
+
+### 14.10.2 UI
+
+- **Canvas** (`editor/widgets/events_canvas.py`). One
+  `_ExitZoneItem(QGraphicsRectItem)` per zone, drawn at
+  `(x*8, y*8)` with size `((x2-x1+1)*8, (y2-y1+1)*8)`. Three colour
+  channels:
+  - Exits — blue outline / fill, label `E{display_idx}`, draggable.
+  - Hitboxes — orange outline / fill, label `H{display_idx}`,
+    *not* draggable.
+  - Spawns — green diamond marker, label `S{display_idx}`, draggable.
+  Display indices are per-type sequential (`E0, E1, …` / `S0, S1, …`)
+  rather than the raw `idx` field — the user reads them as ordinal
+  counters, not engine identifiers.
+- **Drag.** `ItemIsMovable + ItemSendsGeometryChanges` on exit/spawn
+  items. Mouse-release snaps `(end_pos / 8)` to integer tiles, computes
+  `(dx, dy)`, rejects negative / >0xFFFF coords, then calls the
+  injected `exit_moved_cb(block_offset, new_x1, new_y1, new_x2, new_y2)`
+  which routes through `EditExitBoxCommand` (same undo command the
+  sidebar spinbox edits use).
+- **Sidebar** (`editor/widgets/map_browser.py`). `QListWidget` ordered
+  Sprites → Exits → Hitboxes → Spawns, each row tagged with
+  `_EVT_ROW_TYPE_ROLE`. Stacked form pages indexed by
+  `_EVT_PAGE_{SPRITE,EXIT,SPAWN,HITBOX,EMPTY}`:
+  - Exit page (page 1): editable `(x1,y1)`/`(x2,y2)`, destination
+    combo, `spawn_arg` spinbox, handler @entry+offset label.
+  - Spawn page (page 3): editable `(x, y)` (writes `x1=x2`, `y1=y2`).
+  - **Hitbox page (page 4, new):** read-only `(x1,y1)`/`(x2,y2)` and a
+    `handler @entry NNNN +0xNNNN` location label. No editable fields —
+    a `"<i>… Read-only.</i>"` notice explains why.
+
+### 14.10.3 Codec / serialisation
+
+No file-format changes — EXIT_ZONE edits are byte-identical splices via
+`overlay5.replace_exit_box` / `replace_exit_handler_dest` /
+`replace_exit_handler_spawn_arg`. They flow through the existing
+`overlay5_entry_edits` channel introduced for sprite-drag (§14.9 G), so
+`.romproj` v7 already covers them. Hitboxes are read-only and therefore
+never write back.
+
+### 14.10.4 Annotation script
+
+`research_docs/claude_notes/overlay5_annotate.py` was extended with a
+`try_exit_zone` recogniser that emits one line per 18-byte 0x001b block
+(`EXIT_ZONE idx=… box=(…)-(…)  flag=0xNNNN  dst=0xNNNNN` or `SPAWN …`
+when `dst==0`). The pattern is gated to the prologue region detected by
+walking the documented prologue opcode set
+(`_PROLOGUE_OPCODE_SIZES`, kept in sync with `digimon_core/overlay5.py`)
+— necessary because zone payload bytes can otherwise spell `3E 00 …`
+and trip the MOVE_END recogniser. Aggregate counts across the corpus
+(post-extension): 1171 EXIT_ZONE + 1074 SPAWN tokens.
+
+### 14.10.5 Risks / known gaps
+
+- **Hitbox → script lookup not wired.** Each hitbox carries a
+  `handler @entry NNNN +0xNNNN` label so the curious user can grep
+  `_overlay5_annotated/NNNN.txt`, but we don't render the actual script
+  bytes in the form. Investigated for map 28 (entry 0263) — the
+  bespoke handlers there hit `0x009a` at `+0x12` with a u16 sprite-slot
+  that *coincidentally* matches one OVERWORLD_SPRITE.slot, but map 29
+  (entry 0264) uses a different shape with no `0x009a`. No universal
+  field exists, so a per-handler decoder would have to be hand-written
+  per opcode shape. Deferred.
+- **Handler edits don't propagate to siblings.** Three zones may share
+  the same handler (e.g. entry 0259 zones 4/5/6 all use `0x0dd68`);
+  editing the destination via one zone's form updates the others'
+  destinations too (handler is a single 12-byte prefix). The combo
+  reflects this correctly on next reload, but there's no UI affordance
+  warning the user before they commit.
