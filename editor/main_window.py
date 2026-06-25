@@ -71,6 +71,7 @@ from .widgets.btchr_browser import BtchrBrowser
 from .widgets.btmap_browser import BtmapBrowser
 from .widgets.map_browser import MapBrowser
 from .widgets.mchr_browser import MchrBrowser
+from .widgets.sound_editor import SoundEditor
 from .widgets.sprite_browser import SpriteBrowser
 from .widgets.standard_digivolution_editor import (
     StandardDigivolutionEditor,
@@ -143,6 +144,9 @@ NAV_GROUPS = [
         ("Battle Sprites", "btchr_browser"),
         ("Battle Backgrounds", "btmap_browser"),
         ("Field Maps", "map_browser"),
+    ]),
+    ("Sound", [
+        ("BGMs", "sound_editor"),
     ]),
     ("Settings", [
         ("QoL Toggles", "qol_settings"),
@@ -740,6 +744,13 @@ class MainWindow(QMainWindow):
             session.apply_overlay5_entry_edits(
                 project.get("overlay5_entry_edits", [])
             )
+            # Staged BGM swap payloads (Sound editor). Replayed onto the
+            # swap cache so the next ROM save runs them through the
+            # SDAT rebuild + splice path.
+            session.apply_bgm_swap_edits(project.get("bgm_swap_edits", []))
+            # Staged "Add As New Entry" additions; positional, applied
+            # in list order by the same SDAT splice path.
+            session.apply_bgm_addition_edits(project.get("bgm_addition_edits", []))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Failed to load project", str(exc))
             return
@@ -785,6 +796,7 @@ class MainWindow(QMainWindow):
                         skip_btmap_splice=True,
                         skip_map_splice=True,
                         skip_overlay5_splice=True,
+                        skip_sound_splice=True,
                     )
                 ),
                 qol=self.session.qol,
@@ -794,6 +806,8 @@ class MainWindow(QMainWindow):
                 btmap_edits=self.session.btmap_file_edits(),
                 map_edits=self.session.map_file_edits(),
                 overlay5_entry_edits=self.session.overlay5_entry_edits(),
+                bgm_swap_edits=self.session.bgm_swap_edits(),
+                bgm_addition_edits=self.session.bgm_addition_edits(),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Failed to save project", str(exc))
@@ -1127,6 +1141,8 @@ class MainWindow(QMainWindow):
             return BtmapBrowser(self.session, self.undo_stack)
         if key == "map_browser":
             return MapBrowser(self.session, self.undo_stack)
+        if key == "sound_editor":
+            return SoundEditor(self.session, self.undo_stack)
         if key.startswith("strings_bucket:"):
             bucket = key.split(":", 1)[1]
             prefix = _STRING_BUCKET_PREFIXES.get(bucket)

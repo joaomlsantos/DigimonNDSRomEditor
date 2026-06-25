@@ -12,6 +12,7 @@ from typing import Any, Callable, List, Optional, Tuple
 from PySide6.QtGui import QUndoCommand
 
 from digimon_core import btchr, btchrspr, overlay5 as overlay5_mod
+from digimon_core.sound.swap import BgmSwap
 
 
 # All SetAttrCommands share one id so the QUndoStack will *attempt* to merge
@@ -805,5 +806,147 @@ class AppendPakEntriesCommand(QUndoCommand):
             pak_obj.flags.pop()
             pak_obj.count -= 1
             self._session.mark_sprite_pak_dirty(pak_name)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class StageBgmSwapCommand(QUndoCommand):
+    """Stage a donor ``BgmSwap`` against its ``target_bgm_id`` slot.
+
+    Captures whatever swap was staged on that slot before (or ``None``
+    for vanilla) so undo flips back to the prior state — chained
+    Replace + Replace + Undo round-trips back to the first donor, not
+    to vanilla. ``on_change`` lets the SoundEditor refresh the ROM list
+    marker and footer after each flip.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        swap: BgmSwap,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._target_id = swap.target_bgm_id
+        self._new_swap = swap
+        self._prev_swap: Optional[BgmSwap] = session.staged_bgm_swap(
+            swap.target_bgm_id
+        )
+        self._on_change = on_change
+
+    def redo(self) -> None:
+        self._session.stage_bgm_swap(self._new_swap)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        if self._prev_swap is None:
+            self._session.revert_bgm_swap(self._target_id)
+        else:
+            self._session.stage_bgm_swap(self._prev_swap)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class RevertBgmSwapCommand(QUndoCommand):
+    """Drop the staged swap on ``target_bgm_id``; undo restages it.
+
+    No-op if the slot is already vanilla — the caller should gate the
+    Revert button on ``session.staged_bgm_swap(id) is not None`` so we
+    don't push empty undo entries onto the stack.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        target_bgm_id: int,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._target_id = target_bgm_id
+        self._prev_swap: Optional[BgmSwap] = session.staged_bgm_swap(target_bgm_id)
+        self._on_change = on_change
+
+    def redo(self) -> None:
+        self._session.revert_bgm_swap(self._target_id)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        if self._prev_swap is not None:
+            self._session.stage_bgm_swap(self._prev_swap)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class AddBgmCommand(QUndoCommand):
+    """Append a donor ``BgmSwap`` as a brand-new BGM slot ("Add As New Entry").
+
+    Each addition gets bgm_id ``vanilla_seq_count + position`` at save time.
+    Undo pops it from the staged-additions list at the position the redo
+    placed it; redo re-inserts at that same position so undo-redo round-
+    trips are stable even when the user has staged other additions in
+    between.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        swap: BgmSwap,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._new_swap = swap
+        self._index: Optional[int] = None
+        self._on_change = on_change
+
+    def redo(self) -> None:
+        self._index = self._session.stage_bgm_addition(
+            self._new_swap, index=self._index,
+        )
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        if self._index is not None:
+            self._session.revert_bgm_addition(self._index)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class RevertBgmAdditionCommand(QUndoCommand):
+    """Drop a staged addition at ``index``; undo restages it at the same index.
+
+    Caller should gate the button on the index being valid so we don't
+    push empty undo entries.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        index: int,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._index = index
+        self._removed: Optional[BgmSwap] = None
+        self._on_change = on_change
+
+    def redo(self) -> None:
+        self._removed = self._session.revert_bgm_addition(self._index)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        if self._removed is not None:
+            self._session.stage_bgm_addition(self._removed, index=self._index)
         if self._on_change is not None:
             self._on_change()

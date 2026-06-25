@@ -45,9 +45,19 @@ from digimon_core import qol as qol_module
 #     Keyed by entry index (235..498); routed through the overlay5 splice
 #     on save. Entry length is invariant — only x/y windows flip — so
 #     this channel never grows the overlay5 file.
+# v8: adds bgm_swap_edits channel — staged donor BGM payloads (SSEQ/SBNK/
+#     SWAR triples) keyed by target ``bgm_id``. Routed through the SDAT
+#     rebuild + splice on ROM save; project save runs with
+#     ``skip_sound_splice=True`` so a grown SDAT doesn't shift every
+#     later FAT file into the byte diff.
+# v9: adds bgm_addition_edits channel — staged "Add As New Entry" donor
+#     payloads (same SSEQ/SBNK/SWAR triple shape) that grow the SDAT by
+#     one BGM slot each. Positional: list order encodes the eventual
+#     bgm_id (vanilla_seq_count + position). Routed through the same SDAT
+#     splice path as bgm_swap_edits.
 # Loader accepts every prior version; saver always writes the current version.
-FORMAT_VERSION = 7
-_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
+FORMAT_VERSION = 9
+_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
 EDITOR_VERSION = "0.1.0"
 
 
@@ -57,6 +67,10 @@ BtchrAppendedSidecar = Tuple[int, int]  # (chrsize_word, btchrsize_value)
 BtmapEdit = Tuple[str, bytes]  # (fat_path, file_bytes)
 MapEdit = Tuple[str, bytes]  # (fat_path, file_bytes) — DAT/map/* overrides
 Overlay5EntryEdit = Tuple[int, bytes]  # (entry_ix, entry_bytes)
+# (target_bgm_id, donor_label, donor_game_label, sseq_bytes, sbnk_bytes, swar_bytes)
+BgmSwapEdit = Tuple[int, str, str, bytes, bytes, bytes]
+# (donor_label, donor_game_label, sseq_bytes, sbnk_bytes, swar_bytes)
+BgmAdditionEdit = Tuple[str, str, bytes, bytes, bytes]
 
 
 def vanilla_sha256(rom_bytes: bytes) -> str:
@@ -122,6 +136,8 @@ def save_project(
     btmap_edits: List[BtmapEdit] = (),
     map_edits: List[MapEdit] = (),
     overlay5_entry_edits: List[Overlay5EntryEdit] = (),
+    bgm_swap_edits: List[BgmSwapEdit] = (),
+    bgm_addition_edits: List[BgmAdditionEdit] = (),
 ) -> None:
     """Write a .romproj at `path`.
 
@@ -171,6 +187,20 @@ def save_project(
     these never grow the overlay5 file — they're skipped in the
     serialize step and replayed via ``apply_overlay5_entry_edits`` on
     load before the next save runs them through the overlay5 splice.
+
+    `bgm_swap_edits` carries staged donor BGM payloads as
+    ``(target_bgm_id, donor_label, donor_game_label, sseq, sbnk, swar)``
+    tuples. Routed through the SDAT rebuild + ROM splice on save;
+    project save passes ``skip_sound_splice=True`` so a grown SDAT
+    doesn't shift every later FAT file into the byte diff. Replayed
+    via ``apply_bgm_swap_edits`` on load.
+
+    `bgm_addition_edits` carries staged "Add As New Entry" donor payloads
+    as ``(donor_label, donor_game_label, sseq, sbnk, swar)`` tuples.
+    Positional: list order encodes the eventual bgm_id
+    (``vanilla_seq_count + position``). Routed through the same SDAT
+    rebuild + splice on save; replayed via ``apply_bgm_addition_edits``
+    on load.
     """
     diffs = compute_byte_diff(vanilla_rom_data, edited_rom_data)
     payload = {
@@ -207,6 +237,27 @@ def save_project(
             {"entry_ix": ix, "bytes": base64.b64encode(data).decode("ascii")}
             for ix, data in overlay5_entry_edits
         ],
+        "bgm_swap_edits": [
+            {
+                "bgm_id": bgm_id,
+                "donor_label": donor_label,
+                "donor_game_label": donor_game_label,
+                "sseq": base64.b64encode(sseq).decode("ascii"),
+                "sbnk": base64.b64encode(sbnk).decode("ascii"),
+                "swar": base64.b64encode(swar).decode("ascii"),
+            }
+            for bgm_id, donor_label, donor_game_label, sseq, sbnk, swar in bgm_swap_edits
+        ],
+        "bgm_addition_edits": [
+            {
+                "donor_label": donor_label,
+                "donor_game_label": donor_game_label,
+                "sseq": base64.b64encode(sseq).decode("ascii"),
+                "sbnk": base64.b64encode(sbnk).decode("ascii"),
+                "swar": base64.b64encode(swar).decode("ascii"),
+            }
+            for donor_label, donor_game_label, sseq, sbnk, swar in bgm_addition_edits
+        ],
     }
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -219,8 +270,11 @@ def load_project(path: str) -> dict:
     tuples (empty for v1/v2 projects), btmap_edits as a list of
     ``(fat_path, file_bytes)`` tuples (empty for v1-v4 projects),
     map_edits as a list of ``(fat_path, file_bytes)`` tuples (empty for
-    v1-v5 projects), and overlay5_entry_edits as a list of
-    ``(entry_ix, entry_bytes)`` tuples (empty for v1-v6 projects).
+    v1-v5 projects), overlay5_entry_edits as a list of
+    ``(entry_ix, entry_bytes)`` tuples (empty for v1-v6 projects), and
+    bgm_swap_edits as a list of ``(target_bgm_id, donor_label,
+    donor_game_label, sseq_bytes, sbnk_bytes, swar_bytes)`` tuples
+    (empty for v1-v7 projects).
     Caller resolves the vanilla ROM and verifies the hash separately."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     fmt = data.get("format_version")
@@ -257,5 +311,26 @@ def load_project(path: str) -> dict:
     data["overlay5_entry_edits"] = [
         (entry["entry_ix"], base64.b64decode(entry["bytes"]))
         for entry in data.get("overlay5_entry_edits", [])
+    ]
+    data["bgm_swap_edits"] = [
+        (
+            entry["bgm_id"],
+            entry.get("donor_label", ""),
+            entry.get("donor_game_label", ""),
+            base64.b64decode(entry["sseq"]),
+            base64.b64decode(entry["sbnk"]),
+            base64.b64decode(entry["swar"]),
+        )
+        for entry in data.get("bgm_swap_edits", [])
+    ]
+    data["bgm_addition_edits"] = [
+        (
+            entry.get("donor_label", ""),
+            entry.get("donor_game_label", ""),
+            base64.b64decode(entry["sseq"]),
+            base64.b64decode(entry["sbnk"]),
+            base64.b64decode(entry["swar"]),
+        )
+        for entry in data.get("bgm_addition_edits", [])
     ]
     return data

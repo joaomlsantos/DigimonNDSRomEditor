@@ -985,3 +985,383 @@ and trip the MOVE_END recogniser. Aggregate counts across the corpus
   destinations too (handler is a single 12-byte prefix). The combo
   reflects this correctly on next reload, but there's no UI affordance
   warning the user before they commit.
+
+## 15. Plan: Sound editor (donor-SDAT BGM injection)
+
+**Goal.** Replace any of DWDD's BGM slots with a sequence lifted from
+another NDS game's SDAT, under the engine's per-BGM memory budget.
+
+Scope is limited to **SDAT → SDAT** donors. Non-SDAT formats (DSE,
+SADL/ADX, GBA Sappy, etc.) are out of scope; see §15.7 for the
+investigation notes that closed that line of inquiry.
+
+### 15.1 Findings
+
+- **DWDD's audio container.** `dat/snd/sound_data.sdat` follows the
+  standard Nintendo SDAT layout (SYMB/INFO/FAT/FILE blocks). BGMs are
+  named `bgmNN` with paired `BANK_BGMNN` (SBNK) and `WAVE_BGMNN`
+  (SWAR). The BANK INFO's `waveArc[4]` is a slot table of u16 SWAR
+  indices, `-1` for unused slots.
+- **Per-BGM memory cap = ~166 KB.** Derived empirically as
+  `SSEQ + SBNK + Σ populated SWAR < ~166 KB` (memory
+  `project_bgm_cap_includes_sseq.md`; supersedes earlier 161 KB /
+  SBNK+SWAR-only figures). Going over corrupts adjacent BGM slots at
+  load time.
+- **Donor trim survives at this cap.** SBNK programs not referenced by
+  the donor SSEQ are zeroed; SWARs are rebuilt with only the
+  instrument-referenced swavs. AWDS, PKPL, MKDS, PWAA, PWJFA have
+  usable donor pools after trim — confirmed by the `audit_donor`
+  output across all five.
+- **Multi-SWAR flatten works.** Donors that spread instruments across
+  multiple waveArc slots (e.g. PKPL `SEQ_FUE` uses two) collapse to a
+  single SWAR (slot 0) via `merge_swars` + `flatten_sbnk`, with every
+  instrument's wave reference rewritten to the new slot. The flattened
+  payload is typically smaller than the per-slot trim estimate because
+  duplicate SWAR headers fold away.
+- **`sound.sbin` is a vanilla SDAT.** PMD BRT's `sound.sbin` opens as
+  an SDAT with no wrapper. Confirmed by hex scan: `SDAT` magic at
+  byte 0, all four sub-blocks present, `audit_donor` walks it cleanly
+  (98/98 sequences fit the cap — PMD BRT runs a tighter sound budget).
+  No code path needs to know about the extension; users can pick it
+  via the "All files" filter today (file-dialog filter widen deferred,
+  pending an NDS-ROM-direct import path that would replace ad-hoc
+  per-extension whitelisting).
+
+### 15.2 Architecture
+
+All trim/flatten/swap logic is pure-function under
+`digimon_core/sound/`. The session owns a single staged-edits channel;
+the splice runs from `serialize_all` like every other channel.
+
+**`digimon_core/sound/trim.py`** — primitives for cap-fit:
+- `sseq_progs(sseq_bytes) -> set[int]` — walks SSEQ bytecode and
+  returns the set of instrument programs the sequence references.
+- `sbnk_program_map(sbnk_bytes) -> (dict[prog → (type, swar_refs)], header)`
+  — walks SBNK records and exposes every instrument's `(slot, swav,
+  swav_off)` references for trim/flatten passes.
+- `build_trimmed_swar(swar_bytes, keep_swavs) -> (new_bytes, idx_map)`
+  — compacts the wave offset table to just the kept swavs.
+
+**`digimon_core/sound/donor.py`** — read-only audit:
+- `audit_donor(sdat_bytes, name_filter="", exclude="SE_") -> List[DonorBgmRow]`.
+- `DonorBgmRow` carries per-sequence sizing (SSEQ, original SBNK,
+  trimmed Σ SWAR), `fits_cap`, and `parse_failed` flags so the UI can
+  surface why a candidate is unimportable.
+
+**`digimon_core/sound/rebuild.py`** — SDAT re-layer:
+- `parse_sdat_blocks(sdat)` / `read_names` / `info_entry_offsets` —
+  SYMB/INFO walkers that don't depend on file ordering.
+- `rebuild_sdat(sdat, replacements) -> bytes` — re-lays only the FILE
+  block with new payloads for the given file IDs, 0x20-aligned, with
+  FAT entries rewritten. INFO and SYMB pass through, so any caller
+  changes to those (e.g. waveArc patches) take effect verbatim.
+- `add_bgm_to_sdat(sdat, sseq_bytes, sbnk_bytes, swar_bytes,
+  seq_name=None) -> (bytes, int)` — grows SEQ/BANK/WAVE INFO arrays
+  by one entry each, appends three FILE payloads, rebuilds SYMB
+  (with string interning) + INFO + FAT + FILE blocks, returns the new
+  SDAT and the allocated seq index. Used by the additions channel
+  below; works alongside (and after) `rebuild_sdat` replacements in
+  the same splice pass.
+
+**`digimon_core/sound/swap.py`** — `BgmSwap` builder:
+- Frozen `BgmSwap` dataclass: `target_bgm_id`, `donor_label`,
+  `donor_game_label`, `sseq_bytes`, `sbnk_bytes`, `swar_bytes`,
+  `trimmed_total_bytes`.
+- `build_swap(donor_sdat, donor_seq_idx, target_bgm_id, *,
+  donor_label, donor_game_label) -> BgmSwap` — resolves SBNK + waveArc
+  SWARs, trims via `build_trimmed_swar`, merges via
+  `merge_swars` + `flatten_sbnk`, validates that any used slot has a
+  populated waveArc entry, returns the swap blob.
+
+**Session integration** (`editor/session.py`):
+- `_staged_bgm_swaps: Dict[int, BgmSwap]` — Replace channel keyed by
+  vanilla bgm id.
+- `_staged_bgm_additions: List[BgmSwap]` — Add channel; ordered list,
+  each entry becomes one new SDAT slot (`bgm_id = vanilla_count + idx`).
+  Uses the same `BgmSwap` dataclass with `target_bgm_id=-1` sentinel.
+- Public surface: `stage_bgm_swap`, `revert_bgm_swap`,
+  `staged_bgm_swap(id)`, `staged_bgm_swaps()`, `bgm_swap_edits()`
+  (project export), `apply_bgm_swap_edits()` (project import);
+  parallel `stage_bgm_addition`, `revert_bgm_addition`,
+  `staged_bgm_additions`, `bgm_addition_edits`,
+  `apply_bgm_addition_edits` for the additions channel.
+- `_apply_bgm_swap_splice(out)` — runs from `serialize_all`. For each
+  staged swap: resolves the BANK INFO entry, patches `waveArc[4]` to
+  `(primary, -1, -1, -1)`, hands the staged sseq/sbnk/swar bytes to
+  `rebuild_sdat`. Then loops over `_staged_bgm_additions` calling
+  `add_bgm_to_sdat` on the in-flight SDAT (so swaps and additions
+  compose). Final splice via `fat.find_container` +
+  `fat.splice_range` + `fat.resize_fat_entry`. `header[0x80]` (total
+  used size) re-derives from max FAT end; downstream files re-locate
+  via the FAT shift.
+- `serialize_all(skip_sound_splice=True)` for project save so a grown
+  SDAT doesn't push every later file into the byte diff.
+
+**`.romproj` channel** (`editor/project_file.py`):
+- `FORMAT_VERSION = 9` (v8 added `bgm_swap_edits`, v9 added
+  `bgm_addition_edits`; v1–v8 still load with the addition channel
+  empty).
+- `BgmSwapEdit = Tuple[int, str, str, bytes, bytes, bytes]` carries
+  the swap blob as base64-encoded SSEQ/SBNK/SWAR plus the donor labels
+  used for the staged-slot marker.
+- `BgmAdditionEdit = Tuple[str, str, bytes, bytes, bytes]` — same
+  shape minus the target bgm id (additions are positional, not keyed).
+
+### 15.3 UI
+
+**`editor/widgets/sound_editor.py`** — single page, horizontal split.
+
+```
+┌─ Sound editor ───────────────────────────────────────────┐
+│ [Import SDAT…] [Replace…] [Revert]                        │
+├──────────────────────┬───────────────────────────────────┤
+│ ROM BGMs — 36 slots  │ Donor: awds.sdat — 12/67 fit cap   │
+│ ┌──────────────────┐ │ ┌─ Name ▼ ─┬── Size ──┬───┐       │
+│ │ bgm00   162.4 KB │ │ │ BGM_HACHI│  87.9 KB │ ✓ │       │
+│ │ bgm01   158.1 KB │ │ │ BGM_DEF1 │ 107.5 KB │ ✓ │       │
+│ │ bgm10   132.0 KB │ │ │ BGM_ZIPO │ 344.6 KB │ ⚠ │ ←hover│
+│ │   ← BGM_HACHI    │ │ │   …      │          │   │       │
+│ │   (87.9 KB) ✱    │ │ └──────────┴──────────┴───┘       │
+│ │ …                │ │ Per-row = SSEQ + trim SBNK + Σ SWAR│
+│ └──────────────────┘ │ (cap 166 KB)                       │
+├──────────────────────┴───────────────────────────────────┤
+│ ROM BGM — bgm10           │ Donor BGM — BGM_HACHI         │
+│ Staged: BGM_HACHI — 87.9KB│ 87.9 KB — 78.1 KB headroom   │
+│ SSEQ   12.4 KB            │ SSEQ        9.1 KB           │
+│ SBNK   BANK_BGM10 (4 KB)  │ SBNK   …    (3.2 KB)         │
+│ waveArc 116 KB / 1 slot   │ waveArc …   75.6 KB / 1 slot │
+└───────────────────────────┴───────────────────────────────┘
+```
+
+Specifics:
+- **Left pane.** `QListWidget`. Each row: `bgmNN   NN.N KB[ ⚠]`
+  for vanilla; `bgmNN  NN.N KB  ← <donor> (NN.N KB) ✱` for staged.
+  `⚠` only when the vanilla slot itself exceeds the cap (informational
+  — DWDD ships some that are technically over).
+- **Right pane.** `QTreeWidget` with three clickable, sortable columns:
+  `Name | Size | <status>` where status is `✓` / `⚠` / `✗ parse`.
+  Default sort: Size ascending. `_DonorRowItem.__lt__` handles all
+  three columns explicitly (no `super().__lt__()` call — PySide6's
+  binding around the base operator segfaults during sort otherwise).
+  Hover tooltips on `⚠` rows show
+  `"Over the 166 KB cap by N.N KB — pick a smaller donor."`; `✗`
+  rows show `"SSEQ or SBNK didn't walk cleanly — unimportable."`.
+- **Toolbar.** `Import SDAT…` (file dialog filter `*.sdat`),
+  `Replace…` (gated on selected vanilla ROM slot + selected importable
+  donor + donor bytes still held), `Add As New Entry` (gated on
+  selected importable donor only — no ROM-side selection required),
+  `Revert` (gated on the selected ROM row being a removable target:
+  either a vanilla slot with a staged swap, or one of the virtual
+  addition rows).
+- **ROM list virtual rows.** The list shows `vanilla_count + len(
+  additions)` rows. Vanilla rows render as before; addition rows
+  render as `bgmNN    NN.N KB  ✨ new ← <donor>` and select via
+  `_rom_row_kind(row) -> ('addition', (idx, swap))`. Header label
+  updates to `ROM BGMs — 46 vanilla + N new` when additions exist.
+- **Footer.** Two metadata columns mirroring left/right selections, in
+  the same shape as `mchr_browser`'s metadata block. Addition rows
+  show `"ROM BGM — bgm46 (pending new)"` plus the donor label.
+- **Undo.** `StageBgmSwapCommand` / `RevertBgmSwapCommand` in
+  `editor/commands.py` snapshot the previous swap (vanilla or
+  prior donor) so chained Replace → Replace → Undo lands on the
+  prior donor, not vanilla. `AddBgmCommand` / `RevertBgmAdditionCommand`
+  capture the list index on first redo so undo/redo round-trips
+  preserve the addition's bgm id slot.
+
+### 15.4 Phasing
+
+| Phase | Output | Status |
+|---|---|---|
+| **1** | Read-only ROM BGM list with per-slot KB + cap warning | ✅ |
+| **2** | `audit_donor` + donor pane with Import SDAT… and per-row cap audit | ✅ |
+| **3a** | Vendor `sbnk_flatten` + `sdat_swap_bgm` rebuild; `BgmSwap` dataclass + `build_swap` builder | ✅ |
+| **3b** | `_staged_bgm_swaps` session channel + `.romproj` v8 `bgm_swap_edits` | ✅ |
+| **3c** | Replace/Revert toolbar; staged-slot markers in ROM list; `QUndoCommand` | ✅ |
+| **3d** | `_apply_bgm_swap_splice`: SDAT rebuild + FAT splice on ROM save; full roundtrip test | ✅ |
+| **3e** | Donor pane → sortable `QTreeWidget` with header-click sort + over-cap hover tooltip | ✅ |
+
+Phase 3d roundtrip evidence: staged AWDS bgm10 (27.8 KB) + PKPL bgm20
+(16.8 KB, multi-SWAR flattened). Saved ROM: SDAT 6,199,200 →
+6,065,952 (−133,120 B), `header[0x80]` = max FAT end, downstream
+`DAT/WZ/0D` shifted exactly −133,120 B with bytes byte-identical.
+Reparsing the saved ROM shows the new payload sizes and
+`waveArc=[WAVE_BGMNN]` for the swapped slots; untouched bgm00 still
+matches vanilla. In-game playback verified in DeSmuME/melonDS by the
+user — swapped tracks play correctly without engine glitches.
+
+### 15.5 Risks
+
+- **166 KB cap is empirical, not documented.** Going over typically
+  corrupts adjacent BGM slots at load time. The audit hard-rejects
+  over-cap donors and `build_swap` rechecks the flattened payload
+  before staging (flatten can land slightly above the per-slot trim
+  estimate). Stays defensive even though no vanilla DWDD slot exceeds
+  it by a useful margin.
+- **SBNK flatten is lossy on multi-SWAR donors.** Per-slot offset
+  structure collapses into slot 0. The engine doesn't care because
+  `waveArc[4]` is patched to `(primary, -1, -1, -1)` to match. If a
+  future donor uses cross-slot stereo (left in slot 0, right in slot 1
+  with paired instrument refs), the flatten breaks the stereo pair
+  silently. Not seen in the AWDS/PKPL/MKDS/PWAA/PWJFA pool.
+- **SDAT splice is a whole-ROM FAT shift.** A typical swap delta is
+  ~−130 KB (donor SDATs trim aggressively); every downstream file
+  re-locates. `fat.resize_fat_entry` handles this and the
+  `header[0x80]` recompute, but any code path that caches absolute
+  offsets across `serialize_all` would break. None known currently;
+  worth flagging if a future channel introduces absolute-offset
+  caching.
+- **Donor SDAT bytes are held across the audit.** `_donor_bytes` lives
+  on the widget for as long as the audit is on-screen so Replace can
+  rebuild from the user's row pick without re-reading. Dropped on
+  next import or widget teardown. ~5 MB for typical donor SDATs — OK
+  for a desktop tool.
+
+### 15.6 Acceptance criteria
+
+- **Audit.** Every BGM in every donor SDAT either reports a cap-fit
+  trim total, an over-cap total with the by-how-much delta, or a
+  parse-failed flag with a tooltip explaining the walker rejection.
+- **Replace + Revert.** `StageBgmSwapCommand` / `RevertBgmSwapCommand`
+  round-trip cleanly. Chained Replace → Replace → Undo lands on the
+  prior donor (not vanilla).
+- **ROM save.** Saved ROM reparses with the swapped slot showing the
+  new payload sizes + waveArc patched to `(primary, -1, -1, -1)`.
+  Downstream files byte-identical at their new shifted offsets.
+  `header[0x80]` matches max FAT end. In-game playback confirms the
+  new track plays without glitches (user-verified).
+- **Project file.** A `.romproj` with staged swaps saves and re-opens
+  with the swaps intact. The byte diff between the loaded ROM and the
+  re-applied project equals the cumulative swap delta only — no
+  spurious FAT-shift drift in the project payload.
+
+### 15.7 Status — open follow-ups
+
+**Done since phase 3 acceptance.**
+
+- *Donor tree polish.* Replaced the flat `QListWidget` with a
+  sortable 3-column `QTreeWidget`; status column + over-cap hover
+  tooltip; PySide6-safe custom `__lt__` (handles all three columns
+  without calling `super`).
+- *`sound.sbin` reconnaissance.* Confirmed PMD BRT's `sound.sbin` is
+  a vanilla SDAT under a different extension. Filter widen deferred —
+  user prefers to scan donor sources directly from NDS ROMs (the
+  workflow `nds_extract_sdat.py` prototypes) rather than maintain a
+  per-extension allow-list.
+
+**Deferred / pending.**
+
+- *Audit-results refresh.* `audit_results/*.txt` was generated before
+  the cap accounting switched to SSEQ-inclusive; numbers there are
+  stale by the SSEQ size. Cheap to rerun when next opened.
+- *In-editor "Import from NDS ROM" picker.* Pulls SDATs straight out
+  of a donor NDS ROM via FAT walk (same logic as
+  `nds_extract_sdat.py`), instead of asking the user to extract first.
+  Would also subsume the `.sbin` case naturally without a per-extension
+  filter.
+- *In-editor track preview.* Considered three tiers in conversation:
+  (1) SSEQ → MIDI + system-soundfont playback (~1-2 d, cheap but
+  unfaithful — fine for *recognition*); (2) authentic DS-chip
+  emulation (weeks); (3) external-tool launch button. User rejected
+  all three; recommendation in any release blurb is "preview tracks
+  in VGMTrans + the joshw.info 2sf packs for track names" rather than
+  shipping a player.
+- *Non-SDAT donor formats.* Investigated:
+  - **`.sbin` (PMD BRT)** — already works as vanilla SDAT (above).
+  - **DSE — SWD/SMD (PMD Explorers)** — well-documented via
+    psy_commando's `ppmdu`; requires a MIDI+SF2 → SDAT pipeline.
+  - **SADL (999, Radiant Historia, Layton) + ADX (CRI titles)** —
+    streamed PCM/ADPCM, not sequenced. Render-to-PCM blows past the
+    166 KB cap immediately. Dead end.
+  - **GBA Sappy/MP2K + PSX SEQ/VAB + SNES N-SPC + N64 + …** — all
+    extractable to MIDI + SF2/DLS via existing community tools
+    (saptapper, PSF, SPC2MIDI, etc.); same MIDI+SF2 → SDAT bottleneck.
+
+  The MIDI + SF2 → SDAT converter is the universal middle layer. No
+  working public tool exists for it: loveemu's authoritative catalog
+  lists zero importers (the entire NDS audio scene is export-only),
+  Nitro Studio 2 by Gota7 (with Gericom's underlying libraries) is the
+  only credible attempt but its README flags "Audio conversion of any
+  kind is faulty" and NS2 Deluxe is gutted. The pragmatic Python
+  rebuild path is `ndspy` (pure-Python SSEQ/SBNK/SWAR/SDAT
+  load+save) + `mido` (MIDI parsing) + `sf2utils` (SF2 parsing) +
+  ~6–9 days writing the conversion mapping (MIDI events → SSEQ
+  bytecode; SF2 zones → SBNK records; SF2 samples → IMA-ADPCM SWAV
+  with 8-sample loop-point alignment). Biggest lossiness vector is SF2
+  velocity layers having no SBNK equivalent — pick the highest-velocity
+  layer or weight, expect "the sample plays but it doesn't sound
+  right" tuning passes. **Decision:** parked until a user actually
+  wants to port a non-SDAT donor; the SDAT-to-SDAT donor pool already
+  covers a huge swath of NDS titles and `sound.sbin` works as-is, so
+  building this just to "have it" is premature.
+
+### 15.8 Add As New Entry (additions channel)
+
+**Goal.** Append donor BGMs as brand-new SDAT slots rather than
+overwriting vanilla. Each addition grows the SDAT by one SEQ/BANK/WAVE
+triple; the new bgm id is `vanilla_seq_count + position_in_additions`
+(e.g. `bgm46` on a stock DWDD ROM with 46 vanilla SEQs).
+
+**`add_bgm_to_sdat`** (`digimon_core/sound/rebuild.py`). Full
+re-serialization rather than surgical insertion — growing one INFO
+record array shifts every subsequent block's offsets and the FAT
+entry table, so parse-then-emit is simpler than patching in place.
+Parser side: SYMB walked as 7 flat name lists + 1 nested seqarc list
+(`[(name, [sub_names])]`); INFO bodies treated as opaque byte blobs
+sized by offset deltas (`_min_above` helper); FAT entries parsed as
+`(off, sz, mem, reserved)` quads. Emit side: SYMB rebuilt with a
+`string_cache` so duplicate names don't double-emit; INFO bodies
+written through verbatim except for the appended SEQ/BANK/WAVE rows;
+FILE block laid out with `first_payload_base = file_off + 0xc` to
+match vanilla DWDD spacing (header is 12 B, payloads 0x20-aligned
+within the block).
+
+The SEQ INFO body is built as
+`struct.pack("<HHHBBBBH", new_seq_fid, 0, new_bank_idx, 127, 64, 64,
+0, 0)` (file id, padding, bank idx, vol, prio, pan, ply, padding);
+BANK body as `("<HHhhhh", new_bank_fid, 0, new_wave_idx, -1, -1, -1)`
+(file id, padding, primary waveArc + three -1 slots); WAVE body as
+`("<HH", new_wave_fid, 0)`. Returns `(new_sdat_bytes, new_seq_index)`.
+
+**Session channel.** `_staged_bgm_additions: List[BgmSwap]` (ordered,
+positional). Reuses `BgmSwap` with `target_bgm_id=-1`. Splice runs
+inside `_apply_bgm_swap_splice` after the swap loop, threading the
+in-flight SDAT through `add_bgm_to_sdat` once per addition so swaps
+and additions compose cleanly in a single FAT splice.
+
+**Undo commands** (`editor/commands.py`). `AddBgmCommand` captures
+`_index = None` on construction; the first `redo()` calls
+`stage_bgm_addition(swap, index=None)` (append) and stores the
+returned index. Subsequent redos pass that captured index so
+position-based bgm ids stay stable across undo/redo cycles. `undo()`
+pops at the captured index. `RevertBgmAdditionCommand` mirrors this:
+`redo()` pops at index (storing the removed swap), `undo()`
+re-inserts at the same index.
+
+**UI.** Same widget as §15.3; differences:
+- New toolbar button **`Add As New Entry`** (gated on importable
+  donor selection only — no ROM-side selection required).
+- ROM list virtual rows: `bgmNN    NN.N KB  ✨ new ← <donor>` for
+  additions; `_rom_row_kind(row)` discriminates `('vanilla', bgm)`
+  vs `('addition', (idx, swap))` for downstream selection handlers.
+- Header label flips to `ROM BGMs — 46 vanilla + N new` when
+  additions exist.
+- Revert dispatches on row kind — `RevertBgmSwapCommand` for staged
+  vanilla rows, `RevertBgmAdditionCommand` for addition rows.
+
+**`.romproj` v9.** Adds `bgm_addition_edits: List[BgmAdditionEdit]`
+where `BgmAdditionEdit = (donor_label, donor_game_label, sseq_b64,
+sbnk_b64, swar_b64)`. Order preserved; load applies via
+`session.apply_bgm_addition_edits`.
+
+**Roundtrip evidence.** End-to-end test against the real DWDD ROM:
+vanilla 46 SEQ entries → 47 after staging one addition (AWDS
+`BGM_EVENT_GREEN1`). SDAT 6,199,200 → 6,258,784 B. Saved ROM
+reparses to 47 BGMs with `bgm46` carrying the donor's sseq/sbnk
+sizes; vanilla `bgm00` byte-identical. `header[0x80]` recomputed
+from max FAT end; downstream files shifted by the SDAT delta.
+
+**Why this matters.** No DWDD slot needs replacing to add the new
+track, so users can extend the soundtrack without losing any vanilla
+BGM. Engine accepts the new slot because INFO+SYMB+FAT all grow
+together and `waveArc` references resolve through the new SWAR's
+freshly-allocated INFO row.

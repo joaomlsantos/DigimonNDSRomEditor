@@ -12,9 +12,11 @@ import os
 import shutil
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from digimon_core import constants, fat, fnt, loaders, model, msgpak, overlay5 as overlay5_mod, overlay5_cutscenes as overlay5_cutscenes_mod, pak, qol as qol_module, rom
+from digimon_core.sound import sdat as sdat_mod
+from digimon_core.sound.swap import BgmSwap
 
 
 # Every sprite pak the editor knows how to splice on save. Used by
@@ -110,6 +112,37 @@ class RomSession:
     # Phase B/C reads vanilla bytes only; the FAT-splice path lands in
     # Phase E with its own write-side resolver).
     _file_table_cache: Optional[fnt.FileTable] = field(default=None)
+
+    # Lazy cache for the vanilla ``dat/snd/sound_data.sdat`` slice and its
+    # parsed ``bgmNN`` summary. The sound editor reads through both; donor
+    # SDATs (right pane) live in the widget, not on the session.
+    _sdat_bytes_cache: Optional[bytes] = field(default=None)
+    _vanilla_bgm_summary_cache: Optional[List[sdat_mod.BgmSummary]] = field(default=None)
+
+    # Staged BGM swap payloads, keyed by target ``bgm_id`` (the vanilla
+    # slot the user picked to overwrite). ``stage_bgm_swap`` populates
+    # this from a built ``BgmSwap``; the SDAT splice on save (Phase 3d)
+    # iterates and applies them. Project save (Phase 3b) routes the
+    # payloads through the ``bgm_swap_edits`` channel so the swap bytes
+    # don't bloat the byte diff via the SDAT splice.
+    _staged_bgm_swaps: Dict[int, BgmSwap] = field(default_factory=dict)
+
+    # Staged "Add As New Entry" donor payloads. Ordered: each entry's
+    # eventual bgm_id is ``vanilla_seq_count + index_in_list``. The same
+    # SSEQ/SBNK/SWAR triple shape as ``_staged_bgm_swaps`` (we reuse
+    # ``BgmSwap`` but ignore its ``target_bgm_id`` field). The splice
+    # path grows the SDAT via ``add_bgm_to_sdat`` for each entry in
+    # order; the project channel ``bgm_addition_edits`` persists them
+    # positionally.
+    _staged_bgm_additions: List[BgmSwap] = field(default_factory=list)
+
+    # Donor SDAT pane cache for the sound editor. Lives on the session
+    # so it survives editor-widget teardown when the user navigates to
+    # another editor and back. Not persisted to .romproj — it's a UI
+    # convenience, not project state. Cleared when a new ROM is loaded.
+    _sound_donor_path: Optional[str] = field(default=None)
+    _sound_donor_bytes: Optional[bytes] = field(default=None)
+    _sound_donor_rows: Optional[List[Any]] = field(default=None)
 
     # Per-FAT-path overrides for btmap edits (Phase D). Path → uncompressed
     # bytes that supersede the vanilla FAT slot. Cleared on session reset;
@@ -445,6 +478,7 @@ class RomSession:
         skip_btmap_splice: bool = False,
         skip_map_splice: bool = False,
         skip_overlay5_splice: bool = False,
+        skip_sound_splice: bool = False,
     ) -> bytearray:
         """Write every model back onto a copy of the original ROM bytes.
 
@@ -538,6 +572,14 @@ class RomSession:
         # through the ``overlay5_entry_edits`` channel instead.
         if not skip_overlay5_splice:
             self._apply_overlay5_splice(out)
+        # BGM swaps — same channel pattern as btmap/map/overlay5. ROM
+        # save rebuilds dat/snd/sound_data.sdat with staged donor SSEQ/
+        # SBNK/SWAR payloads and FAT-shifts the rest of the ROM around
+        # the resized SDAT. Project save passes ``skip_sound_splice=True``
+        # and routes the payloads through the ``bgm_swap_edits`` channel
+        # so a grown SDAT doesn't shift every later file in the byte diff.
+        if not skip_sound_splice:
+            self._apply_bgm_swap_splice(out)
         return out
 
     def serialize_all_with_qol(self) -> bytearray:
@@ -564,6 +606,25 @@ class RomSession:
         if self._file_table_cache is None:
             self._file_table_cache = fnt.FileTable.from_rom(self.original_rom_data)
         return self._file_table_cache
+
+    def sdat_bytes(self) -> bytes:
+        """Lazy slice of the vanilla ``dat/snd/sound_data.sdat`` payload.
+
+        Sound edits are not yet wired into ``serialize_all`` (that lands
+        with the Apply-Swap phase), so for now this returns vanilla bytes
+        regardless of dirty state.
+        """
+        if self._sdat_bytes_cache is None:
+            self._sdat_bytes_cache = self.vanilla_file_table().slice(
+                self.original_rom_data, sdat_mod.SDAT_PATH
+            )
+        return self._sdat_bytes_cache
+
+    def vanilla_bgm_summary(self) -> List[sdat_mod.BgmSummary]:
+        """Parsed ``bgmNN`` list off the vanilla SDAT, sorted by id."""
+        if self._vanilla_bgm_summary_cache is None:
+            self._vanilla_bgm_summary_cache = sdat_mod.list_bgms(self.sdat_bytes())
+        return self._vanilla_bgm_summary_cache
 
     def btmap_file_bytes(self, path: str) -> bytes:
         """Resolve ``path`` (e.g. ``"DAT/btmap/0ac"``) to bytes.
@@ -837,6 +898,100 @@ class RomSession:
             # In-place write — length already verified at register time.
             out[ovl_start + entry_off:
                 ovl_start + entry_off + len(new_entry)] = new_entry
+
+    def _apply_bgm_swap_splice(self, out: bytearray) -> None:
+        """Rebuild the SDAT with staged donor payloads and FAT-splice it back.
+
+        Resolves bgmNN / BANK_BGMNN / WAVE_BGMNN to FAT file IDs inside
+        the SDAT, patches the BANK INFO waveArc[4] to a single-slot
+        (slot 0) layout — every staged swap is single-SWAR by design —
+        then runs :func:`rebuild_sdat` and splices the result back into
+        the ROM via the same FAT-resize primitives the btmap/map paths
+        use. After this returns, downstream FAT entries + NDS header
+        offsets have been shifted to absorb the SDAT delta and the ROM
+        is internally consistent for the trailing-FF trim step.
+        """
+        if not self._staged_bgm_swaps and not self._staged_bgm_additions:
+            return
+        from digimon_core.sound.rebuild import (
+            add_bgm_to_sdat,
+            info_entry_offsets,
+            parse_sdat_blocks,
+            read_names,
+            rebuild_sdat,
+            resolve_info_index,
+            resolve_sdat_file_id,
+        )
+
+        file_table = fnt.FileTable.from_rom(bytes(out))
+        try:
+            sdat_start, sdat_end = file_table.resolve(sdat_mod.SDAT_PATH)
+        except KeyError:
+            # No SDAT in this ROM? Nothing to do — but flag silently
+            # rather than crash a save that touches sound for no reason.
+            return
+        sdat = bytes(out[sdat_start:sdat_end])
+
+        _, blocks = parse_sdat_blocks(sdat)
+        _, symb_off, _ = blocks[b"SYMB"]
+        _, info_off, _ = blocks[b"INFO"]
+        symb_recs = struct.unpack_from("<8I", sdat, symb_off + 8)
+        info_recs = struct.unpack_from("<8I", sdat, info_off + 8)
+        seq_names = read_names(sdat, symb_off, symb_recs[0])
+        bank_names = read_names(sdat, symb_off, symb_recs[2])
+        wave_names = read_names(sdat, symb_off, symb_recs[3])
+        seq_info = info_entry_offsets(sdat, info_off, info_recs[0])
+        bank_info = info_entry_offsets(sdat, info_off, info_recs[2])
+        wave_info = info_entry_offsets(sdat, info_off, info_recs[3])
+
+        # Patch BANK INFO waveArc[4] for every staged slot before the
+        # rebuild — rebuild_sdat re-lays only the FILE block, so INFO
+        # mutations on the input bytes survive into the output SDAT.
+        sdat_mut = bytearray(sdat)
+        replacements: Dict[int, bytes] = {}
+        for bgm_id, swap in self._staged_bgm_swaps.items():
+            sseq_name = f"bgm{bgm_id:02d}"
+            sbnk_name = f"BANK_BGM{bgm_id:02d}"
+            swar_name = f"WAVE_BGM{bgm_id:02d}"
+            sseq_fid = resolve_sdat_file_id(sdat, seq_names, seq_info, sseq_name)
+            sbnk_fid = resolve_sdat_file_id(sdat, bank_names, bank_info, sbnk_name)
+            swar_fid = resolve_sdat_file_id(sdat, wave_names, wave_info, swar_name)
+            if -1 in (sseq_fid, sbnk_fid, swar_fid):
+                raise ValueError(
+                    f"BGM swap target bgm{bgm_id:02d} missing one of "
+                    f"{sseq_name}/{sbnk_name}/{swar_name} in SDAT symbol table"
+                )
+
+            primary_wave_idx = resolve_info_index(wave_names, swar_name)
+            bank_idx = bank_names.index(sbnk_name)
+            bank_ent_off = bank_info[bank_idx]
+            # Every built swap is single-SWAR (flatten_sbnk collapsed it),
+            # so waveArc[0] = primary, [1..3] = unused (-1).
+            struct.pack_into(
+                "<4h", sdat_mut, bank_ent_off + 4,
+                primary_wave_idx, -1, -1, -1,
+            )
+
+            replacements[sseq_fid] = swap.sseq_bytes
+            replacements[sbnk_fid] = swap.sbnk_bytes
+            replacements[swar_fid] = swap.swar_bytes
+
+        new_sdat = rebuild_sdat(bytes(sdat_mut), replacements)
+
+        # Apply each "Add As New Entry" addition in order. Each call grows
+        # the SDAT by one SEQ/BANK/WAVE triple; the assigned bgm_id is
+        # vanilla_seq_count + position in the additions list.
+        for swap in self._staged_bgm_additions:
+            new_sdat, _new_idx = add_bgm_to_sdat(
+                new_sdat, swap.sseq_bytes, swap.sbnk_bytes, swap.swar_bytes,
+            )
+
+        idx, _cs, ce = fat.find_container(out, sdat_start, sdat_end)
+        content_delta = len(new_sdat) - (sdat_end - sdat_start)
+        aligned_shift = fat.splice_range(
+            out, sdat_start, sdat_end, ce, new_sdat,
+        )
+        fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
 
     # ---- BTCHR sidecar edits ----------------------------------------------
 
@@ -2013,6 +2168,163 @@ class RomSession:
                     f"mismatch: {len(data)} vs {len(vanilla)}"
                 )
             self._dirty_overlay5_entries[entry_ix] = bytes(data)
+
+    # ---- BGM swap channel -------------------------------------------------
+
+    def stage_bgm_swap(self, swap: BgmSwap) -> Optional[BgmSwap]:
+        """Stage ``swap`` against its ``target_bgm_id`` slot.
+
+        Returns the previously-staged swap for that slot (or None if it
+        was vanilla) so the caller's QUndoCommand can restore it on undo.
+        """
+        previous = self._staged_bgm_swaps.get(swap.target_bgm_id)
+        self._staged_bgm_swaps[swap.target_bgm_id] = swap
+        return previous
+
+    def revert_bgm_swap(self, target_bgm_id: int) -> Optional[BgmSwap]:
+        """Drop any staged swap on ``target_bgm_id``.
+
+        Returns the dropped swap so the caller's QUndoCommand can
+        restage it on undo, or None if the slot was already vanilla.
+        """
+        return self._staged_bgm_swaps.pop(target_bgm_id, None)
+
+    def staged_bgm_swap(self, target_bgm_id: int) -> Optional[BgmSwap]:
+        """Return the staged swap for ``target_bgm_id`` (or None)."""
+        return self._staged_bgm_swaps.get(target_bgm_id)
+
+    def staged_bgm_swaps(self) -> Dict[int, BgmSwap]:
+        """Read-only snapshot of every staged swap, keyed by target slot."""
+        return dict(self._staged_bgm_swaps)
+
+    def bgm_swap_edits(self) -> List[Tuple[int, str, str, bytes, bytes, bytes]]:
+        """Snapshot staged BGM swaps for the .romproj ``bgm_swap_edits`` channel.
+
+        Each tuple is ``(target_bgm_id, donor_label, donor_game_label,
+        sseq_bytes, sbnk_bytes, swar_bytes)``. Sorted by target_bgm_id
+        for stable on-disk output. Mirrors the btmap/map/overlay5
+        channel pattern: project save runs with ``skip_sound_splice=True``
+        and routes the actual SSEQ/SBNK/SWAR payloads through this
+        channel so a grown SDAT doesn't shift every later ROM file into
+        the byte diff.
+        """
+        return [
+            (
+                target_id,
+                swap.donor_label,
+                swap.donor_game_label,
+                bytes(swap.sseq_bytes),
+                bytes(swap.sbnk_bytes),
+                bytes(swap.swar_bytes),
+            )
+            for target_id, swap in sorted(self._staged_bgm_swaps.items())
+        ]
+
+    def apply_bgm_swap_edits(
+        self, edits: List[Tuple[int, str, str, bytes, bytes, bytes]],
+    ) -> None:
+        """Replay staged BGM swaps from a .romproj onto the swap cache.
+
+        Reconstructs each ``BgmSwap`` from the persisted tuple. The
+        ``trimmed_total_bytes`` field is recomputed from the payload
+        lengths rather than persisted — it's derivable, and recomputing
+        means a stale total in an older project can't drift from the
+        actual bytes.
+        """
+        for target_id, donor_label, donor_game_label, sseq, sbnk, swar in edits:
+            self._staged_bgm_swaps[target_id] = BgmSwap(
+                target_bgm_id=target_id,
+                donor_label=donor_label,
+                donor_game_label=donor_game_label,
+                sseq_bytes=bytes(sseq),
+                sbnk_bytes=bytes(sbnk),
+                swar_bytes=bytes(swar),
+                trimmed_total_bytes=len(sseq) + len(sbnk) + len(swar),
+            )
+
+    # ---- BGM "Add As New Entry" channel -----------------------------------
+
+    def stage_bgm_addition(
+        self, swap: BgmSwap, index: Optional[int] = None,
+    ) -> int:
+        """Append (or insert at ``index``) a donor payload as a new BGM slot.
+
+        Returns the position the addition was inserted at. The eventual
+        bgm_id assigned on save is ``vanilla_seq_count + position``; the
+        ``target_bgm_id`` field on ``swap`` is ignored (additions don't
+        target a vanilla slot).
+        """
+        if index is None or index >= len(self._staged_bgm_additions):
+            self._staged_bgm_additions.append(swap)
+            return len(self._staged_bgm_additions) - 1
+        self._staged_bgm_additions.insert(index, swap)
+        return index
+
+    def revert_bgm_addition(self, index: int) -> Optional[BgmSwap]:
+        """Drop the addition at ``index``. Returns the dropped swap (or None
+        if the index is out of range, e.g. after an external reorder)."""
+        if 0 <= index < len(self._staged_bgm_additions):
+            return self._staged_bgm_additions.pop(index)
+        return None
+
+    def staged_bgm_additions(self) -> List[BgmSwap]:
+        """Read-only snapshot of every staged addition, in insertion order."""
+        return list(self._staged_bgm_additions)
+
+    def bgm_addition_edits(self) -> List[Tuple[str, str, bytes, bytes, bytes]]:
+        """Snapshot staged additions for the .romproj ``bgm_addition_edits``
+        channel. Positional: list order encodes the eventual bgm_id."""
+        return [
+            (
+                swap.donor_label,
+                swap.donor_game_label,
+                bytes(swap.sseq_bytes),
+                bytes(swap.sbnk_bytes),
+                bytes(swap.swar_bytes),
+            )
+            for swap in self._staged_bgm_additions
+        ]
+
+    def apply_bgm_addition_edits(
+        self, edits: List[Tuple[str, str, bytes, bytes, bytes]],
+    ) -> None:
+        """Replay staged additions from a .romproj. Same conventions as
+        :meth:`apply_bgm_swap_edits` (recompute trimmed total, sentinel
+        target_bgm_id = -1 since additions don't address a vanilla slot).
+        """
+        for donor_label, donor_game_label, sseq, sbnk, swar in edits:
+            self._staged_bgm_additions.append(BgmSwap(
+                target_bgm_id=-1,
+                donor_label=donor_label,
+                donor_game_label=donor_game_label,
+                sseq_bytes=bytes(sseq),
+                sbnk_bytes=bytes(sbnk),
+                swar_bytes=bytes(swar),
+                trimmed_total_bytes=len(sseq) + len(sbnk) + len(swar),
+            ))
+
+    def set_sound_donor(
+        self, path: str, data: bytes, rows: List[Any],
+    ) -> None:
+        """Cache the imported donor SDAT so the sound editor can rehydrate
+        its right pane after a tab switch. Replaces any prior donor."""
+        self._sound_donor_path = path
+        self._sound_donor_bytes = data
+        self._sound_donor_rows = rows
+
+    def clear_sound_donor(self) -> None:
+        self._sound_donor_path = None
+        self._sound_donor_bytes = None
+        self._sound_donor_rows = None
+
+    def sound_donor(self) -> Optional[Tuple[str, bytes, List[Any]]]:
+        if self._sound_donor_bytes is None or self._sound_donor_path is None:
+            return None
+        return (
+            self._sound_donor_path,
+            self._sound_donor_bytes,
+            list(self._sound_donor_rows or []),
+        )
 
     def apply_string_edits(self, edits: List[Tuple[str, int, str]]) -> None:
         """Replay logical string edits from a .romproj onto the parsed model.
