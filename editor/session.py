@@ -998,20 +998,35 @@ class RomSession:
     def current_chrsize_word(self, group: int) -> int:
         """Return the live u32 for ``group`` in BTCHR/CHRSIZE.BIN.
 
-        Prefers an in-memory edit if one exists; otherwise reads the
-        vanilla word from ``original_rom_data``. Used by undo commands
-        to snapshot the pre-edit state before they overwrite it.
+        Resolution order: in-memory edit → appended sidecar (for groups
+        past the vanilla 415) → vanilla bytes from ``original_rom_data``.
+        Without the appended-sidecar branch, ``group >= vanilla_count``
+        would `unpack_from` past the 1660-byte file end into the NDS
+        0x200-aligned 0xFF tail padding and return 0xFFFFFFFF — and
+        ``AppendBtchrGroupCommand`` snapshots through this, so a
+        duplicate of an already-appended group would write a 0xFFFFFFFF
+        sidecar (4 GB nominal alloc → crash on first engine load).
         """
         if group in self._chrsize_edits:
             return self._chrsize_edits[group]
+        vanilla = self.vanilla_btchr_group_count()
+        if group >= vanilla:
+            return self._btchr_appended_chrsize[group - vanilla]
         ft = fnt.FileTable.from_rom(self.original_rom_data)
         start, _end = ft.resolve(CHRSIZE_PATH)
         return struct.unpack_from("<I", self.original_rom_data, start + group * 4)[0]
 
     def current_btchrsize_value(self, group: int) -> int:
-        """Return the live u32 for ``group`` in BTCHR/BTCHRSIZE.BIN."""
+        """Return the live u32 for ``group`` in BTCHR/BTCHRSIZE.BIN.
+
+        Same resolution order as :meth:`current_chrsize_word` — see
+        that docstring for the appended-sidecar rationale.
+        """
         if group in self._btchrsize_edits:
             return self._btchrsize_edits[group]
+        vanilla = self.vanilla_btchr_group_count()
+        if group >= vanilla:
+            return self._btchr_appended_btchrsize[group - vanilla]
         ft = fnt.FileTable.from_rom(self.original_rom_data)
         start, _end = ft.resolve(BTCHRSIZE_PATH)
         return struct.unpack_from("<I", self.original_rom_data, start + group * 4)[0]
