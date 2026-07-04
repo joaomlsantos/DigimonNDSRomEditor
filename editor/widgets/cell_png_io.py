@@ -94,13 +94,13 @@ def detect_oam_tile_conflicts(
     OAMs.
     """
     bytes_per_tile = 64 if is_8bpp else 32
-    tile_mult = max(1, ncer.boundary_bytes // bytes_per_tile)
+    boundary_bytes = ncer.boundary_bytes
     seen: dict = {}
     shared_tiles: set = set()
     flip_conflict_tiles: set = set()
     for cell in ncer.cells:
         for oam in cell.oams:
-            base = oam.tile * tile_mult
+            base = (oam.tile * boundary_bytes) // bytes_per_tile
             for t in range(base, base + oam.n_tiles):
                 key = (oam.hflip, oam.vflip)
                 prev = seen.get(t)
@@ -160,6 +160,124 @@ def cell_layout(ncer: ncer_mod.Ncer) -> Optional[CellLayout]:
     return rects, max_w, max_h
 
 
+# ---- coverage-gap overlay ---------------------------------------------
+
+
+_RED_OVERLAY_RGBA = (255, 0, 0, 96)
+
+
+def _stamp_red_overlay_in_slot(
+    img: QImage,
+    cell: ncer_mod.Cell,
+    *,
+    slot_x: int,
+    slot_y: int,
+    slot_w: int,
+    slot_h: int,
+    xmin: int,
+    ymin: int,
+) -> None:
+    """Draw the red checkerboard on gap pixels of one slot in ``img``.
+
+    ``img`` must be ARGB32-compatible (callers convert Indexed8 sources
+    first). Uses ``qRgba`` scanline writes over the checker pattern
+    ``(px + py) & 1 == 0`` so the underlying sprite pixels stay
+    visible through the gaps. Semi-transparent (alpha=96) so it reads
+    as an overlay rather than a solid fill.
+
+    Mask coord (0, 0) corresponds to slot pixel (0, 0), which is where
+    the cell's bbox origin lands — i.e. OAM coord (xmin, ymin). The
+    ``slot_x/slot_y`` offset is re-applied when writing pixels into
+    ``img``, not baked into the mask origin (doing that shifted every
+    non-cell-0 slot's OAM rectangles off the mask, leaving every pixel
+    marked uncovered and the whole slot tinted red).
+    """
+    mask = btchr.oam_coverage_mask(cell, slot_w, slot_h, xmin, ymin)
+    if not mask:
+        return
+    img_w = img.width()
+    img_h = img.height()
+    r, g, b, a = _RED_OVERLAY_RGBA
+    tint = qRgba(r, g, b, a)
+    for py in range(slot_h):
+        dy = slot_y + py
+        if not (0 <= dy < img_h):
+            continue
+        row = py * slot_w
+        for px in range(slot_w):
+            if mask[row + px]:
+                continue
+            if ((px + py) & 1) != 0:
+                continue
+            dx = slot_x + px
+            if not (0 <= dx < img_w):
+                continue
+            img.setPixel(dx, dy, tint)
+
+
+def _to_argb32(img: QImage) -> QImage:
+    """Return an ARGB32 copy suitable for overlay-stamping.
+
+    Indexed8 sources have to be widened before ``setPixel`` can write
+    the semi-transparent tint. Already-RGBA images pass through with
+    just a ``convertToFormat`` no-op copy so the caller can safely
+    mutate without touching the shared cached source.
+    """
+    if img.format() not in (
+        QImage.Format_ARGB32, QImage.Format_ARGB32_Premultiplied,
+    ):
+        return img.convertToFormat(QImage.Format_ARGB32)
+    return img.copy()
+
+
+def overlay_red_gaps_composite(
+    img: QImage,
+    *,
+    ncer: ncer_mod.Ncer,
+    layout: CellLayout,
+    columns: int,
+) -> QImage:
+    """Return an ARGB32 copy of ``img`` with gap pixels tinted red for
+    every cell in the composite grid."""
+    rects, max_w, max_h = layout
+    n_cells = len(ncer.cells)
+    columns = max(1, min(columns, n_cells))
+    out = _to_argb32(img)
+    for ci, cell in enumerate(ncer.cells):
+        col = ci % columns
+        row = ci // columns
+        xmin, ymin, _, _ = rects[ci]
+        _stamp_red_overlay_in_slot(
+            out, cell,
+            slot_x=col * max_w, slot_y=row * max_h,
+            slot_w=max_w, slot_h=max_h,
+            xmin=xmin, ymin=ymin,
+        )
+    return out
+
+
+def overlay_red_gaps_single_cell(
+    img: QImage,
+    *,
+    ncer: ncer_mod.Ncer,
+    layout: CellLayout,
+    cell_idx: int,
+) -> QImage:
+    """Return an ARGB32 copy of a per-cell PNG with gap pixels tinted red."""
+    rects, max_w, max_h = layout
+    if not (0 <= cell_idx < len(ncer.cells)):
+        return _to_argb32(img)
+    out = _to_argb32(img)
+    xmin, ymin, _, _ = rects[cell_idx]
+    _stamp_red_overlay_in_slot(
+        out, ncer.cells[cell_idx],
+        slot_x=0, slot_y=0,
+        slot_w=max_w, slot_h=max_h,
+        xmin=xmin, ymin=ymin,
+    )
+    return out
+
+
 # ---- canvas + paint ---------------------------------------------------
 
 
@@ -182,17 +300,20 @@ def make_indexed_canvas(w: int, h: int, palette: List[Rgb]) -> QImage:
 
 
 def _tile_geometry(ctx: CellPngContext) -> Tuple[int, int, int]:
-    """``(bytes_per_tile, row_stride, tile_mult)`` for the current sprite.
+    """``(bytes_per_tile, row_stride, boundary_bytes)`` for the current sprite.
 
-    ``tile_mult`` converts an OAM ``tile`` index into a count of
-    bit-depth-native tiles. For NCERs whose ``boundary_bytes`` is below
-    one tile (shouldn't happen for valid sprites) the multiplier is
-    clamped to 1 so we don't divide-by-zero downstream.
+    OAM tile fields are slot indices whose unit is ``boundary_bytes``,
+    not tiles. The linear NCGR tile index is
+    ``(slot * boundary_bytes) // bytes_per_tile`` — evaluate at the call
+    site so 2D-8bpp sprites (boundary=32, bytes_per_tile=64: half a tile
+    per slot) resolve correctly. A previous ``tile_mult`` scalar clamped
+    to 1 here silently mapped OAM slots one-for-one to tile indices,
+    which pushed slots past ``n_tiles`` on multi-cell 2D-8bpp BTCHR
+    sprites (e.g. group 77) and cropped the bottom half of every cell.
     """
     bytes_per_tile = 64 if ctx.is_8bpp else 32
     row_stride = 8 if ctx.is_8bpp else 4
-    tile_mult = max(1, ctx.ncer.boundary_bytes // bytes_per_tile)
-    return bytes_per_tile, row_stride, tile_mult
+    return bytes_per_tile, row_stride, ctx.ncer.boundary_bytes
 
 
 def paint_cell_indexed(
@@ -211,13 +332,13 @@ def paint_cell_indexed(
     coords. Index 0 is reserved transparent — never written, so any
     transparent gutter behind the cell stays alpha=0.
     """
-    bytes_per_tile, row_stride, tile_mult = _tile_geometry(ctx)
+    bytes_per_tile, row_stride, boundary_bytes = _tile_geometry(ctx)
     tile_bytes = ctx.tile_bytes
     n_tiles = ctx.n_tiles
     img_w = img.width()
     img_h = img.height()
     for o in cell.oams:
-        first_tile = o.tile * tile_mult
+        first_tile = (o.tile * boundary_bytes) // bytes_per_tile
         ox = o.x - xmin
         oy = o.y - ymin
         ntw = o.w // 8
@@ -335,7 +456,7 @@ def _decode_cell_into(
     palette: List[Rgb],
     bytes_per_tile: int,
     row_stride: int,
-    tile_mult: int,
+    boundary_bytes: int,
 ) -> None:
     """Walk one cell's OAMs and write decoded pixels into the tile buffer.
 
@@ -348,7 +469,7 @@ def _decode_cell_into(
     src_w = src.width()
     src_h = src.height()
     for o in cell.oams:
-        first_tile = o.tile * tile_mult
+        first_tile = (o.tile * boundary_bytes) // bytes_per_tile
         ox = o.x - xmin
         oy = o.y - ymin
         ntw = o.w // 8
@@ -386,6 +507,110 @@ def _decode_cell_into(
                         )
 
 
+def _count_uncovered_in_slot(
+    src: QImage,
+    cell: ncer_mod.Cell,
+    *,
+    slot_x: int,
+    slot_y: int,
+    slot_w: int,
+    slot_h: int,
+    xmin: int,
+    ymin: int,
+    use_indexed: bool,
+) -> int:
+    """Count non-transparent pixels in ``src`` inside the slot rectangle
+    that fall outside every OAM in ``cell``.
+
+    ``xmin/ymin`` is the cell's bbox origin (same convention as
+    :func:`_decode_cell_into`). Pixels are "non-transparent" if the
+    Indexed8 index is > 0 or the RGBA alpha is >= 128 — matches how
+    :func:`_decode_cell_into` decides whether a pixel is content.
+    Mask origin is ``(xmin, ymin)`` (see
+    :func:`_stamp_red_overlay_in_slot` for the same convention).
+    """
+    mask = btchr.oam_coverage_mask(cell, slot_w, slot_h, xmin, ymin)
+    if not mask:
+        return 0
+    lost = 0
+    src_w = src.width()
+    src_h = src.height()
+    for py in range(slot_h):
+        dy = slot_y + py
+        if not (0 <= dy < src_h):
+            continue
+        row = py * slot_w
+        for px in range(slot_w):
+            if mask[row + px]:
+                continue
+            dx = slot_x + px
+            if not (0 <= dx < src_w):
+                continue
+            if use_indexed:
+                if src.pixelIndex(dx, dy) != 0:
+                    lost += 1
+            else:
+                if src.pixelColor(dx, dy).alpha() >= 128:
+                    lost += 1
+    return lost
+
+
+def count_uncovered_content_composite(
+    img: QImage,
+    *,
+    ncer: ncer_mod.Ncer,
+    layout: CellLayout,
+    columns: int,
+) -> int:
+    """Composite-import variant: sum uncovered non-transparent pixels
+    across all cells laid out in the ``columns × rows`` grid."""
+    rects, max_w, max_h = layout
+    n_cells = len(ncer.cells)
+    columns = max(1, min(columns, n_cells))
+    use_indexed = img.format() == QImage.Format_Indexed8
+    if not use_indexed:
+        img = img.convertToFormat(QImage.Format_RGBA8888)
+    total = 0
+    for ci, cell in enumerate(ncer.cells):
+        col = ci % columns
+        row = ci // columns
+        xmin, ymin, _, _ = rects[ci]
+        total += _count_uncovered_in_slot(
+            img, cell,
+            slot_x=col * max_w, slot_y=row * max_h,
+            slot_w=max_w, slot_h=max_h,
+            xmin=xmin, ymin=ymin,
+            use_indexed=use_indexed,
+        )
+    return total
+
+
+def count_uncovered_content_per_cell(
+    imgs: List[QImage],
+    *,
+    ncer: ncer_mod.Ncer,
+    layout: CellLayout,
+) -> int:
+    """Per-cell-import variant: each PNG is its own ``max_w × max_h`` slot."""
+    rects, max_w, max_h = layout
+    if len(imgs) != len(ncer.cells):
+        return 0
+    use_indexed = imgs[0].format() == QImage.Format_Indexed8
+    if not use_indexed:
+        imgs = [p.convertToFormat(QImage.Format_RGBA8888) for p in imgs]
+    total = 0
+    for ci, cell in enumerate(ncer.cells):
+        xmin, ymin, _, _ = rects[ci]
+        total += _count_uncovered_in_slot(
+            imgs[ci], cell,
+            slot_x=0, slot_y=0,
+            slot_w=max_w, slot_h=max_h,
+            xmin=xmin, ymin=ymin,
+            use_indexed=use_indexed,
+        )
+    return total
+
+
 def import_cells_to_tiles(
     img: QImage,
     *,
@@ -420,7 +645,7 @@ def import_cells_to_tiles(
         img = img.convertToFormat(QImage.Format_RGBA8888)
 
     new_tiles = bytearray(ctx.tile_bytes)
-    bytes_per_tile, row_stride, tile_mult = _tile_geometry(ctx)
+    bytes_per_tile, row_stride, boundary_bytes = _tile_geometry(ctx)
     for ci, cell in enumerate(ctx.ncer.cells):
         col = ci % columns
         row = ci // columns
@@ -432,7 +657,7 @@ def import_cells_to_tiles(
             xmin=xmin, ymin=ymin,
             use_indexed=use_indexed, palette=palette,
             bytes_per_tile=bytes_per_tile, row_stride=row_stride,
-            tile_mult=tile_mult,
+            boundary_bytes=boundary_bytes,
         )
     return bytes(new_tiles)
 
@@ -477,7 +702,7 @@ def import_per_cell_to_tiles(
         imgs = [p.convertToFormat(QImage.Format_RGBA8888) for p in imgs]
 
     new_tiles = bytearray(ctx.tile_bytes)
-    bytes_per_tile, row_stride, tile_mult = _tile_geometry(ctx)
+    bytes_per_tile, row_stride, boundary_bytes = _tile_geometry(ctx)
     for ci, cell in enumerate(ctx.ncer.cells):
         xmin, ymin, _, _ = rects[ci]
         _decode_cell_into(
@@ -487,7 +712,7 @@ def import_per_cell_to_tiles(
             xmin=xmin, ymin=ymin,
             use_indexed=use_indexed, palette=palette,
             bytes_per_tile=bytes_per_tile, row_stride=row_stride,
-            tile_mult=tile_mult,
+            boundary_bytes=boundary_bytes,
         )
     return bytes(new_tiles)
 

@@ -157,6 +157,27 @@ def wrap_in_scroll(content: QWidget, parent: Optional[QWidget] = None) -> QScrol
     return scroll
 
 
+def wrap_tooltip(text: str, width_px: int = 300) -> str:
+    """HTML-wrap tooltip text so Qt wraps it at ``width_px`` pixels.
+
+    Qt treats any tooltip string containing HTML tags as rich text and
+    renders it through QTextDocument, which honors the outer table's
+    `width` attribute for layout. Wrapping via a fixed-width table is
+    the well-known reliable trick — bare `<p style='width:...'>` and
+    CSS `max-width` on `QToolTip` are only intermittently respected
+    across Qt versions.
+
+    Mirrors the 300 px wrap length used by DWDDRandomizer's tkinter
+    tooltips so long descriptions stay narrow instead of stretching
+    across the whole screen.
+    """
+    from html import escape
+    escaped = escape(text).replace("\n", "<br>")
+    return (
+        f"<table width='{width_px}'><tr><td>{escaped}</td></tr></table>"
+    )
+
+
 def make_form(parent: QWidget):
     """Tightened QFormLayout factory — drop-in replacement for `QFormLayout(box)`.
 

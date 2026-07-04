@@ -64,16 +64,19 @@ class AnimStep:
 class MiniHeader:
     """Parsed BTCHR entry-0 mini-header.
 
-    Three animation tracks (idle/attack/defend) and a 14-byte fixed prefix
-    whose signed fields scale with sprite footprint — exact meaning is
-    pivot/bbox, exposed verbatim so the UI can show them.
+    Three animation tracks (idle/attack/defend) and a 14-byte fixed prefix.
+    Field semantics confirmed empirically by editing Lunamon's values and
+    observing gameplay + scan-target UI.
     """
-    footprint_scale: int   # u16 at 0x00 — scales with sprite size
+    footprint_scale: int   # u16 at 0x00 — tile-per-frame VRAM budget;
+                           # setting above actual tpf spills across cell
+                           # boundaries and garbles intermediate frames
     flag: int              # u16 at 0x02
     pad_04: int            # i16 at 0x04 — usually 0
-    y_pivot_a: int         # i16 at 0x06 — always <= 0 in vanilla
-    x_pivot: int           # i16 at 0x08
-    y_pivot_b: int         # i16 at 0x0A — always <= 0 in vanilla
+    y_pivot_a: int         # i16 at 0x06 — perceived Y for scan-circle
+                           # overlay; does NOT move sprite on battlefield
+    x_pivot: int           # i16 at 0x08 — no observable effect in vanilla
+    y_pivot_b: int         # i16 at 0x0A — no observable effect in vanilla
     pad_0c: int            # u16 at 0x0C — usually 0
     idle: List[AnimStep]   # track A — starts implicit on cell 0
     attack: List[AnimStep] # track B
@@ -263,6 +266,26 @@ def decode_digimon(pak_file, group_idx: int, digimon_id: int = -1) -> BtchrDigim
 # ---- sidecar --------------------------------------------------------------
 
 
+def derived_footprint_scale(n_tiles: int, n_cells: int) -> int:
+    """Compute the canonical mini-header footprint_scale from tile geometry.
+
+    Verified across all 415 vanilla BTCHR groups: ``footprint_scale`` in
+    entry-0's mini-header exactly matches ``chrsize.tpf``, and equals
+    ``n_tiles // n_cells`` — the per-cell tile budget the engine uses to
+    slice the NCGR into cell-sized chunks (cell *i* reads
+    ``[i*fs : (i+1)*fs]``). The two single-cell sentinel groups fall out
+    naturally: ``n_tiles // 1 == n_tiles``.
+
+    Any code path that rebuilds the tile bank should recompute fs from
+    here and rewrite mini-header + chrsize + btchrsize together — the
+    three sources must stay consistent or the engine indexes garbled
+    tiles for cells > 0.
+    """
+    if n_cells > 0:
+        return n_tiles // n_cells
+    return n_tiles
+
+
 def parse_chrsize(raw: bytes) -> List[Tuple[int, int]]:
     """Return ``[(digimon_id, tile_count_div5), ...]`` per group.
 
@@ -294,6 +317,41 @@ def cell_bbox(cell: ncer_mod.Cell) -> Tuple[int, int, int, int]:
     return (min(xs), min(ys), max(xes), max(yes))
 
 
+def oam_coverage_mask(
+    cell: ncer_mod.Cell, w: int, h: int, x_origin: int, y_origin: int,
+) -> bytes:
+    """Return a ``w*h`` byte array marking which pixels the cell's OAMs
+    cover (``1`` = at least one OAM covers this pixel, ``0`` = gap).
+
+    Origin ``(x_origin, y_origin)`` is the OAM-coord location of pixel
+    ``(0, 0)`` in the output — i.e. the bbox min for a straight
+    ``render_cell_rgba`` call, or ``(xmin - slot_x, ymin - slot_y)`` when
+    the caller is aligning with a PNG slot.
+
+    Motivated by BTCHR sprites like group 161 (Baihumon, 0x00a1) whose
+    OAM union leaves an interior gap on the left flank — any content
+    painted into that gap by a PNG import has no OAM referencing it and
+    never renders in-game.
+    """
+    if w <= 0 or h <= 0:
+        return b""
+    mask = bytearray(w * h)
+    for o in cell.oams:
+        x0 = o.x - x_origin
+        y0 = o.y - y_origin
+        for py in range(o.h):
+            dy = y0 + py
+            if not (0 <= dy < h):
+                continue
+            row = dy * w
+            xs = max(0, x0)
+            xe = min(w, x0 + o.w)
+            if xe > xs:
+                for dx in range(xs, xe):
+                    mask[row + dx] = 1
+    return bytes(mask)
+
+
 def render_cell_rgba(
     cell: ncer_mod.Cell,
     tile_bytes: bytes,
@@ -303,9 +361,12 @@ def render_cell_rgba(
 ) -> Tuple[bytes, int, int]:
     """Composite one cell into a flat RGBA buffer + ``(width, height)``.
 
-    Tile addressing assumes 8bpp 1D-mapped (DWDD vanilla — all 415
-    digimon). The OAM tile field is a slot index; ``slot_bytes /
-    bytes_per_tile`` gives the linear NCGR tile index multiplier.
+    Tile addressing is 8bpp (all 415 vanilla BTCHR digimon). OAM ``tile``
+    is a slot index whose unit is ``boundary_bytes`` — the linear NCGR
+    tile index is ``(slot * boundary_bytes) // bytes_per_tile``. Handles
+    both 1D-mapped BTCHR (boundary=128 → 2 tiles per slot) and
+    2D-mapped BTCHR (boundary=32 → half a tile per slot) with the same
+    formula.
 
     Index 0 is transparent (alpha=0). ``pad`` adds transparent border on
     every side — convenient for previews so OAM-edge artifacts don't
@@ -319,10 +380,9 @@ def render_cell_rgba(
     buf = bytearray(w * h * 4)  # zero-init → fully transparent
 
     n_tiles = len(tile_bytes) // BYTES_PER_TILE_8BPP
-    tile_mult = boundary_bytes // BYTES_PER_TILE_8BPP
 
     for o in cell.oams:
-        first_tile = o.tile * tile_mult
+        first_tile = (o.tile * boundary_bytes) // BYTES_PER_TILE_8BPP
         ox = o.x - xmin + pad
         oy = o.y - ymin + pad
         ntw = o.w // 8

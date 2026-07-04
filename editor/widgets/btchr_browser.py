@@ -50,13 +50,18 @@ from ..commands import (
     ReplaceSpriteCommand,
 )
 from ._png_palette import build_palette_from_png, nearest_idx_opaque
+from .form_helpers import add_unknown_form_row, wrap_tooltip
 from .cell_png_io import (
     CellPngContext,
     CellPngError,
     build_palette_for_per_cell_import,
     cell_layout as shared_cell_layout,
+    count_uncovered_content_composite,
+    count_uncovered_content_per_cell,
     import_cells_to_tiles,
     import_per_cell_to_tiles,
+    overlay_red_gaps_composite,
+    overlay_red_gaps_single_cell,
     render_cells_qimage as shared_render_cells_qimage,
     render_one_cell_qimage as shared_render_one_cell_qimage,
 )
@@ -315,6 +320,37 @@ class BtchrBrowser(QWidget):
         self._show_all_cells = QCheckBox("Show all cells (strip)")
         self._show_all_cells.toggled.connect(self._on_show_all_toggled)
 
+        # OAM-gap toggles — kept always-visible so the footer layout
+        # doesn't shift when switching between sprites with/without
+        # gaps; disabled (grayed out) instead when the current sprite
+        # has no gaps. Tooltips carry the "what does this mean" detail
+        # since the labels themselves can't fit a full explanation and
+        # "red overlay" alone doesn't convey the semantics.
+        self._show_red_overlay_cb = QCheckBox("Highlight OAM coverage gaps")
+        self._show_red_overlay_cb.setChecked(True)
+        self._show_red_overlay_cb.setToolTip(wrap_tooltip(
+            "Some sprites leave regions inside their bounding box that "
+            "no OAM references. Content painted there (via PNG import) "
+            "is written into tile storage but never rendered in-game. "
+            "When enabled, those regions are tinted red on the cells "
+            "and tile-sheet previews."
+        ))
+        self._show_red_overlay_cb.toggled.connect(
+            self._on_show_red_overlay_toggled
+        )
+
+        self._bake_red_overlay_cb = QCheckBox(
+            "Include OAM coverage gaps in exported PNGs"
+        )
+        self._bake_red_overlay_cb.setChecked(False)
+        self._bake_red_overlay_cb.setToolTip(wrap_tooltip(
+            "When enabled, exported tile-sheet and per-cell PNGs will "
+            "have the red gap highlight painted into the image itself, "
+            "so an external image editor also shows where content "
+            "would be lost on re-import. Leave unchecked for a "
+            "lossless round-trip."
+        ))
+
         # Tile-sheet tab widgets.
         self._sheet_preview = QLabel("Select a digimon.")
         self._sheet_preview.setAlignment(Qt.AlignCenter)
@@ -395,6 +431,33 @@ class BtchrBrowser(QWidget):
         # all sized to the union bbox over all 5 cells — guarantees the
         # "all cells must be the same size" invariant the engine relies
         # on, and lets the user copy frames between digimon freely.
+        # Composite cells-sheet IO: export renders all cells side by side
+        # into one PNG (the OAM view the Tile-sheet tab shows); import
+        # reads that composite back. Export is read-only; import writes
+        # tiles (and optionally the palette) but never the OAM layout —
+        # the cells codec paints into the existing OAM rectangles, it
+        # doesn't move them.
+        self._export_cells_sheet_btn = QPushButton("Export cells sheet PNG…")
+        self._export_cells_sheet_btn.setToolTip(wrap_tooltip(
+            "Save all cells composited side by side into a single PNG — "
+            "the same image the Tile-sheet tab shows in Cells (OAM) "
+            "view. Read-only: it does not modify the sprite, tiles, or "
+            "OAM."
+        ))
+        self._export_cells_sheet_btn.clicked.connect(
+            self._on_export_cells_sheet_png
+        )
+        self._import_cells_sheet_btn = QPushButton("Import cells sheet PNG…")
+        self._import_cells_sheet_btn.setToolTip(wrap_tooltip(
+            "Read a cells-composite PNG (as written by Export cells "
+            "sheet PNG) back into the sprite's tiles. Paints into the "
+            "existing OAM rectangles — cell count and OAM layout are "
+            "unchanged; only the tile pixels (and optionally the "
+            "palette) are rewritten."
+        ))
+        self._import_cells_sheet_btn.clicked.connect(
+            self._on_import_cells_sheet_png
+        )
         self._export_per_cell_btn = QPushButton("Export per-cell PNGs…")
         self._export_per_cell_btn.clicked.connect(self._on_export_per_cell_pngs)
         self._import_per_cell_btn = QPushButton("Import per-cell PNGs…")
@@ -436,6 +499,8 @@ class BtchrBrowser(QWidget):
         cells_controls = QFormLayout()
         cells_controls.addRow("Cell", self._cell_spin)
         cells_controls.addRow("", self._show_all_cells)
+        cells_controls.addRow("", self._show_red_overlay_cb)
+        cells_controls.addRow("", self._bake_red_overlay_cb)
 
         # ---- Animation playback + step editing -----------------------
         # Timer drives _anim_pos at the chosen FPS; _on_anim_tick reads
@@ -505,13 +570,22 @@ class BtchrBrowser(QWidget):
         self._meta_name = QLabel("—")
         self._meta_cells = QLabel("—")
         self._meta_tiles = QLabel("—")
+        self._meta_footprint_scale = QLabel("—")
+        self._meta_footprint_scale.setToolTip(wrap_tooltip(
+            "Derived tiles-per-cell budget (mini_header u16 @ 0x00). "
+            "Always equals NCGR tiles ÷ cell count and matches "
+            "chrsize.tpf for the group — read-only because editing it "
+            "independently of the tile bank makes the engine index "
+            "garbled tiles for cells past 0."
+        ))
         self._meta_cell_size = QLabel("—")
         self._meta_idle = QLabel("—")
         self._meta_attack = QLabel("—")
         self._meta_defend = QLabel("—")
         for lbl in (
             self._meta_name,
-            self._meta_cells, self._meta_tiles, self._meta_cell_size,
+            self._meta_cells, self._meta_tiles,
+            self._meta_footprint_scale, self._meta_cell_size,
             self._meta_idle, self._meta_attack, self._meta_defend,
         ):
             lbl.setMinimumWidth(280)
@@ -519,29 +593,27 @@ class BtchrBrowser(QWidget):
         name_font.setBold(True)
         self._meta_name.setFont(name_font)
 
-        # Editable header fields. footprint_scale is u16; y_pivot_a,
-        # x_pivot, y_pivot_b are i16 (vanilla y-pivots are always ≤ 0
-        # because the engine pivots from the sprite's top, but signed
-        # range is exposed for parity with the stored shape). Edits go
-        # through _push_header_replacement so undo/redo wraps them.
-        # _hdr_loading guards programmatic refresh from re-firing the
-        # valueChanged → re-encode loop on selection change.
+        # Editable mini-header fields. y_pivot_a (i16 @ 0x06) drives the
+        # scan-target overlay Y — user-facing. x_pivot (i16 @ 0x08) and
+        # y_pivot_b (i16 @ 0x0A) have no observable in-game effect in
+        # vanilla testing, so they're labelled with their raw offsets
+        # and hidden behind the global "Show unknown fields" toggle.
+        # footprint_scale (u16 @ 0x00) is deliberately NOT editable —
+        # the field is a derived tiles-per-cell value that must equal
+        # ``n_tiles // n_cells`` (== chrsize.tpf); editing it independent
+        # of the tile bank garbles cells past 0. It's surfaced read-only
+        # via `_meta_footprint_scale` in the metadata block above.
+        # Edits go through _push_header_replacement so undo/redo wraps
+        # them. _hdr_loading guards programmatic refresh from re-firing
+        # the valueChanged → re-encode loop on selection change.
         self._hdr_loading = False
-        self._hdr_scale_spin = QSpinBox()
-        self._hdr_scale_spin.setRange(0, 0xFFFF)
-        self._hdr_scale_spin.setMaximumWidth(110)
-        self._hdr_scale_spin.setToolTip(
-            "footprint_scale (u16) — scales with sprite size; affects "
-            "render footprint."
-        )
-        self._hdr_scale_spin.valueChanged.connect(
-            lambda v: self._on_header_field_changed("footprint_scale", v)
-        )
         self._hdr_y_pivot_a_spin = QSpinBox()
         self._hdr_y_pivot_a_spin.setRange(-0x8000, 0x7FFF)
         self._hdr_y_pivot_a_spin.setMaximumWidth(110)
         self._hdr_y_pivot_a_spin.setToolTip(
-            "y_pivot_a (i16) — top pivot; vanilla values are always ≤ 0."
+            "Scan target Y (mini_header i16 @ 0x06) — perceived Y for "
+            "the scan-target circle overlay; does not move the sprite "
+            "on the battlefield. Vanilla values are always ≤ 0."
         )
         self._hdr_y_pivot_a_spin.valueChanged.connect(
             lambda v: self._on_header_field_changed("y_pivot_a", v)
@@ -550,7 +622,8 @@ class BtchrBrowser(QWidget):
         self._hdr_x_pivot_spin.setRange(-0x8000, 0x7FFF)
         self._hdr_x_pivot_spin.setMaximumWidth(110)
         self._hdr_x_pivot_spin.setToolTip(
-            "x_pivot (i16) — horizontal pivot offset."
+            "mini_header i16 @ 0x08 — no observable in-game effect in "
+            "vanilla testing."
         )
         self._hdr_x_pivot_spin.valueChanged.connect(
             lambda v: self._on_header_field_changed("x_pivot", v)
@@ -559,7 +632,8 @@ class BtchrBrowser(QWidget):
         self._hdr_y_pivot_b_spin.setRange(-0x8000, 0x7FFF)
         self._hdr_y_pivot_b_spin.setMaximumWidth(110)
         self._hdr_y_pivot_b_spin.setToolTip(
-            "y_pivot_b (i16) — bottom pivot; vanilla values are always ≤ 0."
+            "mini_header i16 @ 0x0A — no observable in-game effect in "
+            "vanilla testing."
         )
         self._hdr_y_pivot_b_spin.valueChanged.connect(
             lambda v: self._on_header_field_changed("y_pivot_b", v)
@@ -569,11 +643,11 @@ class BtchrBrowser(QWidget):
         meta_form.addRow("Name", self._meta_name)
         meta_form.addRow("Cells", self._meta_cells)
         meta_form.addRow("NCGR tiles", self._meta_tiles)
+        meta_form.addRow("Tiles / cell", self._meta_footprint_scale)
         meta_form.addRow("Per-cell PNG size", self._meta_cell_size)
-        meta_form.addRow("Footprint scale", self._hdr_scale_spin)
-        meta_form.addRow("Y pivot (top)", self._hdr_y_pivot_a_spin)
-        meta_form.addRow("X pivot", self._hdr_x_pivot_spin)
-        meta_form.addRow("Y pivot (bottom)", self._hdr_y_pivot_b_spin)
+        meta_form.addRow("Scan target Y", self._hdr_y_pivot_a_spin)
+        add_unknown_form_row(meta_form, "Unknown 0x08", self._hdr_x_pivot_spin)
+        add_unknown_form_row(meta_form, "Unknown 0x0A", self._hdr_y_pivot_b_spin)
         meta_form.addRow("Idle", self._meta_idle)
         meta_form.addRow("Attack", self._meta_attack)
         meta_form.addRow("Defend", self._meta_defend)
@@ -586,6 +660,17 @@ class BtchrBrowser(QWidget):
         cells_layout = QVBoxLayout(cells_tab)
         cells_layout.setContentsMargins(8, 8, 8, 8)
         cells_layout.addWidget(self._scroll, 1)
+
+        # Coverage-gap note lives above the footer (see right_layout
+        # below) so it's visible from both the Cells and Tile-sheet
+        # tabs — the previous cells-tab-only placement left users on
+        # the tile-sheet tab staring at red pixels with no explanation.
+        self._coverage_note = QLabel()
+        self._coverage_note.setWordWrap(True)
+        self._coverage_note.setStyleSheet(
+            "color: #b00020; font-size: 11px; padding: 2px 4px 0 4px;"
+        )
+        self._coverage_note.setVisible(False)
 
         # Animation panel sits below the preview so playback animates
         # the same preview the user is already looking at. Controls row
@@ -646,7 +731,12 @@ class BtchrBrowser(QWidget):
         # four buttons pinned to the widest label so Export/Import line
         # up across columns.
         sheet_btns = (self._export_sheet_btn, self._import_sheet_btn)
-        per_cell_btns = (self._export_per_cell_btn, self._import_per_cell_btn)
+        per_cell_btns = (
+            self._export_cells_sheet_btn,
+            self._import_cells_sheet_btn,
+            self._export_per_cell_btn,
+            self._import_per_cell_btn,
+        )
         pal_btns = (self._export_pal_btn, self._import_pal_btn)
         kit_btns = (
             self._export_btchrspr_btn,
@@ -667,6 +757,8 @@ class BtchrBrowser(QWidget):
         sheet_col.addStretch(1)
         per_cell_col = QVBoxLayout()
         per_cell_col.setSpacing(4)
+        per_cell_col.addWidget(self._export_cells_sheet_btn)
+        per_cell_col.addWidget(self._import_cells_sheet_btn)
         per_cell_col.addWidget(self._export_per_cell_btn)
         per_cell_col.addWidget(self._import_per_cell_btn)
         per_cell_col.addStretch(1)
@@ -688,6 +780,7 @@ class BtchrBrowser(QWidget):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(self._tabs, 1)
+        right_layout.addWidget(self._coverage_note)
 
         # Single row under the tabs: cell nav controls (leftmost — the
         # space the picker used to occupy), button columns, metadata,
@@ -768,8 +861,17 @@ class BtchrBrowser(QWidget):
         h = d.header
         name = self._name_for_group(g)
         self._meta_name.setText(name if name else "—")
-        self._meta_cells.setText(str(len(d.ncer.cells)))
+        n_cells = len(d.ncer.cells)
+        self._meta_cells.setText(str(n_cells))
         self._meta_tiles.setText(f"{d.n_tiles} tiles (8bpp)")
+        derived_fs = btchr.derived_footprint_scale(d.n_tiles, n_cells)
+        stored_fs = d.header.footprint_scale
+        if stored_fs == derived_fs:
+            self._meta_footprint_scale.setText(str(derived_fs))
+        else:
+            self._meta_footprint_scale.setText(
+                f"{stored_fs} (expected {derived_fs} — mini-header out of sync)"
+            )
         layout = self._cell_layout()
         if layout is None:
             self._meta_cell_size.setText("—")
@@ -837,7 +939,15 @@ class BtchrBrowser(QWidget):
     # ---- rendering -----------------------------------------------------
 
     def _cell_pixmap(self, cell_idx: int) -> Optional[QPixmap]:
-        """Render + memoize one cell of the current digimon."""
+        """Render + memoize one cell of the current digimon.
+
+        Overlays a semi-transparent green checkerboard on pixels inside
+        the cell bbox that no OAM covers — those regions get exported to
+        PNG and can be painted over by the user, but the engine never
+        draws them (no OAM references the underlying tiles), so any
+        imported content there is silently lost. Sprite 0x00a1
+        (Baihumon) is the canonical example.
+        """
         if self._current_decoded is None:
             return None
         d = self._current_decoded
@@ -848,10 +958,28 @@ class BtchrBrowser(QWidget):
         cached = self._cell_pixmaps[cell_idx]
         if cached is not None:
             return cached
+        cell = d.ncer.cells[cell_idx]
         rgba, w, h = btchr.render_cell_rgba(
-            d.ncer.cells[cell_idx], d.tile_bytes, d.palette,
+            cell, d.tile_bytes, d.palette,
             boundary_bytes=d.ncer.boundary_bytes,
         )
+        if self._show_red_overlay_cb.isChecked():
+            xmin, ymin, _, _ = btchr.cell_bbox(cell)
+            mask = btchr.oam_coverage_mask(cell, w, h, xmin, ymin)
+            if mask:
+                buf = bytearray(rgba)
+                for i, covered in enumerate(mask):
+                    if covered:
+                        continue
+                    py = i // w
+                    px = i % w
+                    if ((px + py) & 1) == 0:
+                        po = i * 4
+                        buf[po] = 255
+                        buf[po + 1] = 0
+                        buf[po + 2] = 0
+                        buf[po + 3] = 96
+                rgba = bytes(buf)
         img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888).copy()
         pm = QPixmap.fromImage(img)
         self._cell_pixmaps[cell_idx] = pm
@@ -860,7 +988,9 @@ class BtchrBrowser(QWidget):
     def _refresh_preview(self) -> None:
         if self._current_decoded is None:
             self._cells_src_qimage = None
+            self._coverage_note.setVisible(False)
             return
+        self._update_coverage_note()
         if self._show_all_cells.isChecked():
             pm = self._build_all_cells_strip()
         else:
@@ -954,6 +1084,95 @@ class BtchrBrowser(QWidget):
                     img.setPixel(tx0 + px, ty0 + py, tile[py * 8 + px])
         return img
 
+    def _cell_uncovered_pixel_count(self, cell_idx: int) -> int:
+        """Number of pixels inside the cell's bbox that no OAM covers."""
+        if self._current_decoded is None:
+            return 0
+        d = self._current_decoded
+        if not (0 <= cell_idx < len(d.ncer.cells)):
+            return 0
+        cell = d.ncer.cells[cell_idx]
+        xmin, ymin, xmax, ymax = btchr.cell_bbox(cell)
+        w = xmax - xmin
+        h = ymax - ymin
+        if w <= 0 or h <= 0:
+            return 0
+        mask = btchr.oam_coverage_mask(cell, w, h, xmin, ymin)
+        return (w * h) - sum(mask)
+
+    def _sprite_has_gaps(self) -> bool:
+        """True if any cell of the current sprite has uncovered pixels."""
+        if self._current_decoded is None:
+            return False
+        d = self._current_decoded
+        return any(
+            self._cell_uncovered_pixel_count(i) > 0
+            for i in range(len(d.ncer.cells))
+        )
+
+    def _on_show_red_overlay_toggled(self, _checked: bool) -> None:
+        """Invalidate cell pixmap cache and refresh both previews so the
+        overlay toggle takes effect immediately (cells preview reads the
+        checkbox directly; the sheet preview re-renders in cells mode)."""
+        self._cell_pixmaps = []
+        self._refresh_preview()
+        self._refresh_sheet_preview()
+
+    def _update_coverage_note(self) -> None:
+        """Refresh the "red overlay means uncovered pixels" note.
+
+        Shows the total gap-pixel count for the current view (single
+        cell, or every cell in the strip) so the user knows how much of
+        the visible red is actually consequential. Hidden — along with
+        the overlay toggles — when the current sprite has no gaps.
+        """
+        if self._current_decoded is None:
+            self._coverage_note.setVisible(False)
+            self._show_red_overlay_cb.setEnabled(False)
+            self._bake_red_overlay_cb.setEnabled(False)
+            return
+        d = self._current_decoded
+        if self._show_all_cells.isChecked():
+            total = sum(
+                self._cell_uncovered_pixel_count(i)
+                for i in range(len(d.ncer.cells))
+            )
+            scope = "across all cells"
+        else:
+            total = self._cell_uncovered_pixel_count(self._current_cell)
+            scope = f"in cell {self._current_cell}"
+        sprite_has_gaps = self._sprite_has_gaps()
+        self._show_red_overlay_cb.setEnabled(sprite_has_gaps)
+        self._bake_red_overlay_cb.setEnabled(sprite_has_gaps)
+        if total <= 0:
+            self._coverage_note.setVisible(False)
+            return
+        self._coverage_note.setText(
+            f"Red overlay: {total} pixel{'s' if total != 1 else ''} {scope} "
+            "sit inside the cell bounding box but no OAM covers them. "
+            "Content painted here (via PNG import) will not render "
+            "in-game, as the sprite's OAM layout leaves those gaps."
+        )
+        self._coverage_note.setVisible(True)
+
+    def _confirm_uncovered_content(self, lost: int) -> bool:
+        """Ask the user whether to proceed when the PNG has non-transparent
+        pixels in regions no OAM covers. Those pixels get written to NCGR
+        tile storage but the engine never draws them, so the visible import
+        is silently smaller than the source PNG."""
+        reply = QMessageBox.warning(
+            self,
+            "Content outside OAM coverage",
+            f"The imported image has {lost} non-transparent pixel"
+            f"{'s' if lost != 1 else ''} in regions that no OAM covers. "
+            "Those pixels will not appear in-game — this sprite's OAM "
+            "layout leaves gaps inside its bounding box.\n\n"
+            "Import anyway?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
     def _cell_ctx(self) -> Optional[CellPngContext]:
         """Build a CellPngContext over the current BTCHR sprite.
 
@@ -996,7 +1215,17 @@ class BtchrBrowser(QWidget):
             self._sheet_src_qimage = None
             return
         if self._view_mode_combo.currentData() == "cells":
-            img = self._render_cells_qimage(self._sheet_columns_spin.value())
+            columns_val = self._sheet_columns_spin.value()
+            img = self._render_cells_qimage(columns_val)
+            if img is not None and self._show_red_overlay_cb.isChecked():
+                layout = self._cell_layout()
+                if layout is not None:
+                    img = overlay_red_gaps_composite(
+                        img,
+                        ncer=self._current_decoded.ncer,
+                        layout=layout,
+                        columns=columns_val,
+                    )
         else:
             img = self._render_sheet_qimage(
                 self._sheet_cols_spin.value(),
@@ -1067,6 +1296,69 @@ class BtchrBrowser(QWidget):
 
     # ---- tile sheet PNG ------------------------------------------------
 
+    def _on_export_cells_sheet_png(self) -> None:
+        """Export all cells composited into one row as a single PNG.
+
+        Independent of the Tile-sheet tab's view-mode combo — always the
+        OAM cells composite, one row (columns = n_cells), so the file
+        matches the attached-style reference layout every time. Embeds
+        ``btchr_mode=cells`` so ``Import tile sheet PNG`` can round-trip
+        it. Read-only w.r.t. the ROM.
+        """
+        if self._current_decoded is None or self._current_group is None:
+            return
+        d = self._current_decoded
+        n_cells = len(d.ncer.cells)
+        if n_cells == 0:
+            QMessageBox.critical(
+                self, "Export failed",
+                "Sprite has no cells — nothing to export.",
+            )
+            return
+        columns = n_cells
+        img = self._render_cells_qimage(columns)
+        if img is None:
+            QMessageBox.critical(self, "Export failed", "Render failed.")
+            return
+        if self._bake_red_overlay_cb.isChecked():
+            layout = self._cell_layout()
+            if layout is not None:
+                img = overlay_red_gaps_composite(
+                    img, ncer=d.ncer, layout=layout, columns=columns,
+                )
+        img.setText("btchr_mode", "cells")
+        img.setText("btchr_columns", str(columns))
+        suggested = f"btchr_cells_0x{self._current_group:04x}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export cells sheet PNG", suggested, "PNG (*.png)"
+        )
+        if not path:
+            return
+        if not img.save(path, "PNG"):
+            QMessageBox.critical(self, "Export failed", f"Could not write {path}.")
+
+    def _on_import_cells_sheet_png(self) -> None:
+        """Import a cells-composite PNG back into the sprite's tiles.
+
+        Symmetric with :meth:`_on_export_cells_sheet_png`. Forces the
+        cells codec regardless of the view-mode combo — the OAM-rectangle
+        layout is what the file encodes. Delegates the actual decode +
+        undo wrapping to the shared :meth:`_import_cells_png`.
+        """
+        if self._current_decoded is None or self._current_group is None:
+            return
+        d = self._current_decoded
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import cells sheet PNG", "", "PNG (*.png)"
+        )
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.critical(self, "Import failed", f"Could not read {path}.")
+            return
+        self._import_cells_png(img, d)
+
     def _on_export_sheet_png(self) -> None:
         if self._current_decoded is None or self._current_group is None:
             return
@@ -1094,6 +1386,15 @@ class BtchrBrowser(QWidget):
                     self, "Export failed", f"Could not write {path}.",
                 )
                 return
+            if self._bake_red_overlay_cb.isChecked():
+                layout = self._cell_layout()
+                if layout is not None:
+                    img = overlay_red_gaps_composite(
+                        img,
+                        ncer=self._current_decoded.ncer,
+                        layout=layout,
+                        columns=columns_val,
+                    )
             img.setText("btchr_mode", "cells")
             img.setText("btchr_columns", str(columns_val))
         else:
@@ -1357,6 +1658,11 @@ class BtchrBrowser(QWidget):
             palette=new_palette,
             is_8bpp=True,
         )
+        lost = count_uncovered_content_composite(
+            img, ncer=d.ncer, layout=layout, columns=columns,
+        )
+        if lost > 0 and not self._confirm_uncovered_content(lost):
+            return
         try:
             new_tiles = import_cells_to_tiles(
                 img, ctx=ctx, layout=layout,
@@ -1437,6 +1743,7 @@ class BtchrBrowser(QWidget):
         m = re.match(r"^(.*)_cell_\d+$", base)
         if m:
             base = m.group(1)
+        bake_overlay = self._bake_red_overlay_cb.isChecked()
         for ci in range(n_cells):
             img = self._render_one_cell_qimage(ci)
             if img is None:
@@ -1445,6 +1752,13 @@ class BtchrBrowser(QWidget):
                     f"Could not render cell {ci}.",
                 )
                 return
+            if bake_overlay:
+                img = overlay_red_gaps_single_cell(
+                    img,
+                    ncer=d.ncer,
+                    layout=layout,
+                    cell_idx=ci,
+                )
             img.setText("btchr_mode", "per_cell")
             img.setText("btchr_cell", str(ci))
             img.setText("btchr_n_cells", str(n_cells))
@@ -1543,6 +1857,11 @@ class BtchrBrowser(QWidget):
             palette=new_palette,
             is_8bpp=True,
         )
+        lost = count_uncovered_content_per_cell(
+            pngs, ncer=d.ncer, layout=layout,
+        )
+        if lost > 0 and not self._confirm_uncovered_content(lost):
+            return
         try:
             new_tiles = import_per_cell_to_tiles(
                 pngs, ctx=ctx, layout=layout, palette=new_palette,
@@ -2181,13 +2500,12 @@ class BtchrBrowser(QWidget):
             cmd.redo()
 
     def _load_header_spinboxes(self, h: btchr.MiniHeader) -> None:
-        """Programmatic refresh of the 4 editable header spinboxes. The
+        """Programmatic refresh of the 3 editable header spinboxes. The
         loading guard prevents the valueChanged signals from re-firing
         _on_header_field_changed → re-encode loop during selection or
         post-undo refresh."""
         self._hdr_loading = True
         try:
-            self._hdr_scale_spin.setValue(h.footprint_scale)
             self._hdr_y_pivot_a_spin.setValue(h.y_pivot_a)
             self._hdr_x_pivot_spin.setValue(h.x_pivot)
             self._hdr_y_pivot_b_spin.setValue(h.y_pivot_b)
@@ -2195,8 +2513,9 @@ class BtchrBrowser(QWidget):
             self._hdr_loading = False
 
     def _on_header_field_changed(self, attr: str, value: int) -> None:
-        """One handler for all four header spinboxes — clones the live
-        MiniHeader with ``attr`` swapped and pushes a replacement.
+        """One handler for the three editable header spinboxes — clones
+        the live MiniHeader with ``attr`` swapped and pushes a
+        replacement.
         Skipped when the spinbox value matches the live header (e.g.
         loading guard let one through, or undo restored the same value)."""
         if self._hdr_loading:

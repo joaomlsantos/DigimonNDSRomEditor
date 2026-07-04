@@ -49,6 +49,7 @@ from .cell_export_policy import (
     allow_shared_tile_exports,
     register_change_callback as _register_cell_policy_callback,
 )
+from .form_helpers import wrap_tooltip
 from .cell_png_io import (
     CellPngContext,
     CellPngError,
@@ -77,18 +78,24 @@ SPR_ANM = "DAT/SPR_ANM.PAK"
 SPR_PARALLEL_PAKS = (SPR_CHR, SPR_PAL, SPR_CEL, SPR_ANM)
 
 
-# Per-cell highlight colors for the OAM overlay. RGBA with low alpha so the
-# preview stays readable underneath. Cycles when n_cells exceeds the list.
-OAM_OVERLAY_COLORS = (
-    (255,  80,  80),
-    ( 80, 200,  80),
-    ( 80, 160, 255),
-    (255, 200,  60),
-    (220,  80, 220),
-    ( 60, 220, 220),
-    (255, 140,  40),
-    (180, 120, 255),
-)
+def _oam_gap_tile_set(
+    ncer_obj: Optional["ncer_mod.Ncer"], n_tiles: int, *, bpp4: bool,
+) -> set:
+    """Return the set of tile indices in the NCGR that no OAM references.
+
+    Same "coverage gap" idea as BTCHR's per-pixel mask, one level up:
+    here the unit is a whole tile, since the sprite_browser preview is
+    a raw-tile grid rather than an OAM composite. An empty set means
+    every tile is drawn by some cell; a non-empty set is exactly the
+    tiles that any PNG-import edit would silently discard.
+    """
+    if ncer_obj is None or not ncer_obj.cells or n_tiles <= 0:
+        return set()
+    referenced = set()
+    for cell_ranges in ncer_mod.cell_tile_ranges(ncer_obj, bpp4=bpp4):
+        for tile_start, tile_end in cell_ranges:
+            referenced.update(range(tile_start, min(tile_end, n_tiles)))
+    return set(range(n_tiles)) - referenced
 
 
 def _format_spr_label(prefix: str, role_token: str, metadata: str) -> str:
@@ -182,6 +189,12 @@ class SpriteBrowser(QWidget):
         self._picking_transparent: bool = False
         self._preview_src_size: Tuple[int, int] = (0, 0)
         self._preview_pixmap_size: Tuple[int, int] = (0, 0)
+        # OAM-gap overlay hidden from the UI: SPR_CHR data is tightly
+        # packed (0/1627 vanilla entries have gap tiles), so the toggle
+        # and meta row are dead weight for icons. The paint routine +
+        # gap-set helper stay in place so the feature can be surfaced
+        # again if a future workflow (e.g. tile-bank extension via PNG
+        # import) starts producing gaps.
         self._show_oam_overlay: bool = False
         # Cells tab state: lazy-render when the tab becomes visible so
         # switching sprites while the tab is hidden doesn't pay for the
@@ -386,18 +399,27 @@ class SpriteBrowser(QWidget):
         transparent_widget.setLayout(transparent_row)
         transparent_row.setContentsMargins(0, 0, 0, 0)
 
-        # OAM overlay toggle. When on, the preview is painted with one
-        # translucent rectangle per cell highlighting which NCGR tiles the
-        # cell's OAMs read from. Tells the user which tile ranges a
-        # replacement is load-bearing for (PLAN §11 G).
-        self._oam_overlay_check = QCheckBox("Show OAM cells")
+        # OAM coverage-gap toggle. Tiles in the raw-tile-grid preview
+        # that no NCER OAM references are tinted red — content painted
+        # into those tiles won't render in-game. Mirrors the BTCHR
+        # cell-preview red overlay so both editors flag the same class
+        # of "wasted paint" identically.
+        self._oam_overlay_check = QCheckBox("Highlight OAM coverage gaps")
+        self._oam_overlay_check.setChecked(True)
+        self._oam_overlay_check.setToolTip(wrap_tooltip(
+            "Some sprites leave tiles inside their NCGR that no NCER "
+            "OAM references. Content painted there (via PNG import) is "
+            "written into tile storage but never rendered in-game. When "
+            "enabled, those tiles are tinted red on the tile-grid "
+            "preview."
+        ))
         self._oam_overlay_check.toggled.connect(self._on_oam_overlay_toggled)
 
         controls = QFormLayout()
         controls.addRow("Width (tiles)", self._width_spin)
         controls.addRow("Palette bank", self._palette_combo)
         controls.addRow("Transparent color", transparent_widget)
-        controls.addRow("OAM overlay", self._oam_overlay_check)
+        # controls.addRow("OAM gaps", self._oam_overlay_check)
 
         # Metadata panel — one row per field, read-only.
         self._meta_tiles = QLabel("—")
@@ -406,6 +428,12 @@ class SpriteBrowser(QWidget):
         self._meta_cells = QLabel("—")
         self._meta_mapping = QLabel("—")
         self._meta_min_tiles = QLabel("—")
+        self._meta_oam_gaps = QLabel("—")
+        self._meta_oam_gaps.setToolTip(wrap_tooltip(
+            "Tiles in the NCGR that no OAM references. Content painted "
+            "into these tiles won't render in-game — highlighted red on "
+            "the preview when the OAM gaps toggle is on."
+        ))
         self._meta_chr_size = QLabel("—")
         # Pin the value column to a worst-case width so the form (and the
         # whole right pane via the splitter) doesn't reflow each time a
@@ -416,7 +444,7 @@ class SpriteBrowser(QWidget):
         for lbl in (
             self._meta_tiles, self._meta_bpp, self._meta_palettes,
             self._meta_cells, self._meta_mapping, self._meta_min_tiles,
-            self._meta_chr_size,
+            self._meta_oam_gaps, self._meta_chr_size,
         ):
             lbl.setMinimumWidth(worst_width)
 
@@ -427,6 +455,7 @@ class SpriteBrowser(QWidget):
         meta_form.addRow("NCER cells", self._meta_cells)
         meta_form.addRow("OBJ mapping", self._meta_mapping)
         meta_form.addRow("Min tiles required", self._meta_min_tiles)
+        # meta_form.addRow("OAM coverage gaps", self._meta_oam_gaps)
         meta_form.addRow("CHR entry bytes", self._meta_chr_size)
 
         # Export / replace actions: PNG for content editing (round-trips
@@ -471,11 +500,11 @@ class SpriteBrowser(QWidget):
         # pipeline BTCHR uses (see cell_png_io). The per-cell variant
         # writes one PNG per cell, all sized to the union bbox so cells
         # can be swapped without manual cropping.
-        self._export_cells_png_btn = QPushButton("Export cells PNG…")
+        self._export_cells_png_btn = QPushButton("Export cells sheet PNG…")
         self._export_cells_png_btn.clicked.connect(self._on_export_cells_png)
         self._export_per_cell_btn = QPushButton("Export per-cell PNGs…")
         self._export_per_cell_btn.clicked.connect(self._on_export_per_cell_pngs)
-        self._import_cells_png_btn = QPushButton("Import cells PNG…")
+        self._import_cells_png_btn = QPushButton("Import cells sheet PNG…")
         self._import_cells_png_btn.clicked.connect(self._on_import_cells_png)
         self._import_per_cell_btn = QPushButton("Import per-cell PNGs…")
         self._import_per_cell_btn.clicked.connect(self._on_import_per_cell_pngs)
@@ -873,6 +902,15 @@ class SpriteBrowser(QWidget):
         if min_tiles > n_tiles:
             flag = f"  ⚠ exceeds NCGR ({n_tiles})"
         self._meta_min_tiles.setText(f"{min_tiles}{flag}")
+        gap_tiles = _oam_gap_tile_set(
+            parsed_ncer, n_tiles, bpp4=(bit_depth == 3),
+        )
+        if not parsed_ncer.cells:
+            self._meta_oam_gaps.setText("—")
+        elif gap_tiles:
+            self._meta_oam_gaps.setText(f"{len(gap_tiles)} tiles")
+        else:
+            self._meta_oam_gaps.setText("0")
         self._meta_chr_size.setText(
             f"{len(chr_compressed)}B compressed / {len(chr_decompressed)}B raw"
         )
@@ -923,7 +961,7 @@ class SpriteBrowser(QWidget):
         if max(w, h) < 256:
             pix = pix.scaled(w * 2, h * 2, Qt.KeepAspectRatio, Qt.FastTransformation)
         if self._show_oam_overlay:
-            self._paint_oam_overlay(pix, bit_depth, w, h)
+            self._paint_oam_gap_overlay(pix, bit_depth, w, h)
         self._image_label.setPixmap(pix)
         # Stash dimensions for click→source-pixel mapping in the picker.
         self._preview_src_size = (w, h)
@@ -936,59 +974,51 @@ class SpriteBrowser(QWidget):
         self._show_oam_overlay = checked
         self._refresh_preview_only()
 
-    def _paint_oam_overlay(
+    def _paint_oam_gap_overlay(
         self, pix: QPixmap, bit_depth: int, src_w: int, src_h: int,
     ) -> None:
-        """Overlay per-cell tile rectangles on the rendered preview.
+        """Tint tiles no OAM covers red on the tile-grid preview.
 
-        Tiles a cell's OAMs occupy in the linear NCGR are translated to
-        rectangles in the linear-tile-grid layout the preview uses (so the
-        overlay matches what's visible). Each cell gets its own color from
-        ``OAM_OVERLAY_COLORS``; the OAM ``tile`` field decoded via
-        :func:`ncer.cell_tile_ranges` handles the 8bpp+2D quirk where a
-        tile index addresses 32B slots rather than 64B tiles.
+        Complement of :func:`ncer.cell_tile_ranges` — everything NOT
+        referenced by any cell is painted with translucent red so users
+        can see at a glance which tiles a PNG edit would silently
+        discard. Draws whole 8×8 tiles rather than a per-pixel checker
+        (BTCHR's approach) since the sprite_browser preview unit *is*
+        the tile — sub-tile precision would just add noise.
         """
         ncer_obj = getattr(self, "_cached_ncer", None)
         if ncer_obj is None or src_w == 0 or src_h == 0:
             return
-        bpp4 = (bit_depth == 3)
-        ranges_per_cell = ncer_mod.cell_tile_ranges(ncer_obj, bpp4=bpp4)
-        if not ranges_per_cell:
+        cached = getattr(self, "_cached", None)
+        if cached is None:
+            return
+        tile_bytes, *_ = cached
+        bytes_per_tile = 32 if bit_depth == 3 else 64
+        n_tiles = len(tile_bytes) // bytes_per_tile if bytes_per_tile else 0
+        gap_tiles = _oam_gap_tile_set(
+            ncer_obj, n_tiles, bpp4=(bit_depth == 3),
+        )
+        if not gap_tiles:
             return
         width_tiles = self._current_width_tiles
         if width_tiles <= 0:
             return
-        # Skipping the 2× upscale's transform jitter: derive scale from the
-        # actual pixmap size rather than assuming `pix == src_w*2`.
         scale_x = pix.width() / src_w
         scale_y = pix.height() / src_h
 
         painter = QPainter(pix)
         try:
             painter.setRenderHint(QPainter.Antialiasing, False)
-            for ci, ranges in enumerate(ranges_per_cell):
-                r, g, b = OAM_OVERLAY_COLORS[ci % len(OAM_OVERLAY_COLORS)]
-                fill = QColor(r, g, b, 70)
-                outline = QColor(r, g, b, 220)
-                painter.setBrush(QBrush(fill))
-                painter.setPen(QPen(outline, 1))
-                for tile_start, tile_end in ranges:
-                    # Walk by row segments — a range that crosses a row
-                    # boundary in the linear-tile grid renders as one
-                    # rectangle per row instead of a single weirdly-shaped
-                    # box.
-                    cursor = tile_start
-                    while cursor < tile_end:
-                        row = cursor // width_tiles
-                        col = cursor % width_tiles
-                        row_end = min(tile_end, (row + 1) * width_tiles)
-                        span = row_end - cursor
-                        x = int(col * 8 * scale_x)
-                        y = int(row * 8 * scale_y)
-                        rw = int(span * 8 * scale_x)
-                        rh = int(8 * scale_y)
-                        painter.drawRect(x, y, rw, rh)
-                        cursor = row_end
+            painter.setBrush(QBrush(QColor(0xB0, 0x00, 0x20, 140)))
+            painter.setPen(QPen(QColor(0xB0, 0x00, 0x20, 220), 1))
+            for t in sorted(gap_tiles):
+                row = t // width_tiles
+                col = t % width_tiles
+                x = int(col * 8 * scale_x)
+                y = int(row * 8 * scale_y)
+                rw = int(8 * scale_x)
+                rh = int(8 * scale_y)
+                painter.drawRect(x, y, rw, rh)
         finally:
             painter.end()
 
@@ -1881,7 +1911,7 @@ class SpriteBrowser(QWidget):
         img.setText("spr_columns", str(columns))
         default = f"sprite_0x{self._current_idx:04x}_cells.png"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export cells PNG", default, "PNG (*.png)",
+            self, "Export cells sheet PNG", default, "PNG (*.png)",
         )
         if not path:
             return
@@ -1985,7 +2015,7 @@ class SpriteBrowser(QWidget):
             )
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import cells PNG", "", "PNG (*.png);;All files (*)",
+            self, "Import cells sheet PNG", "", "PNG (*.png);;All files (*)",
         )
         if not path:
             return
