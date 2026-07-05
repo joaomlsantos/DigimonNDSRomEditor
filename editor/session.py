@@ -90,6 +90,7 @@ class RomSession:
     equipment: Dict[int, model.Equipment] = field(default_factory=dict)
     consumables: List[model.Consumable] = field(default_factory=list)
     farm_items: List[model.FarmItem] = field(default_factory=list)
+    farm_training_pens: List[model.FarmTrainingPen] = field(default_factory=list)
     # In-game text. Keyed by region_id (see constants.STRING_REGIONS); each
     # entry is a list of GameString in offset order.
     string_regions: Dict[str, List[model.GameString]] = field(default_factory=dict)
@@ -432,6 +433,7 @@ class RomSession:
         session.equipment = loaders.loadEquipment(version, parse_data, file_table=file_table)
         session.consumables = loaders.loadConsumables(version, parse_data)
         session.farm_items = loaders.loadFarmItems(version, parse_data)
+        session.farm_training_pens = loaders.loadFarmTrainingPens(version, parse_data)
         session.string_regions = loaders.loadAllStringRegions(version, parse_data, file_table=file_table)
         # Seed QoL parameter defaults from the actual bytes at their ARM-imm
         # offsets so the editor displays the current value (vanilla on a fresh
@@ -524,6 +526,8 @@ class RomSession:
         for obj in self.consumables:
             obj.writeToRom(out)
         for obj in self.farm_items:
+            obj.writeToRom(out)
+        for obj in self.farm_training_pens:
             obj.writeToRom(out)
         for region_id, region_strings in self.string_regions.items():
             is_msgpak = region_id.startswith("msgpak_")

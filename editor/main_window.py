@@ -62,6 +62,7 @@ from .widgets.enemy_digimon_editor import EnemyDigimonEditor
 from .widgets.equipment_editor import EquipmentEditor
 from .widgets.farm_item_editor import FarmItemEditor
 from .widgets.farm_terrains_editor import FarmTerrainsEditor, farm_terrain_issues
+from .widgets.farm_training_pen_editor import FarmTrainingPenEditor
 from .widgets.string_editor import StringEditor, string_issues
 from .widgets.habitats_editor import HabitatsWorldmapEditor
 from .widgets.move_editor import MoveEditor, move_issues
@@ -132,6 +133,7 @@ NAV_GROUPS = [
         ("Consumables", "consumables"),
         ("Farm Items", "farm_items"),
         ("Farm Terrains", "farm_terrains"),
+        ("Farm Training Pens", "farm_training_pens"),
     ]),
     ("Text", [
         ("ARM9", "strings_bucket:arm9"),
@@ -1129,6 +1131,8 @@ class MainWindow(QMainWindow):
             return ConsumableEditor(self.session.consumables, self.undo_stack, self.session)
         if key == "farm_items":
             return FarmItemEditor(self.session.farm_items, self.undo_stack, self.session)
+        if key == "farm_training_pens":
+            return FarmTrainingPenEditor(self.session.farm_training_pens, self.undo_stack)
         if key == "qol_settings":
             return QolEditor(self.session.qol, self.undo_stack)
         if key == "sprite_browser":

@@ -1,8 +1,10 @@
 """FarmItem editor — 86 fixed-stride 0x30-byte records.
 
-Only id, rank, max_points and bit_cost are documented; the remaining 2-byte
-fields are exposed under an "advanced" group so they round-trip on save while
-staying out of the way during typical edits.
+Grouped as Identity / Behaviour (training pen + stat) / Outcome values /
+Placement (overworld sprite + x/y). The few still-undecoded 2-byte fields —
+notably the per-outcome chances, not yet located in this record — stay under
+an "Unknown / Unmapped" group so they round-trip on save while staying out of
+the way during typical edits.
 """
 from __future__ import annotations
 
@@ -41,6 +43,13 @@ _RANK_CHOICES: List[Tuple[str, int]] = [
     ("C-Rank", 3),
     ("D-Rank", 4),
 ]
+
+
+def _training_pen_choices() -> List[Tuple[str, int]]:
+    return [
+        (f"{ix:02d}  {name}", ix)
+        for ix, name in enumerate(constants.FARM_TRAINING_PEN_NAMES)
+    ]
 
 
 def _item_name(item_id: int) -> str:
@@ -112,16 +121,45 @@ class FarmItemEditor(QWidget):
         identity = QGroupBox("Identity")
         identity_form = make_form(identity)
         self._add_field(identity_form, "Item id",     BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True))
-        self._add_field(identity_form, "Data size",   BoundSpinBox(first, "data_size", 1, self._undo_stack, hex_display=True))
+        self._add_field(identity_form, "Data size",   BoundSpinBox(first, "data_size", 1, self._undo_stack))
         self._add_field(identity_form, "Rank",        BoundIntChoiceCombo(first, "rank", _RANK_CHOICES, self._undo_stack))
         self._add_field(identity_form, "Max points",  BoundSpinBox(first, "max_points", 2, self._undo_stack))
         self._add_field(identity_form, "Bit cost",    BoundSpinBox(first, "bit_cost", 4, self._undo_stack))
 
-        unknowns = QGroupBox("Unknown / Unmapped (raw 2-byte fields)")
+        behaviour = QGroupBox("Behaviour")
+        behaviour_form = make_form(behaviour)
+        self._add_field(behaviour_form, "Training pen", BoundIntChoiceCombo(first, "training_pen_id", _training_pen_choices(), self._undo_stack))
+        # 0x06 is the stat the good raises (u8); the neighbouring 0x07 byte is a
+        # separate still-unmapped qualifier, kept in the Unknown group below.
+        self._add_field(behaviour_form, "Stat id", BoundSpinBox(first, "stat_id", 1, self._undo_stack))
+
+        outcomes = QGroupBox("Outcome Values (signed stat delta)")
+        outcomes_form = make_form(outcomes)
+        self._add_field(outcomes_form, "Great failure", BoundSpinBox(first, "great_failure_value", 2, self._undo_stack, signed=True))
+        self._add_field(outcomes_form, "Failure",       BoundSpinBox(first, "failure_value",       2, self._undo_stack, signed=True))
+        self._add_field(outcomes_form, "Success",       BoundSpinBox(first, "success_value",       2, self._undo_stack, signed=True))
+        self._add_field(outcomes_form, "Great success", BoundSpinBox(first, "great_success_value", 2, self._undo_stack, signed=True))
+
+        placement = QGroupBox("Placement")
+        placement_form = make_form(placement)
+        # sprite_id → overworld sprite; the id↔sprite mapping (and the palette
+        # it renders with) isn't pinned yet, so this is a raw editable id.
+        self._add_field(placement_form, "Overworld sprite id", BoundSpinBox(first, "sprite_id", 2, self._undo_stack, hex_display=True))
+        self._add_field(placement_form, "X position",          BoundSpinBox(first, "x_position", 2, self._undo_stack, signed=True))
+        self._add_field(placement_form, "Y position",          BoundSpinBox(first, "y_position", 2, self._undo_stack, signed=True))
+
+        unknowns = QGroupBox("Unknown / Unmapped (raw fields)")
         register_unknown_container(unknowns)
         unknowns_grid = _make_compact_grid(unknowns, cols=2)
-        for ix, (_offset, attr) in enumerate(model.FarmItem._UNKNOWN_FIELDS):
-            spin = BoundSpinBox(first, attr, 2, self._undo_stack)
+        # The single 1-byte unknown (0x07) rides alongside the 2-byte ones; it
+        # lives outside _UNKNOWN_FIELDS (that list is 2-byte-only) so it's added
+        # explicitly here.
+        unknown_specs = (
+            [(attr, 2) for _offset, attr in model.FarmItem._UNKNOWN_FIELDS]
+            + [("unknown_0x07", 1)]
+        )
+        for ix, (attr, width) in enumerate(unknown_specs):
+            spin = BoundSpinBox(first, attr, width, self._undo_stack)
             self._all_widgets.append(spin)
             add_unknown_grid_field(unknowns_grid, ix // 2, ix % 2, attr, spin)
 
@@ -133,6 +171,9 @@ class FarmItemEditor(QWidget):
         cl.setSpacing(4)
         cl.addWidget(self._title)
         cl.addWidget(identity)
+        cl.addWidget(behaviour)
+        cl.addWidget(outcomes)
+        cl.addWidget(placement)
         cl.addWidget(unknowns)
         cl.addStretch(1)
 
