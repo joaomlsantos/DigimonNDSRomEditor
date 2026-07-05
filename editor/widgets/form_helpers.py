@@ -178,6 +178,40 @@ def wrap_tooltip(text: str, width_px: int = 300) -> str:
     )
 
 
+class OddsTotalLabel(QLabel):
+    """Read-only running total of a set of chance attrs, checked against a target.
+
+    Plugs into the editors' ``_all_widgets`` list — it exposes ``rebind`` and
+    ``refresh`` like the bound widgets, so selection changes and undo/redo
+    refreshes drive it for free. ``expected`` is either a constant int (farm
+    items always sum to 100) or the name of an attribute holding the expected
+    total (training pens store ``total_odds``). Goes red when the sum diverges,
+    flagging a broken odds distribution while editing.
+    """
+
+    def __init__(self, target, chance_attrs: List[str], expected):
+        super().__init__()
+        self._target = target
+        self._attrs = list(chance_attrs)
+        self._expected = expected
+        self.refresh()
+
+    def rebind(self, new_target) -> None:
+        self._target = new_target
+        self.refresh()
+
+    def refresh(self) -> None:
+        total = sum(getattr(self._target, a) for a in self._attrs)
+        expected = (
+            getattr(self._target, self._expected)
+            if isinstance(self._expected, str) else self._expected
+        )
+        self.setText(f"Sum: {total} / {expected}")
+        self.setStyleSheet(
+            "" if total == expected else "color: #b00020; font-weight: bold;"
+        )
+
+
 def make_form(parent: QWidget):
     """Tightened QFormLayout factory — drop-in replacement for `QFormLayout(box)`.
 

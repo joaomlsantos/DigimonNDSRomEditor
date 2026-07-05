@@ -25,6 +25,7 @@ from .form_helpers import (
     BoldGroupBox as QGroupBox,
     BoundIntChoiceCombo,
     BoundSpinBox,
+    OddsTotalLabel,
     _make_compact_grid,
     add_unknown_grid_field,
     make_form,
@@ -133,12 +134,33 @@ class FarmItemEditor(QWidget):
         # separate still-unmapped qualifier, kept in the Unknown group below.
         self._add_field(behaviour_form, "Stat id", BoundSpinBox(first, "stat_id", 1, self._undo_stack))
 
-        outcomes = QGroupBox("Outcome Values (signed stat delta)")
-        outcomes_form = make_form(outcomes)
-        self._add_field(outcomes_form, "Great failure", BoundSpinBox(first, "great_failure_value", 2, self._undo_stack, signed=True))
-        self._add_field(outcomes_form, "Failure",       BoundSpinBox(first, "failure_value",       2, self._undo_stack, signed=True))
-        self._add_field(outcomes_form, "Success",       BoundSpinBox(first, "success_value",       2, self._undo_stack, signed=True))
-        self._add_field(outcomes_form, "Great success", BoundSpinBox(first, "great_success_value", 2, self._undo_stack, signed=True))
+        # Value = signed stat delta; odds = u8 chance. No stored total — the
+        # four odds sum to 100 in vanilla (see model docstring).
+        outcomes = QGroupBox("Outcome Values (signed stat delta) and Odds")
+        outcomes_grid = _make_compact_grid(outcomes, cols=2)
+        outcome_rows = [
+            ("Great failure", "great_failure_value", "great_failure_chance"),
+            ("Failure",       "failure_value",       "failure_chance"),
+            ("Success",       "success_value",       "success_chance"),
+            ("Great success", "great_success_value", "great_success_chance"),
+        ]
+        for row, (label, value_attr, chance_attr) in enumerate(outcome_rows):
+            outcomes_grid.addWidget(QLabel(f"{label} value"), row, 0)
+            v_spin = BoundSpinBox(first, value_attr, 2, self._undo_stack, signed=True)
+            outcomes_grid.addWidget(v_spin, row, 1)
+            self._all_widgets.append(v_spin)
+            outcomes_grid.addWidget(QLabel(f"{label} odds"), row, 2)
+            c_spin = BoundSpinBox(first, chance_attr, 1, self._undo_stack)
+            outcomes_grid.addWidget(c_spin, row, 3)
+            self._all_widgets.append(c_spin)
+        odds_total = OddsTotalLabel(
+            first,
+            [c for _, _, c in outcome_rows],
+            100,
+        )
+        outcomes_grid.addWidget(QLabel("Total odds"), len(outcome_rows), 2)
+        outcomes_grid.addWidget(odds_total, len(outcome_rows), 3)
+        self._all_widgets.append(odds_total)
 
         placement = QGroupBox("Placement")
         placement_form = make_form(placement)
@@ -196,3 +218,29 @@ class FarmItemEditor(QWidget):
             return
         for w in self._all_widgets:
             w.refresh()
+
+
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+
+
+def farm_item_issues(records: List[model.FarmItem]) -> List[ValidationIssue]:
+    """Footer-level issues for farm items: the four outcome odds must sum to
+    100 (there's no stored total to fall back on). Warning-only — nothing
+    blocks saving a record with off-100 odds."""
+    issues: List[ValidationIssue] = []
+    for rec in records:
+        total = (
+            rec.great_failure_chance + rec.failure_chance
+            + rec.success_chance + rec.great_success_chance
+        )
+        if total != 100:
+            issues.append(ValidationIssue(
+                section="Farm Items",
+                category="Odds Sum",
+                message=(
+                    f"{_item_name(rec.id)} — outcome odds sum to {total}, not 100."
+                ),
+                editor_key="farm_items",
+                record_id=rec.id,
+            ))
+    return issues

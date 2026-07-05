@@ -1449,21 +1449,23 @@ class FarmItem:
     - 0x0C s16  success_value
     - 0x0E s16  great_success_value
     - 0x10 u16  max_points
+    - 0x14 u8   great_failure_chance   } four outcome odds; no stored total,
+    - 0x15 u8   failure_chance         } they just sum to 100 (0x64) in vanilla
+    - 0x16 u8   success_chance         }
+    - 0x17 u8   great_success_chance   }
     - 0x18 u16  sprite_id (overworld sprite; id↔sprite mapping still TBD)
     - 0x1C u32  bit_cost
     - 0x28 s16  x_position (relative to the pen centre)
     - 0x2A s16  y_position (relative to the pen centre)
 
-    The success/failure *chances* (analogous to FarmTrainingPen's 0x12-0x15)
-    haven't been located in this record yet; those bytes stay in
+    Unlike FarmTrainingPen there's no `total_odds` slot — the four chances are
+    assumed to sum to 100. The remaining still-undecoded bytes stay in
     `_UNKNOWN_FIELDS` so they round-trip untouched.
     """
     SIZE = 0x30
 
     _UNKNOWN_FIELDS = [
         (0x12, "unknown_0x12"),
-        (0x14, "unknown_0x14"),
-        (0x16, "unknown_0x16"),
         (0x1A, "unknown_0x1a"),
         (0x20, "unknown_0x20"),
         (0x22, "unknown_0x22"),
@@ -1485,6 +1487,10 @@ class FarmItem:
     success_value: int         # s16
     great_success_value: int   # s16
     max_points: int
+    great_failure_chance: int  # u8
+    failure_chance: int        # u8
+    success_chance: int        # u8
+    great_success_chance: int  # u8
     sprite_id: int
     bit_cost: int
     x_position: int            # s16
@@ -1503,6 +1509,10 @@ class FarmItem:
         self.success_value       = int.from_bytes(data[0x0C:0x0E], byteorder="little", signed=True)
         self.great_success_value = int.from_bytes(data[0x0E:0x10], byteorder="little", signed=True)
         self.max_points = int.from_bytes(data[0x10:0x12], byteorder="little")
+        self.great_failure_chance = data[0x14]
+        self.failure_chance       = data[0x15]
+        self.success_chance       = data[0x16]
+        self.great_success_chance = data[0x17]
         self.sprite_id           = int.from_bytes(data[0x18:0x1A], byteorder="little")
         self.bit_cost = int.from_bytes(data[0x1C:0x20], byteorder="little")
         self.x_position          = int.from_bytes(data[0x28:0x2A], byteorder="little", signed=True)
@@ -1523,6 +1533,10 @@ class FarmItem:
         out[0x0C:0x0E] = self.success_value.to_bytes(2, byteorder="little", signed=True)
         out[0x0E:0x10] = self.great_success_value.to_bytes(2, byteorder="little", signed=True)
         out[0x10:0x12] = self.max_points.to_bytes(2, byteorder="little")
+        out[0x14] = self.great_failure_chance & 0xFF
+        out[0x15] = self.failure_chance & 0xFF
+        out[0x16] = self.success_chance & 0xFF
+        out[0x17] = self.great_success_chance & 0xFF
         out[0x18:0x1A] = self.sprite_id.to_bytes(2, byteorder="little")
         out[0x1C:0x20] = self.bit_cost.to_bytes(4, byteorder="little")
         out[0x28:0x2A] = self.x_position.to_bytes(2, byteorder="little", signed=True)

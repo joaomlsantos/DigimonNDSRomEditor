@@ -29,7 +29,7 @@ from typing import List, Optional, Tuple
 
 from PySide6.QtGui import QImage, QPainter, qRgba
 
-from digimon_core import btchr, ncer as ncer_mod
+from digimon_core import btchr, ncer as ncer_mod, sprite
 
 from ._png_palette import build_palette_from_png, nearest_idx_opaque
 
@@ -412,6 +412,68 @@ def render_one_cell_qimage(ctx: CellPngContext, cell_idx: int) -> Optional[QImag
     xmin, ymin, _, _ = rects[cell_idx]
     paint_cell_indexed(img, ctx, ctx.ncer.cells[cell_idx], 0, 0, xmin, ymin)
     return img
+
+
+def spr_index_footprint(cel_pak, index: int) -> Optional[Tuple[int, int]]:
+    """Return the ``(width, height)`` sprite footprint (largest cell OAM bbox)
+    for SPR_* entry ``index``, or ``None`` if out of range / unparseable /
+    empty. Cheap dimension probe (parses only the CEL/NCER, no pixels)."""
+    if not (0 <= index < len(cel_pak.entries)):
+        return None
+    try:
+        ncer_obj = ncer_mod.parse_ncer(
+            sprite.maybe_decompress(cel_pak.entries[index])
+        )
+    except (ValueError, IndexError):
+        return None
+    if not ncer_obj.cells:
+        return None
+    return ncer_mod.sprite_bbox(ncer_obj)
+
+
+def render_spr_index_qimage(
+    chr_pak, pal_pak, cel_pak, index: int, *, palette_bank: int = 0,
+) -> Optional[QImage]:
+    """Composite the SPR_* sprite at ``index`` into one row of cells.
+
+    Standalone convenience for callers that only have a sprite index (e.g.
+    the training-pen editor's ``sprite_id`` preview) rather than the full
+    sprite-browser state. Mirrors the browser's effective-palette rule
+    (concatenate 4bpp banks when the CHR is 8bpp, else use ``palette_bank``).
+    Returns ``None`` for an out-of-range index or an entry that fails to
+    parse / has no palette or cells.
+    """
+    if not (0 <= index < len(chr_pak.entries)):
+        return None
+    try:
+        tile_bytes, bit_depth, *_ = sprite.parse_ncgr(
+            sprite.maybe_decompress(chr_pak.entries[index])
+        )
+        palettes, _ = sprite.parse_nclr(
+            sprite.maybe_decompress(pal_pak.entries[index])
+        )
+        ncer_obj = ncer_mod.parse_ncer(
+            sprite.maybe_decompress(cel_pak.entries[index])
+        )
+    except (ValueError, IndexError):
+        return None
+    if not palettes or not ncer_obj.cells:
+        return None
+    chr_8bpp = (bit_depth == 4)
+    if chr_8bpp and len(palettes[0]) == 16:
+        palette = [c for bank in palettes for c in bank]
+    else:
+        palette = palettes[min(palette_bank, len(palettes) - 1)]
+    bytes_per_tile = 64 if chr_8bpp else 32
+    n_tiles = len(tile_bytes) // bytes_per_tile
+    ctx = CellPngContext(
+        ncer=ncer_obj,
+        tile_bytes=tile_bytes,
+        n_tiles=n_tiles,
+        palette=list(palette),
+        is_8bpp=chr_8bpp,
+    )
+    return render_cells_qimage(ctx, len(ncer_obj.cells))
 
 
 # ---- import (PNG -> tile bytes) ---------------------------------------
