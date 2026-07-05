@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -50,6 +50,7 @@ from ..commands import (
     ReplaceSpriteCommand,
 )
 from ._png_palette import build_palette_from_png, nearest_idx_opaque
+from .collapsible import CollapsibleSection
 from .form_helpers import add_unknown_form_row, wrap_tooltip
 from .cell_png_io import (
     CellPngContext,
@@ -674,13 +675,10 @@ class BtchrBrowser(QWidget):
 
         # Animation panel sits below the preview so playback animates
         # the same preview the user is already looking at. Controls row
-        # first, then the editable steps table. Wrapped in a checkable
-        # QGroupBox starting collapsed — most browsing sessions just
-        # need the preview, so reclaiming the vertical space by default
-        # keeps the cells tab compact.
-        self._anim_group = QGroupBox("Animation")
-        self._anim_group.setCheckable(True)
-        self._anim_group.setChecked(False)
+        # first, then the editable steps table. Collapsed by default —
+        # most browsing sessions just need the preview, so reclaiming the
+        # vertical space keeps the cells tab compact.
+        self._anim_group = CollapsibleSection("Animation", expanded=False)
         anim_content = QWidget()
         anim_content_layout = QVBoxLayout(anim_content)
         anim_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -694,11 +692,45 @@ class BtchrBrowser(QWidget):
         anim_controls_row.addWidget(self._anim_remove_btn)
         anim_content_layout.addLayout(anim_controls_row)
         anim_content_layout.addWidget(self._anim_table)
-        anim_group_layout = QVBoxLayout(self._anim_group)
-        anim_group_layout.addWidget(anim_content)
-        anim_content.setVisible(False)
-        self._anim_group.toggled.connect(anim_content.setVisible)
+        self._anim_group.set_content_widget(anim_content)
         cells_layout.addWidget(self._anim_group)
+
+        # Frame offsets: each cell's on-screen position, editable. The
+        # position of a frame is baked into all its OAM x/y (no dedicated
+        # pivot field — see project memory), so shifting a frame moves
+        # every OAM in that cell uniformly. Values are the absolute OAM
+        # origin as stored in the data. Collapsed by default like
+        # Animation. "True positions" makes the preview + playback honour
+        # these offsets (normally each frame is drawn tight to its own
+        # bbox, hiding the movement).
+        self._frame_off_group = CollapsibleSection("Frame offsets", expanded=False)
+        fo_content = QWidget()
+        fo_content_layout = QVBoxLayout(fo_content)
+        fo_content_layout.setContentsMargins(0, 0, 0, 0)
+        self._true_pos_cb = QCheckBox("Preview true frame positions")
+        self._true_pos_cb.setToolTip(wrap_tooltip(
+            "Draw each frame at its real on-screen offset within the "
+            "sprite's combined bounds, so flipping frames or playing an "
+            "animation shows the actual vertical bob / horizontal lunge. "
+            "Off (default) draws each frame tight to its own bounding "
+            "box, which is better for pixel editing but hides the "
+            "per-frame movement."
+        ))
+        self._true_pos_cb.toggled.connect(lambda _=False: self._refresh_preview())
+        fo_content_layout.addWidget(self._true_pos_cb)
+        # Header row + per-frame rows are (re)built per selection in
+        # _rebuild_frame_offset_rows since the cell count varies.
+        self._frame_off_grid = QGridLayout()
+        self._frame_off_grid.setContentsMargins(0, 0, 0, 0)
+        self._frame_off_grid.setHorizontalSpacing(8)
+        self._frame_off_grid.setVerticalSpacing(3)
+        self._frame_off_spins: List[Tuple[QSpinBox, QSpinBox]] = []
+        self._frame_off_loading = False
+        fo_grid_host = QWidget()
+        fo_grid_host.setLayout(self._frame_off_grid)
+        fo_content_layout.addWidget(fo_grid_host)
+        self._frame_off_group.set_content_widget(fo_content)
+        cells_layout.addWidget(self._frame_off_group)
 
         # ---- Tile sheet tab: width + columns spinners + sheet preview
         sheet_tab = QWidget()
@@ -927,10 +959,130 @@ class BtchrBrowser(QWidget):
         # render against the wrong tile bank.
         self._stop_anim_playback()
         self._refresh_anim_table()
+        self._rebuild_frame_offset_rows()
+        self._load_frame_offsets()
 
     def _on_cell_changed(self, value: int) -> None:
         self._current_cell = value
         self._refresh_preview()
+
+    # ---- frame offsets --------------------------------------------------
+
+    def _rebuild_frame_offset_rows(self) -> None:
+        """(Re)create the per-frame X/Y spinbox grid for the current sprite.
+
+        Cell count varies (sentinels have 1, normal sprites 5), so the
+        rows are torn down and rebuilt on each selection rather than
+        shown/hidden. Every frame (including 0) is editable — values are
+        the absolute OAM origin stored in the data.
+        """
+        while self._frame_off_grid.count():
+            item = self._frame_off_grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._frame_off_spins = []
+        d = self._current_decoded
+        if d is None or not d.ncer.cells:
+            return
+        self._frame_off_grid.addWidget(QLabel("Frame"), 0, 0)
+        self._frame_off_grid.addWidget(QLabel("X"), 0, 1)
+        self._frame_off_grid.addWidget(QLabel("Y"), 0, 2)
+        for ci in range(len(d.ncer.cells)):
+            self._frame_off_grid.addWidget(QLabel(str(ci)), ci + 1, 0)
+            x_spin = QSpinBox()
+            y_spin = QSpinBox()
+            for axis, spin in (("x", x_spin), ("y", y_spin)):
+                spin.setMaximumWidth(70)
+                spin.valueChanged.connect(
+                    lambda v, c=ci, a=axis: self._on_frame_offset_edited(c, a, v)
+                )
+            self._frame_off_grid.addWidget(x_spin, ci + 1, 1)
+            self._frame_off_grid.addWidget(y_spin, ci + 1, 2)
+            self._frame_off_spins.append((x_spin, y_spin))
+
+    def _load_frame_offsets(self) -> None:
+        """Populate the frame-offset spinboxes from the live NCER.
+
+        Values are the absolute OAM origin (top-left of the frame's OAM
+        union) as stored in the data. Per-spin ranges are clamped so the
+        resulting coords always fit the hardware fields (x 9-bit signed,
+        y 8-bit signed) — the edit path can then never push
+        :func:`ncer.shift_cell_oams` out of range.
+        """
+        d = self._current_decoded
+        if d is None or len(self._frame_off_spins) != len(d.ncer.cells):
+            return
+        cells = d.ncer.cells
+        self._frame_off_loading = True
+        try:
+            for ci, (x_spin, y_spin) in enumerate(self._frame_off_spins):
+                cell = cells[ci]
+                ox, oy = _cell_origin(cell)
+                oxs = [o.x for o in cell.oams] or [0]
+                oys = [o.y for o in cell.oams] or [0]
+                # The origin is the min OAM coord; moving it to V shifts
+                # every OAM by (V - origin). Field limits on the extreme
+                # OAMs collapse to: origin >= field_lo, origin <= field_hi
+                # - (span). span keeps the far OAM in range.
+                span_x = max(oxs) - min(oxs)
+                span_y = max(oys) - min(oys)
+                x_spin.setRange(-256, 255 - span_x)
+                y_spin.setRange(-128, 127 - span_y)
+                x_spin.setValue(ox)
+                y_spin.setValue(oy)
+        finally:
+            self._frame_off_loading = False
+
+    def _on_frame_offset_edited(self, cell_idx: int, axis: str, value: int) -> None:
+        """Move ``cell_idx``'s OAM origin to ``value`` on ``axis`` (absolute).
+        One NCER byte-patch, wrapped as an undo command; the post-change
+        refresh reloads the spinboxes."""
+        if self._frame_off_loading:
+            return
+        d = self._current_decoded
+        if d is None or self._current_group is None:
+            return
+        cells = d.ncer.cells
+        if not (0 <= cell_idx < len(cells)):
+            return
+        ox, oy = _cell_origin(cells[cell_idx])
+        cur = ox if axis == "x" else oy
+        delta = value - cur
+        if delta == 0:
+            return
+        dx, dy = (delta, 0) if axis == "x" else (0, delta)
+        self._push_cell_shift(
+            cell_idx, dx, dy,
+            description=(
+                f"Move BTCHR 0x{self._current_group:04x} frame {cell_idx} "
+                f"{axis.upper()}={value}"
+            ),
+        )
+
+    def _push_cell_shift(
+        self, cell_idx: int, dx: int, dy: int, description: str,
+    ) -> None:
+        group = self._current_group
+        entry = self._ncer_entry_idx(group)
+        ncer_raw = sprite.decompress_rle30(self._pak.entries[entry])
+        try:
+            patched = ncer_mod.shift_cell_oams(ncer_raw, cell_idx, dx, dy)
+        except (ValueError, IndexError) as exc:
+            QMessageBox.critical(self, "Move failed", str(exc))
+            self._load_frame_offsets()
+            return
+        compressed = sprite.compress_rle30(patched)
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(BTCHR_PAK, entry, compressed)],
+            description=description,
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
 
     def _on_show_all_toggled(self, checked: bool) -> None:
         self._cell_spin.setEnabled(not checked)
@@ -985,6 +1137,45 @@ class BtchrBrowser(QWidget):
         self._cell_pixmaps[cell_idx] = pm
         return pm
 
+    def _union_bbox(self):
+        """Combined (xmin, ymin, xmax, ymax) over all cells' OAM unions —
+        the shared canvas that preserves inter-frame offsets."""
+        d = self._current_decoded
+        boxes = [btchr.cell_bbox(c) for c in d.ncer.cells if c.oams]
+        if not boxes:
+            return None
+        return (
+            min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes),
+        )
+
+    def _cell_pixmap_anchored(self, cell_idx: int) -> Optional[QPixmap]:
+        """The cell rendered at its true offset inside the union canvas.
+
+        Same tight per-cell pixmap (with any red overlay) as
+        :meth:`_cell_pixmap`, just blitted at ``(xmin, ymin)`` relative to
+        the union origin so flipping frames / playing an animation shows
+        the real bob and lunge instead of every frame snapping to (0, 0).
+        """
+        tight = self._cell_pixmap(cell_idx)
+        if tight is None:
+            return None
+        union = self._union_bbox()
+        if union is None:
+            return tight
+        uxmin, uymin, uxmax, uymax = union
+        w, h = uxmax - uxmin, uymax - uymin
+        if w <= 0 or h <= 0:
+            return tight
+        cell = self._current_decoded.ncer.cells[cell_idx]
+        xmin, ymin, _, _ = btchr.cell_bbox(cell)
+        canvas = QImage(w, h, QImage.Format_RGBA8888)
+        canvas.fill(0)
+        painter = QPainter(canvas)
+        painter.drawPixmap(xmin - uxmin, ymin - uymin, tight)
+        painter.end()
+        return QPixmap.fromImage(canvas)
+
     def _refresh_preview(self) -> None:
         if self._current_decoded is None:
             self._cells_src_qimage = None
@@ -993,6 +1184,8 @@ class BtchrBrowser(QWidget):
         self._update_coverage_note()
         if self._show_all_cells.isChecked():
             pm = self._build_all_cells_strip()
+        elif self._true_pos_cb.isChecked():
+            pm = self._cell_pixmap_anchored(self._current_cell)
         else:
             pm = self._cell_pixmap(self._current_cell)
         if pm is None or pm.isNull():
@@ -1020,6 +1213,9 @@ class BtchrBrowser(QWidget):
 
     def _ncgr_entry_idx(self, group_idx: int) -> int:
         return group_idx * btchr.GROUP_SIZE + 1
+
+    def _ncer_entry_idx(self, group_idx: int) -> int:
+        return group_idx * btchr.GROUP_SIZE + 3
 
     # ---- tile sheet rendering ------------------------------------------
 
@@ -2669,6 +2865,14 @@ class BtchrBrowser(QWidget):
         self._meta_attack.setText(_format_track(h.attack))
         self._meta_defend.setText(_format_track(h.defend))
         self._refresh_anim_table()
+        # Cell count is stable across an in-place edit, so reload values
+        # into the existing rows rather than rebuilding the grid (avoids
+        # tearing down the spinbox the user just interacted with).
+        if len(self._frame_off_spins) == len(self._current_decoded.ncer.cells):
+            self._load_frame_offsets()
+        else:
+            self._rebuild_frame_offset_rows()
+            self._load_frame_offsets()
 
     def _build_all_cells_strip(self) -> Optional[QPixmap]:
         d = self._current_decoded
@@ -2691,6 +2895,14 @@ class BtchrBrowser(QWidget):
             x += pm.width() + gutter
         painter.end()
         return QPixmap.fromImage(strip)
+
+
+def _cell_origin(cell) -> Tuple[int, int]:
+    """Top-left of a cell's OAM union — the single (x, y) that the whole
+    frame's position collapses to. ``(0, 0)`` for an empty cell."""
+    if not cell.oams:
+        return (0, 0)
+    return (min(o.x for o in cell.oams), min(o.y for o in cell.oams))
 
 
 def _format_track(track) -> str:

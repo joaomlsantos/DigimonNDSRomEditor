@@ -140,6 +140,61 @@ def parse_ncer(raw: bytes) -> Ncer:
     return Ncer(cells, mapping)
 
 
+def shift_cell_oams(raw: bytes, cell_idx: int, dx: int, dy: int) -> bytes:
+    """Return a copy of ``raw`` NCER with every OAM in ``cell_idx`` moved by
+    ``(dx, dy)`` on screen.
+
+    Byte-patches only each OAM's x (a1 low 9 bits, signed) and y (a0 low 8
+    bits, signed) fields — every other attribute, the OAM offsets, and the
+    block sizes are untouched, so no structural re-encode is needed (same
+    minimal-diff philosophy as ``sprite.build_ncgr_from_template``). When
+    the bank uses the 16-byte cell layout, the cell's stored bbox is
+    translated too so it stays consistent with the moved OAMs.
+
+    Raises ``ValueError`` if any resulting coordinate leaves the hardware
+    field range (x ∈ [-256, 255], y ∈ [-128, 127]); the caller should clamp
+    its spinbox ranges so this never fires in normal use.
+    """
+    raw = bytearray(maybe_decompress(raw))
+    if raw[:4] != b"RECN":
+        raise ValueError(f"not NCER: {raw[:4]!r}")
+    cebk = find_block(raw, b"KBEC")
+    n_cells = struct.unpack_from("<H", raw, cebk + 8)[0]
+    if not (0 <= cell_idx < n_cells):
+        raise IndexError(f"cell {cell_idx} out of range (n_cells={n_cells})")
+    if dx == 0 and dy == 0:
+        return bytes(raw)
+    bank_attr = struct.unpack_from("<H", raw, cebk + 10)[0]
+    cell_data_off = struct.unpack_from("<I", raw, cebk + 12)[0]
+    cell_size = 16 if (bank_attr & 1) else 8
+    cells_base = cebk + 8 + cell_data_off
+    oam_base = cells_base + n_cells * cell_size
+
+    off = cells_base + cell_idx * cell_size
+    n_oam = struct.unpack_from("<H", raw, off)[0]
+    oam_off = struct.unpack_from("<I", raw, off + 4)[0]
+    for oi in range(n_oam):
+        o = oam_base + oam_off + oi * 6
+        a0, a1 = struct.unpack_from("<HH", raw, o)
+        y = _s8(a0 & 0xFF) + dy
+        x = _s9(a1 & 0x1FF) + dx
+        if not (-128 <= y <= 127):
+            raise ValueError(f"OAM y {y} out of range [-128, 127]")
+        if not (-256 <= x <= 255):
+            raise ValueError(f"OAM x {x} out of range [-256, 255]")
+        a0 = (a0 & 0xFF00) | (y & 0xFF)
+        a1 = (a1 & 0xFE00) | (x & 0x1FF)
+        struct.pack_into("<HH", raw, o, a0, a1)
+
+    if cell_size == 16:
+        xmin, ymin, xmax, ymax = struct.unpack_from("<hhhh", raw, off + 8)
+        struct.pack_into(
+            "<hhhh", raw, off + 8,
+            xmin + dx, ymin + dy, xmax + dx, ymax + dy,
+        )
+    return bytes(raw)
+
+
 def min_tiles_required(ncer: Ncer, bpp4: bool = True) -> int:
     """Smallest NCGR tile count that satisfies every OAM in every cell.
 
