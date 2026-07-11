@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Dict, List, Tuple
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, Signal
-from PySide6.QtGui import QStandardItem, QStandardItemModel, QUndoStack
+from PySide6.QtGui import QIcon, QStandardItem, QStandardItemModel, QUndoStack
 
 from ..commands import SetAttrCommand
 from PySide6.QtWidgets import (
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from digimon_core import constants, model
 
+from .record_list_panel import RecordListPanel
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
     BoundCheckBox,
@@ -239,13 +240,59 @@ _MOVE_RANGE_CHOICES: List[Tuple[str, int]] = [
 ]
 
 
-class MoveListPanel(QWidget):
-    """Filterable list of moves by id + name.
+def _signed_primary_value(move: model.MoveData) -> int:
+    """Move power as the detail form shows it: signed for reduce-style
+    effects (a raw u16 ≥ 0x8000 reads as ``raw - 0x10000``, so 65508 → -28),
+    unsigned otherwise. Mirrors ``_MoveValueSpinBox._to_display``."""
+    raw = move.primary_value
+    if move.primary_effect in _SIGNED_VALUE_EFFECT_IDS and raw >= 0x8000:
+        return raw - 0x10000
+    return raw
 
-    `dirty_aware=True` prepends "● " to rows whose move record bytes differ
-    from the original ROM snapshot; clean rows get matching whitespace so the
-    text column stays aligned. Editors wire `undo_stack.indexChanged` to
-    `refresh_dirty_state` to keep the markers fresh.
+
+def _move_columns(_index: int, move: model.MoveData):
+    # Element cell is intentionally text-free — it's rendered as an icon via
+    # ``_move_decorations``. Power is the move's primary_value (the detail
+    # form labels it "Primary Value (power)"), shown signed to match.
+    return (
+        f"0x{move.id:03x}",
+        _move_name(move.id),
+        "",
+        str(_signed_primary_value(move)),
+        str(move.mp_cost),
+    )
+
+
+def _move_decorations(_index: int, move: model.MoveData):
+    """Per-column cell icons for the move list — only the Element column
+    (index 2) carries one: the same SPR_CHR element icon the in-game move
+    HUD uses. Falls back to no icon when the sprite can't be resolved
+    (headless / partial session)."""
+    element_value = getattr(move.element, "value", move.element)
+    pix = get_element_icon_pixmap(element_value)
+    icon = QIcon(pix) if pix is not None else None
+    return (None, None, icon, None, None)
+
+
+def _move_sort_keys(_index: int, move: model.MoveData):
+    """Sort key for the icon-only Element column: the element's enum value,
+    so the header orders moves Light, Dark, Fire, Earth, Wind, Steel, Water,
+    Thunder (and the reverse when descending) — matching the ``Element``
+    dropdown in the detail form. Out-of-range bytes keep their raw value,
+    which sorts after the eight named elements. Other columns sort on their
+    visible, numeric-aware text."""
+    element_value = getattr(move.element, "value", move.element)
+    return (None, None, int(element_value), None, None)
+
+
+class MoveListPanel(QWidget):
+    """Filterable, sortable, multi-column list of moves.
+
+    Thin wrapper over :class:`RecordListPanel`'s columnar mode (ID /
+    Name / Element / MP columns with header-click sorting) that keeps
+    the move-specific ``select_by_id(move_id)`` + ``moveIndexSelected``
+    API the editor already wires to. ``dirty_aware=True`` shows the "●"
+    gutter marker for edited rows.
     """
 
     moveIndexSelected = Signal(int)  # emits index into the moves list
@@ -253,79 +300,40 @@ class MoveListPanel(QWidget):
     def __init__(self, moves: List[model.MoveData], parent=None, dirty_aware: bool = False):
         super().__init__(parent)
         self._moves = moves
-        self._dirty_aware = dirty_aware
+        self._row_by_id: Dict[int, int] = {
+            move.id: ix for ix, move in enumerate(moves)
+        }
 
-        self._source_model = QStandardItemModel(self)
-        self._row_by_id: Dict[int, int] = {}
-        for ix, move in enumerate(moves):
-            item = QStandardItem(self._decorated_label(ix))
-            item.setEditable(False)
-            item.setData(ix, Qt.UserRole)
-            self._source_model.appendRow(item)
-            self._row_by_id[move.id] = ix
-
-        self._proxy = QSortFilterProxyModel(self)
-        self._proxy.setSourceModel(self._source_model)
-        self._proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
-
-        self._filter_box = QLineEdit()
-        self._filter_box.setPlaceholderText("Filter by name or id…")
-        self._filter_box.textChanged.connect(self._proxy.setFilterFixedString)
-
-        self._view = QListView()
-        self._view.setModel(self._proxy)
-        self._view.setUniformItemSizes(True)
-        self._view.setEditTriggers(QListView.NoEditTriggers)
-        self._view.selectionModel().currentChanged.connect(self._on_current_changed)
+        self._panel = RecordListPanel(
+            moves,
+            dirty_aware=dirty_aware,
+            columns_for=_move_columns,
+            decorations_for=_move_decorations,
+            sort_keys_for=_move_sort_keys,
+            headers=("ID", "Name", "Element", "Power", "MP"),
+        )
+        self._panel.indexSelected.connect(self.moveIndexSelected)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(self._filter_box)
-        layout.addWidget(self._view)
-
-    def _decorated_label(self, index: int) -> str:
-        move = self._moves[index]
-        base = f"0x{move.id:03x} — {_move_name(move.id)}"
-        if not self._dirty_aware:
-            return base
-        return (_DIRTY_PREFIX if is_record_dirty(move) else _CLEAN_PREFIX) + base
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._panel)
 
     def refresh_dirty_state(self) -> None:
-        """Re-render every row label so dirty markers track the current state."""
-        if not self._dirty_aware:
-            return
-        for ix in range(self._source_model.rowCount()):
-            item = self._source_model.item(ix)
-            if item is not None:
-                item.setText(self._decorated_label(ix))
+        self._panel.refresh_dirty_state()
+
+    def refresh_label(self, index: int) -> None:
+        self._panel.refresh_label(index)
 
     def select_first(self) -> None:
-        if self._proxy.rowCount() == 0:
-            return
-        self._view.setCurrentIndex(self._proxy.index(0, 0))
+        self._panel.select_first()
 
     def select_by_id(self, move_id: int) -> bool:
-        """Select the row whose move record has the given id. Clears the filter
-        so the row is guaranteed visible. Returns False if the id is unknown.
-        """
+        """Select the row whose move record has the given id. Returns
+        False if the id is unknown."""
         row = self._row_by_id.get(move_id)
         if row is None:
             return False
-        self._filter_box.clear()
-        src_index = self._source_model.index(row, 0)
-        proxy_index = self._proxy.mapFromSource(src_index)
-        if not proxy_index.isValid():
-            return False
-        self._view.setCurrentIndex(proxy_index)
-        self._view.scrollTo(proxy_index)
-        return True
-
-    def _on_current_changed(self, current, _previous):
-        if not current.isValid():
-            return
-        ix = current.data(Qt.UserRole)
-        if ix is not None:
-            self.moveIndexSelected.emit(int(ix))
+        return self._panel.select_index(row)
 
 
 class MoveEditor(QWidget):

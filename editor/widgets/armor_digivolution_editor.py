@@ -45,10 +45,12 @@ def _item_name(item_id: int) -> str:
     return constants.ITEM_ID_TO_STR.get(item_id, "<unknown>")
 
 
-def _record_label(ix: int, rec: model.ArmorDigivolution) -> str:
+def _record_columns(ix: int, rec: model.ArmorDigivolution):
     return (
-        f"{ix:03d}  {digimon_name(rec.digimon_id)} + {_item_name(rec.item_id)} "
-        f"→ {digimon_name(rec.evolution_id)}"
+        f"{ix:03d}",
+        digimon_name(rec.digimon_id),
+        _item_name(rec.item_id),
+        digimon_name(rec.evolution_id),
     )
 
 
@@ -111,7 +113,11 @@ class ArmorDigivolutionEditor(QWidget):
         self._session = session
         self._current_ix: int = -1
 
-        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
+        self._list_panel = RecordListPanel(
+            records, dirty_aware=True,
+            columns_for=_record_columns,
+            headers=("#", "From", "Item", "To"),
+        )
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -228,8 +234,7 @@ class ArmorDigivolutionEditor(QWidget):
     def _refresh_list_label(self) -> None:
         if not (0 <= self._current_ix < len(self._records)):
             return
-        target = self._records[self._current_ix]
-        self._list_panel.refresh_label(self._current_ix, _record_label(self._current_ix, target))
+        self._list_panel.refresh_label(self._current_ix)
 
     def select_by_id(self, ix: int) -> bool:
         """Footer click-to-navigate hook — record id is the list index."""
@@ -267,9 +272,9 @@ def armor_digivolution_issues(
     issues: List[ValidationIssue] = []
     egg_lo, egg_hi = constants.ITEM_TYPE_IDS["DIGIEGG"]
     for ix, rec in enumerate(records):
-        # Label is the same as the left-pane list so the user can jump to the
+        # Label mirrors the left-pane row so the user can jump to the
         # right record from the popup.
-        label = _record_label(ix, rec)
+        label = "  ".join(_record_columns(ix, rec))
         if rec.digimon_id not in base_digimon:
             issues.append(ValidationIssue(
                 section="Armor Digivolutions",

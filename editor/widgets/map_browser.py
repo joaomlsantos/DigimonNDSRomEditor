@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from digimon_core import map as mapmod, map_import, overlay5 as overlay5_mod
+from digimon_core import map as mapmod, map_import, map_labels, overlay5 as overlay5_mod
 
 from ..commands import (
     EditDialogFieldCommand,
@@ -70,6 +70,7 @@ from ..commands import (
     SetAttrCommand,
 )
 from .cutscenes_tab import CutscenesTab
+from .map_encounter_tab import MapEncounterTab
 from .events_canvas import EventMarkerSpec, EventsCanvas, ExitZoneSpec
 from .paint_canvas import PaintCanvas
 from .record_list_panel import RecordListPanel
@@ -289,7 +290,8 @@ class MapBrowser(QWidget):
     _TAB_WALK = 2
     _TAB_EVENTS = 3
     _TAB_CUTSCENES = 4
-    _TAB_COMPOSITE = 5
+    _TAB_ENCOUNTERS = 5
+    _TAB_COMPOSITE = 6
 
     # Column labels for the .d tuple table. Best-guess names per the
     # recon doc (research_docs/claude_notes/btmap_map_recon.md §.d);
@@ -348,9 +350,21 @@ class MapBrowser(QWidget):
     # ---- UI construction -------------------------------------------------
 
     def _build_ui(self) -> None:
+        # Row label format: ``NNNN  Area Name`` (with the area name
+        # muted-elided when the id is past the vanilla 265). Sourced
+        # from :mod:`digimon_core.map_labels` — same table the enemy
+        # editor's "Appears in" section uses, so a map id reads
+        # identically in both views.
+        def _map_row_label(_ix, mid) -> str:
+            map_id = int(mid)
+            name = map_labels.area_name(map_id)
+            if name and name != "?":
+                return f"{map_id:04d}  {name}"
+            return f"{map_id:04d}"
+
         self._list = RecordListPanel(
             records=list(self._map_ids),
-            label_for=lambda _ix, mid: f"{int(mid):04d}",
+            label_for=_map_row_label,
         )
         self._list.indexSelected.connect(self._on_index_selected)
 
@@ -360,6 +374,7 @@ class MapBrowser(QWidget):
         self._tabs.addTab(self._build_walk_tab(), "Walkability")
         self._tabs.addTab(self._build_events_tab(), "Events")
         self._tabs.addTab(self._build_cutscenes_tab(), "Cutscenes")
+        self._tabs.addTab(self._build_encounter_tab(), "Encounters")
         self._tabs.addTab(self._build_preview_tab("composite"), "Composite")
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -402,18 +417,22 @@ class MapBrowser(QWidget):
         self._tuples_table.setMaximumHeight(20 * mapmod.DESCRIPTOR_MAX_TUPLES + 28)
         self._tuples_table.hide()
 
-        # Just the metadata form under the tabs — no table column. Layout
-        # left-aligns it so it doesn't stretch across the full width.
-        bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(0, 0, 0, 0)
-        bottom_row.addLayout(meta_form, 0)
-        bottom_row.addStretch(1)
+        # Metadata footer under the tabs. Wrapped in its own container
+        # widget so tabs that don't touch these fields (Cutscenes reads
+        # overlay5 script data, not tilemap layers) can hide the whole
+        # strip via ``self._meta_footer.setVisible(False)`` without
+        # having to null-out each QLabel individually.
+        self._meta_footer = QWidget()
+        footer_layout = QHBoxLayout(self._meta_footer)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.addLayout(meta_form, 0)
+        footer_layout.addStretch(1)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(self._tabs, 1)
-        right_layout.addLayout(bottom_row, 0)
+        right_layout.addWidget(self._meta_footer, 0)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._list)
@@ -2375,6 +2394,14 @@ class MapBrowser(QWidget):
         self._refresh_active_tab()
 
     def _on_tab_changed(self, _ix: int) -> None:
+        # Cutscenes + Encounters read overlay5 / ENCTBL data — the
+        # tilemap-oriented metadata footer (Layer A/B dimensions, palette
+        # banks, walkability, .d tuples) is irrelevant there, so hide it.
+        self._meta_footer.setVisible(
+            self._tabs.currentIndex() not in (
+                self._TAB_CUTSCENES, self._TAB_ENCOUNTERS,
+            )
+        )
         self._refresh_active_tab()
 
     def _update_tab_availability(self, map_id: str) -> None:
@@ -2419,7 +2446,7 @@ class MapBrowser(QWidget):
         # shared pinned-RGBA path.
         if ix in (
             self._TAB_LAYER_A, self._TAB_LAYER_B,
-            self._TAB_EVENTS, self._TAB_CUTSCENES,
+            self._TAB_EVENTS, self._TAB_CUTSCENES, self._TAB_ENCOUNTERS,
         ):
             return
         if preview is None or preview.width == 0 or preview.height == 0:
@@ -2447,6 +2474,9 @@ class MapBrowser(QWidget):
             return None
         if ix == self._TAB_CUTSCENES:
             self._refresh_cutscenes_tab()
+            return None
+        if ix == self._TAB_ENCOUNTERS:
+            self._refresh_encounter_tab()
             return None
         composite = mapmod.render_map_from_file_table(
             map_id, self._file_table, self._rom,
@@ -2619,6 +2649,68 @@ class MapBrowser(QWidget):
             self._session, parent=self, undo_stack=self._undo_stack,
         )
         return self._cutscenes_tab
+
+    def _build_encounter_tab(self) -> QWidget:
+        """Construct the Encounters tab (per-map ENCTBL.BIN assignment).
+
+        The tab's "Open in Wild Encounters editor" button routes through
+        ``_navigate_to_wild_area`` up to the main window, mirroring the
+        cross-references the enemy / cutscene panels use.
+        """
+        self._encounter_tab = MapEncounterTab(
+            self._session, self._undo_stack,
+            navigate_to_area=self._navigate_to_wild_area,
+            parent=self,
+        )
+        return self._encounter_tab
+
+    def _refresh_encounter_tab(self) -> None:
+        if self._current_id is None:
+            return
+        self._encounter_tab.set_map(int(self._current_id))
+
+    def _navigate_to_wild_area(self, area_index: int) -> None:
+        """Encounters tab → Wild Encounters editor at ``area_index``.
+
+        Thin bridge to the main window (which owns the editor stack); a
+        no-op when the host doesn't expose the navigation method
+        (headless tests)."""
+        nav = getattr(self.window(), "navigate_to_wild_area", None)
+        if nav is not None:
+            nav(area_index)
+
+    def navigate_to_map_encounters(self, map_id: int) -> None:
+        """Public: open this browser at ``map_id`` on the Encounters tab.
+
+        The reverse of :meth:`_navigate_to_wild_area` — the Wild
+        Encounters editor's "Used by maps" links call this via the main
+        window. No-ops when ``map_id`` isn't in the discovered list.
+        """
+        try:
+            row_ix = self._map_ids.index(str(map_id))
+        except ValueError:
+            return
+        self._list.select_index(row_ix)
+        self._tabs.setCurrentIndex(self._TAB_ENCOUNTERS)
+
+    def navigate_to_cutscene_chain(self, map_id: int, chain_ix: int) -> None:
+        """Public: open this browser at ``map_id`` on the Cutscenes tab,
+        with the chain at global ``chain_ix`` selected.
+
+        Two-phase: first flip the map-list cursor to ``map_id`` (which
+        triggers the standard per-tab render pipeline), then switch to
+        the Cutscenes tab and forward the ``chain_ix`` to
+        :class:`CutscenesTab.select_chain_by_global_ix`. Skipped when
+        the map id isn't in the discovered list (out-of-range or
+        stripped ROM) — no partial state left behind.
+        """
+        try:
+            row_ix = self._map_ids.index(str(map_id))
+        except ValueError:
+            return
+        self._list.select_index(row_ix)
+        self._tabs.setCurrentIndex(self._TAB_CUTSCENES)
+        self._cutscenes_tab.select_chain_by_global_ix(chain_ix)
 
     def _refresh_cutscenes_tab(self) -> None:
         """Re-render the Cutscenes tab for the current map.

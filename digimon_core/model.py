@@ -1249,6 +1249,59 @@ class WildEncounterArea:
         rom_data[self.offset:self.offset + len(data)] = data
 
 
+class MapEncounterEntry:
+    """One 8-byte entry in ``DAT/ec/ENCTBL.BIN`` — the per-field-map
+    encounter assignment table.
+
+    The table has 265 entries (field maps 0..264, same id space as the
+    overlay5 map entries) plus a trailing all-``FFFF`` terminator; entry
+    index == field-map id. Full decode + verification in
+    ``research_docs/claude_notes/map_encounter_table.md``.
+
+    Layout (4 × u16 LE):
+    - 0x00 ``area_index`` — wild-encounter area (index into the
+      ``WildEncounterArea`` list; which digimon spawn). ``0`` / ``1`` are
+      Shine/Dark-side dummies used by towns; ``0xFFFF`` = no area.
+    - 0x02 ``battle_bg`` — battle background id (``DAT/btmap/<id>``);
+      ``0xFFFF`` = none.
+    - 0x04 ``unknown_0x4`` — per-map parameter (1..10; likely an encounter
+      rate/frequency band, unconfirmed). Kept raw + editable.
+    - 0x06 ``wild_battle_bgm`` — BGM played during a wild encounter on this
+      map (music id, same id space as the overlay5 SET_MUSIC opcode / the
+      Sound editor's BGM list). Vanilla uses only 0x10 Normal Battle Theme,
+      0x11 Alt Battle Theme (the "Sunken Tunnel"-family maps), 0x12 Chaos
+      Brain Battle Theme.
+    """
+    SIZE = 8
+    NONE = 0xFFFF
+
+    offset: int
+    map_id: int
+    area_index: int
+    battle_bg: int
+    unknown_0x4: int
+    wild_battle_bgm: int
+
+    def __init__(self, data: bytearray, offset: int, map_id: int = -1):
+        self.offset = offset
+        self.map_id = map_id
+        self.area_index = int.from_bytes(data[0:2], byteorder="little")
+        self.battle_bg = int.from_bytes(data[2:4], byteorder="little")
+        self.unknown_0x4 = int.from_bytes(data[4:6], byteorder="little")
+        self.wild_battle_bgm = int.from_bytes(data[6:8], byteorder="little")
+
+    def getByteArray(self) -> bytearray:
+        out = bytearray(self.SIZE)
+        out[0:2] = (self.area_index & 0xFFFF).to_bytes(2, byteorder="little")
+        out[2:4] = (self.battle_bg & 0xFFFF).to_bytes(2, byteorder="little")
+        out[4:6] = (self.unknown_0x4 & 0xFFFF).to_bytes(2, byteorder="little")
+        out[6:8] = (self.wild_battle_bgm & 0xFFFF).to_bytes(2, byteorder="little")
+        return out
+
+    def writeToRom(self, rom_data: bytearray):
+        rom_data[self.offset:self.offset + self.SIZE] = self.getByteArray()
+
+
 class Equipment:
     """One 0x48-byte equipment record from /eq/.
 
@@ -1504,10 +1557,16 @@ class FarmItem:
         self.training_pen_id     = int.from_bytes(data[0x04:0x06], byteorder="little")
         self.stat_id             = data[0x06]
         self.unknown_0x07        = data[0x07]
-        self.great_failure_value = int.from_bytes(data[0x08:0x0A], byteorder="little", signed=True)
-        self.failure_value       = int.from_bytes(data[0x0A:0x0C], byteorder="little", signed=True)
-        self.success_value       = int.from_bytes(data[0x0C:0x0E], byteorder="little", signed=True)
-        self.great_success_value = int.from_bytes(data[0x0E:0x10], byteorder="little", signed=True)
+        # Stored as raw u16 even though these are semantically s16 (0xFFFF ==
+        # -1): the editor's signed spinboxes handle the two's-complement
+        # display, and raw storage keeps serialisation overflow-free — a
+        # negative edit round-trips through ``value & 0xFFFF`` == 0..65535,
+        # which ``to_bytes(2, signed=True)`` would reject. Mirrors
+        # QuestData.unlock_condition_tamerpoints.
+        self.great_failure_value = int.from_bytes(data[0x08:0x0A], byteorder="little")
+        self.failure_value       = int.from_bytes(data[0x0A:0x0C], byteorder="little")
+        self.success_value       = int.from_bytes(data[0x0C:0x0E], byteorder="little")
+        self.great_success_value = int.from_bytes(data[0x0E:0x10], byteorder="little")
         self.max_points = int.from_bytes(data[0x10:0x12], byteorder="little")
         self.great_failure_chance = data[0x14]
         self.failure_chance       = data[0x15]
@@ -1515,8 +1574,8 @@ class FarmItem:
         self.great_success_chance = data[0x17]
         self.sprite_id           = int.from_bytes(data[0x18:0x1A], byteorder="little")
         self.bit_cost = int.from_bytes(data[0x1C:0x20], byteorder="little")
-        self.x_position          = int.from_bytes(data[0x28:0x2A], byteorder="little", signed=True)
-        self.y_position          = int.from_bytes(data[0x2A:0x2C], byteorder="little", signed=True)
+        self.x_position          = int.from_bytes(data[0x28:0x2A], byteorder="little")
+        self.y_position          = int.from_bytes(data[0x2A:0x2C], byteorder="little")
         for field_offset, attr in self._UNKNOWN_FIELDS:
             setattr(self, attr, int.from_bytes(data[field_offset:field_offset + 2], byteorder="little"))
 
@@ -1528,10 +1587,13 @@ class FarmItem:
         out[0x04:0x06] = self.training_pen_id.to_bytes(2, byteorder="little")
         out[0x06] = self.stat_id & 0xFF
         out[0x07] = self.unknown_0x07 & 0xFF
-        out[0x08:0x0A] = self.great_failure_value.to_bytes(2, byteorder="little", signed=True)
-        out[0x0A:0x0C] = self.failure_value.to_bytes(2, byteorder="little", signed=True)
-        out[0x0C:0x0E] = self.success_value.to_bytes(2, byteorder="little", signed=True)
-        out[0x0E:0x10] = self.great_success_value.to_bytes(2, byteorder="little", signed=True)
+        # `& 0xFFFF` normalises both representations these fields can hold —
+        # a signed value straight off a fresh parse, or the raw u16 the
+        # signed spinbox writes back on edit — to the same unsigned bytes.
+        out[0x08:0x0A] = (self.great_failure_value & 0xFFFF).to_bytes(2, byteorder="little")
+        out[0x0A:0x0C] = (self.failure_value & 0xFFFF).to_bytes(2, byteorder="little")
+        out[0x0C:0x0E] = (self.success_value & 0xFFFF).to_bytes(2, byteorder="little")
+        out[0x0E:0x10] = (self.great_success_value & 0xFFFF).to_bytes(2, byteorder="little")
         out[0x10:0x12] = self.max_points.to_bytes(2, byteorder="little")
         out[0x14] = self.great_failure_chance & 0xFF
         out[0x15] = self.failure_chance & 0xFF
@@ -1539,8 +1601,8 @@ class FarmItem:
         out[0x17] = self.great_success_chance & 0xFF
         out[0x18:0x1A] = self.sprite_id.to_bytes(2, byteorder="little")
         out[0x1C:0x20] = self.bit_cost.to_bytes(4, byteorder="little")
-        out[0x28:0x2A] = self.x_position.to_bytes(2, byteorder="little", signed=True)
-        out[0x2A:0x2C] = self.y_position.to_bytes(2, byteorder="little", signed=True)
+        out[0x28:0x2A] = (self.x_position & 0xFFFF).to_bytes(2, byteorder="little")
+        out[0x2A:0x2C] = (self.y_position & 0xFFFF).to_bytes(2, byteorder="little")
         for field_offset, attr in self._UNKNOWN_FIELDS:
             out[field_offset:field_offset + 2] = getattr(self, attr).to_bytes(2, byteorder="little")
         return out
@@ -1583,10 +1645,12 @@ class FarmTrainingPen:
         self.string_id           = int.from_bytes(data[0x00:0x02], byteorder="little")
         self.sprite_id           = int.from_bytes(data[0x02:0x04], byteorder="little")
         self.stat_op_id          = int.from_bytes(data[0x04:0x06], byteorder="little")
-        self.great_failure_value = int.from_bytes(data[0x06:0x08], byteorder="little", signed=True)
-        self.failure_value       = int.from_bytes(data[0x08:0x0A], byteorder="little", signed=True)
-        self.success_value       = int.from_bytes(data[0x0A:0x0C], byteorder="little", signed=True)
-        self.great_success_value = int.from_bytes(data[0x0C:0x0E], byteorder="little", signed=True)
+        # Raw u16 storage for these s16 fields — see FarmItem for the
+        # rationale (signed spinbox display + overflow-free serialisation).
+        self.great_failure_value = int.from_bytes(data[0x06:0x08], byteorder="little")
+        self.failure_value       = int.from_bytes(data[0x08:0x0A], byteorder="little")
+        self.success_value       = int.from_bytes(data[0x0A:0x0C], byteorder="little")
+        self.great_success_value = int.from_bytes(data[0x0C:0x0E], byteorder="little")
         self.stat_cap            = int.from_bytes(data[0x0E:0x10], byteorder="little")
         self.total_odds          = int.from_bytes(data[0x10:0x12], byteorder="little")
         self.great_failure_chance = data[0x12]
@@ -1602,10 +1666,10 @@ class FarmTrainingPen:
         out[0x00:0x02] = self.string_id.to_bytes(2, byteorder="little")
         out[0x02:0x04] = self.sprite_id.to_bytes(2, byteorder="little")
         out[0x04:0x06] = self.stat_op_id.to_bytes(2, byteorder="little")
-        out[0x06:0x08] = self.great_failure_value.to_bytes(2, byteorder="little", signed=True)
-        out[0x08:0x0A] = self.failure_value.to_bytes(2, byteorder="little", signed=True)
-        out[0x0A:0x0C] = self.success_value.to_bytes(2, byteorder="little", signed=True)
-        out[0x0C:0x0E] = self.great_success_value.to_bytes(2, byteorder="little", signed=True)
+        out[0x06:0x08] = (self.great_failure_value & 0xFFFF).to_bytes(2, byteorder="little")
+        out[0x08:0x0A] = (self.failure_value & 0xFFFF).to_bytes(2, byteorder="little")
+        out[0x0A:0x0C] = (self.success_value & 0xFFFF).to_bytes(2, byteorder="little")
+        out[0x0C:0x0E] = (self.great_success_value & 0xFFFF).to_bytes(2, byteorder="little")
         out[0x0E:0x10] = self.stat_cap.to_bytes(2, byteorder="little")
         out[0x10:0x12] = self.total_odds.to_bytes(2, byteorder="little")
         out[0x12] = self.great_failure_chance & 0xFF

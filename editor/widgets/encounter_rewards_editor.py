@@ -64,8 +64,12 @@ TYPE_MONEY = 2
 EXPECTED_PROBABILITY_SUM = 200
 
 
-def _record_label(ix: int, rec: model.EncounterRewardTable) -> str:
-    return f"Table {ix:03d}  ({len(rec.probabilitiesArray)} slots)  offset 0x{rec.offset:08x}"
+def _record_columns(ix: int, rec: model.EncounterRewardTable):
+    return (
+        f"{ix:03d}",
+        str(len(rec.probabilitiesArray)),
+        f"0x{rec.offset:08x}",
+    )
 
 
 def _slot_type(raw: int) -> int:
@@ -239,7 +243,10 @@ class EncounterRewardsEditor(QWidget):
         self._session = session
         self._current_ix: int = -1
 
-        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
+        self._list_panel = RecordListPanel(
+            records, dirty_aware=True,
+            columns_for=_record_columns, headers=("Table", "Slots", "Offset"),
+        )
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()

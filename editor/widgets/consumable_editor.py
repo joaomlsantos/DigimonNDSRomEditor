@@ -30,8 +30,8 @@ def _item_name(item_id: int) -> str:
     return constants.ITEM_ID_TO_STR.get(item_id, f"<item 0x{item_id:03x}>")
 
 
-def _record_label(_ix: int, rec: model.Consumable) -> str:
-    return f"0x{rec.id:03x}  {_item_name(rec.id)}"
+def _record_columns(_ix: int, rec: model.Consumable):
+    return (f"0x{rec.id:03x}", _item_name(rec.id))
 
 
 class ConsumableEditor(QWidget):
@@ -51,7 +51,10 @@ class ConsumableEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
-        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
+        self._list_panel = RecordListPanel(
+            records, dirty_aware=True,
+            columns_for=_record_columns, headers=("ID", "Name"),
+        )
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()

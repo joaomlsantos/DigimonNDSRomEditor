@@ -664,3 +664,28 @@ def displayed_as_suffix(
     if display_name == own_name:
         return ""
     return f"  [{display_name}]"
+
+
+def displayed_as_name(
+    sprite_map: List[model.SpriteMapEntry],
+    sprite_to_base: Dict[int, int],
+    digimon_id: int,
+    own_name: str,
+    name_resolver: Optional[Callable[[int], str]] = None,
+) -> str:
+    """Bare-name variant of :func:`displayed_as_suffix` for column views.
+
+    Returns just the reskin target's display name (no ``[brackets]``,
+    no leading padding) so it can live in its own list column, or ``""``
+    when the slot renders as its own name. ``"???"`` when the slot's
+    sprite doesn't resolve to any base id.
+    """
+    suffix = displayed_as_suffix(
+        sprite_map, sprite_to_base, digimon_id, own_name,
+        name_resolver=name_resolver,
+    )
+    if not suffix:
+        return ""
+    # ``displayed_as_suffix`` returns "  [Name]" — strip the padding and
+    # brackets rather than duplicating the resolution logic.
+    return suffix.strip().lstrip("[").rstrip("]")

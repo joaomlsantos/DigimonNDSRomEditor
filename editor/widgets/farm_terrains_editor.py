@@ -61,8 +61,8 @@ def _terrain_name(ix: int) -> str:
     return f"<terrain {ix}>"
 
 
-def _record_label(ix: int, rec: model.FarmTerrain) -> str:
-    return f"{ix:02d}  {_terrain_name(ix)}  (id 0x{rec.id:04x})"
+def _record_columns(ix: int, rec: model.FarmTerrain):
+    return (f"{ix:02d}", _terrain_name(ix), f"0x{rec.id:04x}")
 
 
 class FarmTerrainsEditor(QWidget):
@@ -82,7 +82,10 @@ class FarmTerrainsEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
-        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
+        self._list_panel = RecordListPanel(
+            records, dirty_aware=True,
+            columns_for=_record_columns, headers=("#", "Terrain", "ID"),
+        )
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()

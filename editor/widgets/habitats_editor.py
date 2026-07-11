@@ -51,8 +51,8 @@ def _location_name(ix: int) -> str:
     return f"<area {ix}>"
 
 
-def _record_label(ix: int, _rec: model.HabitatWorldmap) -> str:
-    return f"{ix:02d}  {_location_name(ix)}"
+def _record_columns(ix: int, _rec: model.HabitatWorldmap):
+    return (f"{ix:02d}", _location_name(ix))
 
 
 class _SpeciesFlagsRow(QWidget):
@@ -124,7 +124,10 @@ class HabitatsWorldmapEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []
 
-        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
+        self._list_panel = RecordListPanel(
+            records, dirty_aware=True,
+            columns_for=_record_columns, headers=("#", "Location"),
+        )
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()

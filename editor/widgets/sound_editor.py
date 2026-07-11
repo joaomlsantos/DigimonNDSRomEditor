@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -160,7 +161,12 @@ class SoundEditor(QWidget):
         splitter.addWidget(self._build_right_pane())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 700])
+        # Left pane is wider than the old default so the aligned column
+        # layout (0xNNNN  bgmNN  [Label]  N KB) fits comfortably even
+        # with the longest pinned label (32 chars, "Alt Battle Theme
+        # (Sunken Tunnel)"). Drag to resize if a user-edited label
+        # grows longer.
+        splitter.setSizes([560, 700])
         outer.addWidget(splitter, 1)
 
         outer.addWidget(self._build_footer())
@@ -325,6 +331,20 @@ class SoundEditor(QWidget):
         self._rom_detail_cap.setStyleSheet("color: #888;")
         layout.addWidget(self._rom_detail_cap)
 
+        # Editable friendly label for the selected BGM. Pre-filled from
+        # the pinned research-doc dict (``music_names.MUSIC_ID_NAMES``);
+        # commits on ``editingFinished`` land in the session's
+        # ``bgm_label_edits`` channel so the project file preserves them.
+        # ``_label_syncing`` brackets programmatic setText so we don't
+        # trigger a self-commit when we're just seeding the field from a
+        # row selection.
+        self._rom_meta_label = QLineEdit()
+        self._rom_meta_label.setPlaceholderText("(no label)")
+        self._rom_meta_label.editingFinished.connect(
+            self._on_rom_label_committed
+        )
+        self._rom_label_syncing: bool = False
+
         self._rom_meta_sseq = QLabel("\u2014")
         self._rom_meta_sbnk = QLabel("\u2014")
         self._rom_meta_swar = QLabel("\u2014")
@@ -335,6 +355,7 @@ class SoundEditor(QWidget):
         form.setContentsMargins(0, 0, 0, 0)
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(2)
+        form.addRow("Label", self._rom_meta_label)
         form.addRow("SSEQ", self._rom_meta_sseq)
         form.addRow("SBNK", self._rom_meta_sbnk)
         form.addRow("waveArc", self._rom_meta_swar)
@@ -388,6 +409,7 @@ class SoundEditor(QWidget):
                 self._rom_meta_swar, self._rom_meta_slots,
             ):
                 lbl.setText("\u2014")
+            self._seed_label_field(None)
             self._refresh_action_state()
             return
 
@@ -413,6 +435,9 @@ class SoundEditor(QWidget):
             self._rom_meta_slots.setText(
                 ", ".join(bgm.wave_names) if bgm.wave_names else "(none)"
             )
+            # ``row`` is the sequential array id the SET_MUSIC opcode
+            # references \u2014 same key ``bgm_label_edits`` is keyed on.
+            self._seed_label_field(row)
         else:  # "addition"
             addition_idx, swap = payload
             new_bgm_id = len(self._bgms) + addition_idx
@@ -431,7 +456,80 @@ class SoundEditor(QWidget):
                 f"{_fmt_kb(len(swap.swar_bytes))} (single-slot merged)"
             )
             self._rom_meta_slots.setText(f"WAVE_BGM{new_bgm_id:02d}")
+            # Additions land at ``vanilla_count + addition_idx`` in the
+            # SET_MUSIC array \u2014 same slot the user would reference from
+            # a future opcode edit.
+            self._seed_label_field(new_bgm_id)
         self._refresh_action_state()
+
+    # ---- Label field seed / commit --------------------------------------
+
+    def _seed_label_field(self, music_id: Optional[int]) -> None:
+        """Seed the Label field from the session for ``music_id``.
+
+        ``None`` clears the field (used on empty selection). Programmatic
+        set is bracketed by ``_rom_label_syncing`` so ``editingFinished``
+        doesn't fire a spurious commit \u2014 that would round-trip the
+        default label into ``bgm_label_edits`` and shadow the built-in
+        fallback logic.
+        """
+        self._rom_label_syncing = True
+        try:
+            if music_id is None:
+                self._rom_meta_label.setText("")
+                self._rom_meta_label.setEnabled(False)
+                self._rom_meta_label.setProperty("_music_id", None)
+                return
+            self._rom_meta_label.setEnabled(True)
+            self._rom_meta_label.setText(self._session.bgm_label(music_id))
+            self._rom_meta_label.setProperty("_music_id", int(music_id))
+        finally:
+            self._rom_label_syncing = False
+
+    def _on_rom_label_committed(self) -> None:
+        """Push the current Label text into ``session.bgm_label_edits``.
+
+        The session normalises whitespace-only input as "delete the
+        override" \u2014 the field reads the default back afterward so the
+        user sees the pinned name reappear when they clear their edit.
+        Also repaints the matching list row so the ``[Label]`` fragment
+        in the row text updates without waiting for a full rebuild.
+        """
+        if self._rom_label_syncing:
+            return
+        music_id = self._rom_meta_label.property("_music_id")
+        if music_id is None:
+            return
+        new_label = self._rom_meta_label.text()
+        self._session.set_bgm_label(int(music_id), new_label)
+        # Re-seed so the field reflects what the session actually kept
+        # (whitespace-only \u2192 pinned default fallback shows up here).
+        self._seed_label_field(int(music_id))
+        # A label edit can widen (or narrow) the shared label-column
+        # width the whole list is aligned around, so re-render every
+        # row rather than just the edited one. ``_rebuild_rom_list``
+        # preserves the current selection.
+        self._rebuild_rom_list()
+
+    def _refresh_rom_list_row(self, music_id: int) -> None:
+        """Re-render one ROM list row without rebuilding the whole list.
+
+        Keeps the current selection intact \u2014 a full ``_rebuild_rom_list``
+        would clear + re-set the row, which reads correctly to the user
+        but wastes work for a single-field edit like the Label.
+        """
+        row = int(music_id)
+        if row < 0 or row >= self._rom_list.count():
+            return
+        item = self._rom_list.item(row)
+        if item is None:
+            return
+        kind, payload = self._rom_row_kind(row)
+        if kind == "vanilla":
+            item.setText(self._rom_list_label(payload, row))
+        elif kind == "addition":
+            _addition_idx, swap = payload
+            item.setText(self._addition_list_label(row, swap))
 
     def _on_donor_row_changed(self, current=None) -> None:
         if isinstance(current, QTreeWidgetItem):
@@ -537,6 +635,12 @@ class SoundEditor(QWidget):
         )
 
         cap_kb = CAP_BYTES / 1024
+        # Muted foreground for unimportable rows (over-cap + parse-failed).
+        # Both categories can't be Replace-targeted \u2014 the \u2717 / \u26a0 marker in
+        # column 2 already tells the user why, and dimming the row text
+        # makes the list scannable at a glance for "which rows can I
+        # actually import".
+        muted_brush = QBrush(QColor("#888"))
         first_selectable_item: Optional[QTreeWidgetItem] = None
         for idx, row in enumerate(self._donor_rows):
             item = _DonorRowItem(idx, row)
@@ -562,8 +666,14 @@ class SoundEditor(QWidget):
                 item.setToolTip(1, over_msg)
                 item.setToolTip(2, over_msg)
             item.setTextAlignment(2, Qt.AlignCenter)
+            # Grey out unimportable rows so users can eyeball what fits
+            # the cap versus what's out of reach without reading the
+            # status column. Fit-cap rows stay at the default palette.
+            if row.parse_failed or not row.fits_cap:
+                for col in range(3):
+                    item.setForeground(col, muted_brush)
             self._donor_list.addTopLevelItem(item)
-            if first_selectable_item is None and not row.parse_failed:
+            if first_selectable_item is None and row.fits_cap:
                 first_selectable_item = item
 
         self._donor_list.setSortingEnabled(True)
@@ -763,14 +873,44 @@ class SoundEditor(QWidget):
         self._on_rom_row_changed(self._rom_list.currentRow())
 
     def _rebuild_rom_list(self) -> None:
-        """Repaint the ROM list with vanilla bgms + staged additions appended."""
+        """Repaint the ROM list with vanilla bgms + staged additions appended.
+
+        Recomputes the shared column widths so every row lands with the
+        Size column at the same character offset. The Consolas font
+        the list uses is monospace, so padding each column to the same
+        character count is enough to line the eye up on Size \u2014 no
+        QTreeWidget migration needed.
+        """
         prev_row = self._rom_list.currentRow() if self._rom_list.count() else 0
-        self._rom_list.blockSignals(True)
-        self._rom_list.clear()
-        for bgm in self._bgms:
-            self._rom_list.addItem(QListWidgetItem(self._rom_list_label(bgm)))
+
+        # Compute shared column widths across every row we're about to
+        # paint. Recomputing per-rebuild keeps the layout tight when
+        # short-labelled ROMs load and gracefully expands when a user
+        # edits a label longer than the pinned defaults.
         additions = self._session.staged_bgm_additions()
         vanilla_count = len(self._bgms)
+        name_widths: List[int] = []
+        label_widths: List[int] = []
+        for array_ix, bgm in enumerate(self._bgms):
+            name_widths.append(len(bgm.seq_name))
+            lbl = self._session.bgm_label(array_ix)
+            label_widths.append(len(f"[{lbl}]") if lbl else 0)
+        for i in range(len(additions)):
+            new_bgm_id = vanilla_count + i
+            name_widths.append(len(f"bgm{new_bgm_id:02d}"))
+            lbl = self._session.bgm_label(new_bgm_id)
+            label_widths.append(len(f"[{lbl}]") if lbl else 0)
+        # Fall back to sensible defaults when the list is empty so the
+        # per-row formatters don't hit ``max([])``.
+        self._rom_name_col_width = max(name_widths, default=5)
+        self._rom_label_col_width = max(label_widths, default=0)
+
+        self._rom_list.blockSignals(True)
+        self._rom_list.clear()
+        for array_ix, bgm in enumerate(self._bgms):
+            self._rom_list.addItem(
+                QListWidgetItem(self._rom_list_label(bgm, array_ix))
+            )
         for i, swap in enumerate(additions):
             self._rom_list.addItem(
                 QListWidgetItem(self._addition_list_label(vanilla_count + i, swap))
@@ -784,24 +924,50 @@ class SoundEditor(QWidget):
         if new_count > 0:
             self._rom_list.setCurrentRow(min(prev_row, new_count - 1))
 
-    def _rom_list_label(self, bgm) -> str:
-        kb = _fmt_kb(bgm.total_size)
+    def _rom_list_label(self, bgm, array_ix: int) -> str:
+        # Sequential array id \u2014 this is what the overlay5 ``SET_MUSIC``
+        # opcode references, and it drifts from the ``bgmNN`` filename
+        # number as soon as the SDAT has gaps or an "Add As New Entry"
+        # slot lands. Shown as ``0xNNNN`` at column 0 so the user can
+        # match a scripted music cue back to the slot without doing the
+        # array-index math by hand.
+        id_prefix = f"0x{array_ix:04x}"
+        name_col = bgm.seq_name.ljust(self._rom_name_col_width)
+        # Friendly label from the session (user override or pinned
+        # research-doc default) \u2014 shown between the filename and size
+        # in ``[brackets]`` so a scan of the list reads as
+        # ``0xNNNN  bgmNN  [Name]  N KB``. Padded to the shared column
+        # width so the Size column that follows lands at the same
+        # character offset on every row.
+        label = self._session.bgm_label(array_ix)
+        label_col = (f"[{label}]" if label else "").ljust(
+            self._rom_label_col_width
+        )
+        kb = _fmt_kb(bgm.total_size).rjust(9)
         warn = " \u26a0" if bgm.total_size > CAP_BYTES else ""
         staged = self._session.staged_bgm_swap(bgm.bgm_id)
         if staged is None:
-            return f"{bgm.seq_name:8s}{kb:>10s}{warn}"
+            return f"{id_prefix}  {name_col}  {label_col}  {kb}{warn}"
         donor = staged.donor_label or "?"
         staged_kb = _fmt_kb(staged.trimmed_total_bytes)
         return (
-            f"{bgm.seq_name:8s}{kb:>10s}{warn}  \u2190 {donor} "
-            f"({staged_kb}) \u2731"
+            f"{id_prefix}  {name_col}  {label_col}  {kb}{warn}"
+            f"  \u2190 {donor} ({staged_kb}) \u2731"
         )
 
     def _addition_list_label(self, new_bgm_id: int, swap) -> str:
-        name = f"bgm{new_bgm_id:02d}"
-        kb = _fmt_kb(swap.trimmed_total_bytes)
+        # For additions, ``new_bgm_id`` doubles as both the filename
+        # number (``bgmNN``) AND the sequential array id \u2014 additions
+        # always land at the end of the array, so the two coincide.
+        id_prefix = f"0x{new_bgm_id:04x}"
+        name = f"bgm{new_bgm_id:02d}".ljust(self._rom_name_col_width)
+        label = self._session.bgm_label(new_bgm_id)
+        label_col = (f"[{label}]" if label else "").ljust(
+            self._rom_label_col_width
+        )
+        kb = _fmt_kb(swap.trimmed_total_bytes).rjust(9)
         donor = swap.donor_label or "?"
-        return f"{name:8s}{kb:>10s}  \u2728 new \u2190 {donor}"
+        return f"{id_prefix}  {name}  {label_col}  {kb}  \u2728 new \u2190 {donor}"
 
     # ---- ROM row \u2192 (bgm | addition) classification ------------------------
 

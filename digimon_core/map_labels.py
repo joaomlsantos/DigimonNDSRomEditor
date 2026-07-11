@@ -21,7 +21,12 @@ from typing import List
 # strings rather than fan-localized variants so a cross-reference with
 # the ROM's own label table stays direct.
 AREA_NAMES: List[str] = [
-    "SunshineCITY", "Shine Gate", "Shine Office", "Shine Hall", "Shine Plaza", "Shine Square", "Shine Center", "Shine Market",
+    # Map 0 is the unused dev-map placeholder (``0.png``) — the ARM9
+    # area-name table joins it with ``SunshineCITY`` but the map itself
+    # is a leftover from development and is never reachable in-game.
+    # The real Sunshine City hub is the run of Shine Gate .. Shine
+    # Market (map ids 1..7).
+    "(unused dev map)", "Shine Gate", "Shine Office", "Shine Hall", "Shine Plaza", "Shine Square", "Shine Center", "Shine Market",
     "Union Room", "Union Room", "Tamer Home", "Tamer Home", "Shine Terminal", "Shine Terminal", "Shine W Route", "Shine W Route",
     "Shine W Area", "Shine S Route", "Shine S Route", "Shine S Area", "Shine N Route", "Shine N Route", "Shine N Area", "Dark Gate",
     "Dark Office", "Dark Hall", "Dark Plaza", "Dark Square", "Dark Center", "Dark Market", "Union Room", "Union Room",

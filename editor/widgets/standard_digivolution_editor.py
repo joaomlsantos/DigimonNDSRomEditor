@@ -219,7 +219,15 @@ class StandardDigivolutionEditor(QWidget):
         self._session = session
         self._current_id: int = -1
 
-        self._list_panel = DigimonListPanel(entries, dirty_aware=True)
+        self._list_panel = DigimonListPanel(
+            entries,
+            dirty_aware=True,
+            columns_for=lambda did: (
+                f"0x{did:03x}",
+                self._session.digimon_display_name(did),
+            ),
+            headers=("ID", "Name"),
+        )
         self._list_panel.digimonSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()

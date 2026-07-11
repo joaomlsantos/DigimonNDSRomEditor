@@ -37,10 +37,14 @@ from .record_list_panel import RecordListPanel
 DIGIMON_VALUED_CONDITIONS = {0x15, 0x16}
 
 
-def _record_label(ix: int, rec: model.DNADigivolution) -> str:
+def _record_columns(ix: int, rec: model.DNADigivolution):
+    # Result first — it's the field users scan the list by (which pairs
+    # fuse into what), with the two parents trailing.
     return (
-        f"{ix:03d}  {digimon_name(rec.digimon_1_id)} + {digimon_name(rec.digimon_2_id)} "
-        f"→ {digimon_name(rec.dna_evolution_id)}"
+        f"{ix:03d}",
+        digimon_name(rec.dna_evolution_id),
+        digimon_name(rec.digimon_1_id),
+        digimon_name(rec.digimon_2_id),
     )
 
 
@@ -101,7 +105,11 @@ class DNADigivolutionEditor(QWidget):
         self._session = session
         self._current_ix: int = -1
 
-        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
+        self._list_panel = RecordListPanel(
+            records, dirty_aware=True,
+            columns_for=_record_columns,
+            headers=("#", "Result", "Digimon 1", "Digimon 2"),
+        )
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -109,9 +117,12 @@ class DNADigivolutionEditor(QWidget):
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.addWidget(self._list_panel)
         splitter.addWidget(self._detail)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 680])
+        # The detail form (three combos + three conditions) is compact, so
+        # give the list the bulk of the width and let it absorb extra space
+        # on resize — its four columns are what the user actually scans.
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([600, 400])
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -212,8 +223,7 @@ class DNADigivolutionEditor(QWidget):
     def _refresh_list_label(self) -> None:
         if not (0 <= self._current_ix < len(self._records)):
             return
-        target = self._records[self._current_ix]
-        self._list_panel.refresh_label(self._current_ix, _record_label(self._current_ix, target))
+        self._list_panel.refresh_label(self._current_ix)
 
     def select_by_id(self, ix: int) -> bool:
         """Footer click-to-navigate hook — record id is the list index."""
@@ -246,7 +256,7 @@ def dna_digivolution_issues(
     must lie in [1, 99]."""
     issues: List[ValidationIssue] = []
     for ix, rec in enumerate(records):
-        label = _record_label(ix, rec)
+        label = "  ".join(_record_columns(ix, rec))
         for attr, role in (
             ("digimon_1_id", "parent 1"),
             ("digimon_2_id", "parent 2"),

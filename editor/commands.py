@@ -579,6 +579,230 @@ class EditDialogFieldCommand(QUndoCommand):
         self._apply(self._old_value)
 
 
+class SetMusicIdCommand(QUndoCommand):
+    """Atomic edit of the ``music_id`` u16 in a SET_MUSIC (0e 00 XX XX)
+    block.
+
+    Same-length splice (4 bytes in, 4 bytes out). The block may be the
+    map's boot-time BGM (right after REGISTER_HANDLER in the prologue-
+    adjacent region) or a mid-cutscene retune; the codec treats them
+    identically. ``on_change`` fires post-redo/undo so the card can
+    refresh its combo without re-decoding the entry.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        new_music_id: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.SetMusicBlock.from_bytes(entry, block_offset)
+        self._old_value = prev.music_id
+        self._new_value = int(new_music_id) & 0xFFFF
+
+    def _apply(self, value: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_set_music_id(
+            entry, self._block_offset, value,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(value)
+
+    def redo(self) -> None:
+        self._apply(self._new_value)
+
+    def undo(self) -> None:
+        self._apply(self._old_value)
+
+
+class EditReactionFieldCommand(QUndoCommand):
+    """Atomic edit of ``reaction`` or ``target`` u16 in a REACTION_BALLOON
+    (C0 00 [reaction] [target]) block.
+
+    Same-length splice. ``target`` is a sprite slot the balloon anchors
+    over; ``reaction`` is the balloon icon id (0 = "!", 1 = "…", etc).
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        field: str,
+        new_value: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._field = field
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod.ReactionBlock.from_bytes(entry, block_offset)
+        self._old_value = getattr(prev, field)
+        self._new_value = int(new_value) & 0xFFFF
+
+    def _apply(self, value: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_reaction_field(
+            entry, self._block_offset, self._field, value,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(value)
+
+    def redo(self) -> None:
+        self._apply(self._new_value)
+
+    def undo(self) -> None:
+        self._apply(self._old_value)
+
+
+class EditBattleEnemyCommand(QUndoCommand):
+    """Atomic edit of one enemy u16 slot (0..4) inside a BATTLE block.
+
+    The 5-slot roster uses ``0xFFFF`` for "empty"; the UI passes it
+    through as any other value so users can add / clear specific slots
+    without a special "remove" affordance.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        slot_ix: int,
+        new_enemy_id: int,
+        description: str,
+        on_change: Optional[Callable[[int, int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._slot_ix = int(slot_ix)
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod._parse_battle_at(entry, block_offset)
+        if prev is None:
+            raise ValueError(
+                f"no BATTLE block at entry {entry_ix:04d} +0x{block_offset:04x}"
+            )
+        self._old_value = prev.enemies[self._slot_ix]
+        self._new_value = int(new_enemy_id) & 0xFFFF
+
+    def _apply(self, value: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_battle_enemy(
+            entry, self._block_offset, self._slot_ix, value,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(self._slot_ix, value)
+
+    def redo(self) -> None:
+        self._apply(self._new_value)
+
+    def undo(self) -> None:
+        self._apply(self._old_value)
+
+
+class EditBattleBgCommand(QUndoCommand):
+    """Atomic edit of the ``D8 00 [bg]`` u16 inside a BATTLE block."""
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        new_bg_id: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod._parse_battle_at(entry, block_offset)
+        if prev is None:
+            raise ValueError(
+                f"no BATTLE block at entry {entry_ix:04d} +0x{block_offset:04x}"
+            )
+        self._old_value = prev.bg_id
+        self._new_value = int(new_bg_id) & 0xFFFF
+
+    def _apply(self, value: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_battle_bg(
+            entry, self._block_offset, value,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(value)
+
+    def redo(self) -> None:
+        self._apply(self._new_value)
+
+    def undo(self) -> None:
+        self._apply(self._old_value)
+
+
+class EditBattleMusicCommand(QUndoCommand):
+    """Atomic edit of the ``D9 00 [music]`` u16 inside a BATTLE block."""
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        new_music_id: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = entry_ix
+        self._block_offset = block_offset
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        prev = overlay5_mod._parse_battle_at(entry, block_offset)
+        if prev is None:
+            raise ValueError(
+                f"no BATTLE block at entry {entry_ix:04d} +0x{block_offset:04x}"
+            )
+        self._old_value = prev.music_id
+        self._new_value = int(new_music_id) & 0xFFFF
+
+    def _apply(self, value: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_battle_music(
+            entry, self._block_offset, value,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(value)
+
+    def redo(self) -> None:
+        self._apply(self._new_value)
+
+    def undo(self) -> None:
+        self._apply(self._old_value)
+
+
 # FAT path for BTCHR.PAK — duplicated here (also defined in btchr_browser)
 # so commands.py doesn't reach back into the UI layer.
 _BTCHR_PAK = "DAT/BTCHR.PAK"

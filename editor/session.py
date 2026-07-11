@@ -52,6 +52,31 @@ ELEMENT_SPR_INDEX: Dict[int, int] = {
     3: 0xa8,  # EARTH
 }
 
+
+@dataclass(frozen=True)
+class BattleLocation:
+    """One BATTLE occurrence of a specific enemy digimon in overlay5.
+
+    ``digimon_id`` is the enemy species id (same id space as
+    ``sprite_map`` — user-confirmed against Kokuwamon 0x21e in a Newton
+    fight). ``entry_ix`` + ``block_offset`` locate the ``DA 00`` block
+    in overlay5 for byte-level edits. ``chain_ix`` + ``source_entry_ix``
+    walk it back to the cutscene chain that owns the region — that's
+    what the enemy editor's "Appears in" list clicks through to.
+
+    ``map_id`` is derived from ``source_entry_ix`` via
+    :func:`overlay5.map_id_for`; ``None`` for chains that source from
+    non-map entries (systems / globals). ``area_name`` is resolved on
+    demand from :mod:`digimon_core.map_labels` — kept off the record
+    so a user-edited area name (future feature) doesn't stale-cache.
+    """
+    digimon_id: int
+    entry_ix: int
+    block_offset: int
+    chain_ix: int
+    source_entry_ix: int
+    map_id: Optional[int]
+
 # BTCHR sidecars: fixed-size 1660B each (415 × u32). Edits ride the byte
 # diff channel — no FAT resize needed because per-group writes are u32
 # in-place. Resolution happens against the post-sprite-splice ROM in
@@ -87,6 +112,10 @@ class RomSession:
     farm_terrains: List[model.FarmTerrain] = field(default_factory=list)
     starters: List[model.StarterEntry] = field(default_factory=list)
     wild_encounter_areas: List[model.WildEncounterArea] = field(default_factory=list)
+    # Per-field-map encounter assignments from DAT/ec/ENCTBL.BIN — 265
+    # entries, entry i == field map i. Maps each map to its wild-encounter
+    # area + battle background. See model.MapEncounterEntry.
+    map_encounter_table: List[model.MapEncounterEntry] = field(default_factory=list)
     equipment: Dict[int, model.Equipment] = field(default_factory=dict)
     consumables: List[model.Consumable] = field(default_factory=list)
     farm_items: List[model.FarmItem] = field(default_factory=list)
@@ -137,6 +166,31 @@ class RomSession:
     # positionally.
     _staged_bgm_additions: List[BgmSwap] = field(default_factory=list)
 
+    # User-editable friendly labels for BGM slots, keyed by the SET_MUSIC
+    # sequential array id (NOT ``bgm.bgm_id`` — see :mod:`digimon_core.
+    # sound.music_names` for why they can drift apart). ``bgm_label``
+    # falls back to ``music_names.music_name`` when a slot has no user
+    # override, so the sound editor's Label field shows the pinned name
+    # from research docs by default.
+    #
+    # Two persistence layers:
+    # * **App prefs** (per-user, per-ROM) — every ``set_bgm_label`` call
+    #   writes through to :mod:`editor.prefs` under
+    #   ``bgm_labels/<rom_sha256>/<music_id>``, so labels stick across
+    #   sessions even when the user just re-opens the ROM. Labels are
+    #   ROM-scoped since different ROMs (Dawn vs Dusk, or a modded
+    #   fork) don't share BGM slot semantics.
+    # * **Project file** (``bgm_label_edits`` channel, v10+) — bundles
+    #   labels with a shareable ``.romproj`` so distributing a project
+    #   carries its friendly names for reviewers who don't have the
+    #   author's prefs. Loading a .romproj's labels writes through to
+    #   prefs too, unifying the two stores.
+    _bgm_label_edits: Dict[int, str] = field(default_factory=dict)
+    # Cached ``vanilla_rom_sha256`` — computed lazily since the hash of
+    # the full ROM (16-64 MB) isn't free. Used to scope prefs keys so
+    # per-ROM label sets don't collide across the user's ROM library.
+    _rom_sha256_cache: Optional[str] = field(default=None)
+
     # Donor SDAT pane cache for the sound editor. Lives on the session
     # so it survives editor-widget teardown when the user navigates to
     # another editor and back. Not persisted to .romproj — it's a UI
@@ -178,6 +232,26 @@ class RomSession:
     # eager (single ~1s walk on first access, cached for session lifetime).
     # No invalidation today — chain topology is structural, not editable.
     _cutscene_index_cache: Optional[overlay5_cutscenes_mod.CutsceneIndex] = field(default=None)
+
+    # Lazy digimon_id → list of BATTLE occurrences across every cutscene
+    # region in overlay5. Enemies referenced by a ``DA 00 [enemies:5]``
+    # block share the same id space the base/enemy tables use, so this
+    # is what "which cutscenes does this enemy appear in?" reduces to.
+    # Built once on first access; the underlying BATTLE bytes are
+    # read-only in the current codec (splice paths preserve length), so
+    # additions to overlay5 don't need to invalidate the cache
+    # mid-session.
+    _battle_locations_cache: Optional[Dict[int, List[Any]]] = field(default=None)
+
+    # Lazy digimon_id → ascending list of wild-encounter area indices that
+    # place the species (the reverse of ``WildEncounterArea.encounters``).
+    # Unlike the BATTLE index above, wild encounters ARE editable, so the
+    # Wild Encounters editor drops this via ``invalidate_wild_area_index``
+    # whenever an encounter's digimon_id changes. ``_wild_area_labels_cache``
+    # holds the ``<Location> Area <n>`` display strings (structural — one
+    # per area, never invalidated within a session).
+    _wild_areas_by_digimon_cache: Optional[Dict[int, List[int]]] = field(default=None)
+    _wild_area_labels_cache: Optional[List[str]] = field(default=None)
 
     # Per-group edits to BTCHR/CHRSIZE.BIN and BTCHR/BTCHRSIZE.BIN. Both
     # files are fixed-size (1660B = 415 × u32) and never resize, so edits
@@ -430,6 +504,7 @@ class RomSession:
         session.farm_terrains = loaders.loadFarmTerrains(version, parse_data)
         session.starters = loaders.loadStarters(version, parse_data)
         session.wild_encounter_areas = loaders.loadWildEncounterAreas(version, parse_data, file_table=file_table)
+        session.map_encounter_table = loaders.loadMapEncounterTable(version, parse_data, file_table=file_table)
         session.equipment = loaders.loadEquipment(version, parse_data, file_table=file_table)
         session.consumables = loaders.loadConsumables(version, parse_data)
         session.farm_items = loaders.loadFarmItems(version, parse_data)
@@ -471,6 +546,12 @@ class RomSession:
         # open). Depends on the sprite-picker pool's holder, so order
         # matters — holder is created in _build_sprite_picker_pool.
         session._build_combo_pools()
+        # Hydrate user-edited BGM labels from app prefs so opening the
+        # same ROM in a fresh session re-picks up the friendly names
+        # the user typed last time. Runs after the SDAT parse pipeline
+        # is warm since ``_vanilla_rom_sha256`` needs ``original_rom_data``
+        # available (it is — set at cls(...) construction above).
+        session._hydrate_bgm_labels_from_prefs()
         return session
 
     def serialize_all(
@@ -521,6 +602,8 @@ class RomSession:
             obj.writeToRom(out)
         for area in self.wild_encounter_areas:
             area.writeToRom(out)
+        for entry in self.map_encounter_table:
+            entry.writeToRom(out)
         for obj in self.equipment.values():
             obj.writeToRom(out)
         for obj in self.consumables:
@@ -706,6 +789,169 @@ class RomSession:
                 self.overlay5_index(),
             )
         return self._cutscene_index_cache
+
+    def battle_locations_by_digimon(self) -> Dict[int, List[Any]]:
+        """digimon_id → list of BATTLE occurrences across overlay5.
+
+        Each occurrence is a :class:`BattleLocation` dataclass carrying
+        enough info to open the Cutscenes tab at the exact chain: the
+        entry + in-entry offset of the ``DA 00`` block, plus the
+        chain that owns the region (via reverse-lookup against
+        :meth:`cutscene_index`) and the chain's ``source_entry_ix``
+        so callers can resolve the map the player sees this battle on.
+
+        Built once and cached; subsequent calls are O(1). The cost is a
+        single pass over every cutscene region's bytes — ~100ms on the
+        vanilla corpus. Enemy-editor detail panels read through this to
+        surface "appears in Loop Swamp scene NN" cross-references.
+        """
+        if self._battle_locations_cache is None:
+            from digimon_core import overlay5 as ov5
+            cindex = self.cutscene_index()
+            # Reverse index: (entry_ix, region_rel) → first chain_ix
+            # that includes that region. Chains that share a region
+            # (rare) collapse to the first-in-order; the enemy editor
+            # only needs *a* chain that navigates to the battle, so
+            # ambiguity is harmless as long as the chosen chain
+            # renders the block.
+            region_to_chain: Dict[Tuple[int, int], int] = {}
+            for chain_ix, chain in enumerate(cindex.chains):
+                for region_key in chain.path:
+                    region_to_chain.setdefault(region_key, chain_ix)
+
+            out: Dict[int, List[Any]] = {}
+            for (entry_ix, rel), region in cindex.regions.items():
+                entry_bytes = self.overlay5_entry_bytes(entry_ix)
+                events, _unknowns = ov5.iter_region_events_with_meta(
+                    entry_bytes, rel, region.end_rel,
+                )
+                for ev in events:
+                    if ev.kind != ov5.EVENT_KIND_BATTLE:
+                        continue
+                    battle = ev.payload
+                    chain_ix = region_to_chain.get((entry_ix, rel), -1)
+                    source_entry_ix = (
+                        cindex.chains[chain_ix].source_entry_ix
+                        if chain_ix >= 0 else entry_ix
+                    )
+                    map_id = ov5.map_id_for(source_entry_ix)
+                    for enemy_id in battle.enemies:
+                        eid = int(enemy_id) & 0xFFFF
+                        if eid == ov5.BATTLE_ENEMY_EMPTY:
+                            continue
+                        out.setdefault(eid, []).append(BattleLocation(
+                            digimon_id=eid,
+                            entry_ix=int(entry_ix),
+                            block_offset=int(ev.rel),
+                            chain_ix=int(chain_ix),
+                            source_entry_ix=int(source_entry_ix),
+                            map_id=map_id,
+                        ))
+            # Deterministic order per digimon so the UI list doesn't
+            # jitter across sessions: sort by (map_id, entry_ix, offset)
+            # with unmapped locations last.
+            for locations in out.values():
+                locations.sort(key=lambda loc: (
+                    (loc.map_id if loc.map_id is not None else 10_000),
+                    loc.entry_ix,
+                    loc.block_offset,
+                ))
+            self._battle_locations_cache = out
+        return self._battle_locations_cache
+
+    def first_battle_location(
+        self, digimon_id: int,
+    ) -> Optional["BattleLocation"]:
+        """Convenience: the earliest BATTLE location for ``digimon_id``,
+        or ``None`` when the digimon isn't referenced by any cutscene.
+
+        "First" follows the order locked in by
+        :meth:`battle_locations_by_digimon` — sorted by
+        ``(map_id, entry_ix, block_offset)`` with unmapped locations
+        last, so it's the lowest-numbered map on which the enemy shows
+        up. Used by the enemy editor's list column so users can spot
+        which enemies have scripted battles at a glance and jump to
+        one directly.
+        """
+        locs = self.battle_locations_by_digimon().get(int(digimon_id) & 0xFFFF)
+        if not locs:
+            return None
+        return locs[0]
+
+    def map_encounter_entry(self, map_id: int) -> Optional["model.MapEncounterEntry"]:
+        """The ``MapEncounterEntry`` for field map ``map_id`` (entry index
+        == map id), or ``None`` when out of range / table absent."""
+        if 0 <= map_id < len(self.map_encounter_table):
+            return self.map_encounter_table[map_id]
+        return None
+
+    def maps_using_area(self, area_index: int) -> List[int]:
+        """Field-map ids whose encounter entry points at ``area_index``.
+
+        The reverse of :meth:`map_encounter_entry`'s area field — used by
+        the Wild Encounters editor to show which maps a given area governs.
+        Areas 0 / 1 are the Shine/Dark-side dummies shared by every
+        encounters-disabled town, so they resolve to a long list; callers
+        may want to note that.
+        """
+        return [
+            e.map_id for e in self.map_encounter_table
+            if e.area_index == area_index
+        ]
+
+    def wild_areas_by_digimon(self) -> Dict[int, List[int]]:
+        """digimon_id → ascending list of wild-encounter area indices that
+        list the species.
+
+        Each area appears at most once per digimon even when it stocks the
+        same species in several encounter slots. Built once and cached; the
+        Wild Encounters editor calls :meth:`invalidate_wild_area_index`
+        after any encounter edit since it's the only surface that can
+        reassign an encounter's digimon_id.
+        """
+        if self._wild_areas_by_digimon_cache is None:
+            out: Dict[int, List[int]] = {}
+            for area_ix, area in enumerate(self.wild_encounter_areas):
+                seen: Set[int] = set()
+                for enc in area.encounters:
+                    did = int(enc.digimon_id)
+                    if did == 0 or did in seen:
+                        continue
+                    seen.add(did)
+                    out.setdefault(did, []).append(area_ix)
+            self._wild_areas_by_digimon_cache = out
+        return self._wild_areas_by_digimon_cache
+
+    def first_wild_area(self, digimon_id: int) -> Optional[int]:
+        """Lowest wild-encounter area index that lists ``digimon_id``, or
+        ``None`` when the species isn't placed in any area."""
+        areas = self.wild_areas_by_digimon().get(int(digimon_id))
+        if not areas:
+            return None
+        return areas[0]
+
+    def wild_encounter_area_labels(self) -> List[str]:
+        """Cached ``<Location> Area <n>`` labels, one per wild-encounter
+        area (see :func:`loaders.buildWildAreaLabels`). Structural — the
+        area count and their locations don't change within a session."""
+        if self._wild_area_labels_cache is None:
+            self._wild_area_labels_cache = loaders.buildWildAreaLabels(
+                len(self.wild_encounter_areas)
+            )
+        return self._wild_area_labels_cache
+
+    def wild_encounter_area_label(self, area_index: int) -> str:
+        """Friendly label for one area index; bare ``Area <n>`` fallback
+        when the index is out of range."""
+        labels = self.wild_encounter_area_labels()
+        if 0 <= area_index < len(labels):
+            return labels[area_index]
+        return f"Area {area_index}"
+
+    def invalidate_wild_area_index(self) -> None:
+        """Drop the wild-encounter reverse index so the next access
+        rebuilds it. Call after editing any wild encounter's digimon_id."""
+        self._wild_areas_by_digimon_cache = None
 
     def overlay5_entry_bytes(self, entry_ix: int) -> bytes:
         """Bytes for overlay5 entry ``entry_ix`` — dirty cache first,
@@ -2321,6 +2567,117 @@ class RomSession:
                 swar_bytes=bytes(swar),
                 trimmed_total_bytes=len(sseq) + len(sbnk) + len(swar),
             ))
+
+    # ---- BGM friendly labels --------------------------------------------
+
+    def _vanilla_rom_sha256(self) -> str:
+        """SHA-256 hex of the vanilla ROM bytes — key for prefs-scoped
+        BGM labels.
+
+        Different ROMs (Dawn vs Dusk, or a modded/patched build) don't
+        share BGM slot semantics, so labels are keyed per-ROM to avoid
+        one game's names leaking into another's editor.
+        """
+        if self._rom_sha256_cache is None:
+            import hashlib
+            self._rom_sha256_cache = hashlib.sha256(
+                self.original_rom_data
+            ).hexdigest()
+        return self._rom_sha256_cache
+
+    def _bgm_label_prefs_key(self, music_id: int) -> str:
+        return (
+            f"bgm_labels/{self._vanilla_rom_sha256()}/"
+            f"{int(music_id) & 0xFFFF:04x}"
+        )
+
+    def _hydrate_bgm_labels_from_prefs(self) -> None:
+        """Pull every saved label for this ROM out of ``editor.prefs``.
+
+        Called once from :classmethod:`_build` so a freshly-loaded ROM
+        re-picks up the labels the user typed the last time they opened
+        it, even when no .romproj is involved.
+        """
+        try:
+            from . import prefs as prefs_mod
+            settings = prefs_mod.prefs()
+        except Exception:  # noqa: BLE001 — tests / headless can lack prefs
+            return
+        prefix = f"bgm_labels/{self._vanilla_rom_sha256()}"
+        settings.beginGroup(prefix)
+        try:
+            for key in settings.childKeys():
+                try:
+                    music_id = int(key, 16)
+                except ValueError:
+                    continue
+                raw = settings.value(key)
+                if isinstance(raw, str) and raw.strip():
+                    self._bgm_label_edits[music_id & 0xFFFF] = raw
+        finally:
+            settings.endGroup()
+
+    def _persist_bgm_label(self, music_id: int, label: str) -> None:
+        """Write ``music_id → label`` through to prefs (empty = delete)."""
+        try:
+            from . import prefs as prefs_mod
+            settings = prefs_mod.prefs()
+        except Exception:  # noqa: BLE001
+            return
+        key = self._bgm_label_prefs_key(music_id)
+        if label:
+            settings.setValue(key, label)
+        else:
+            settings.remove(key)
+
+    def bgm_label(self, music_id: int) -> str:
+        """Resolve the user-facing label for a BGM slot (SET_MUSIC array id).
+
+        Returns the user's override if one is staged; otherwise falls
+        back to :func:`music_names.music_name` (the pinned research-doc
+        name, or the ``bgmNN`` placeholder for ids past the table).
+        """
+        from digimon_core.sound import music_names
+        override = self._bgm_label_edits.get(int(music_id) & 0xFFFF)
+        return music_names.default_music_label(int(music_id) & 0xFFFF, override)
+
+    def set_bgm_label(self, music_id: int, label: str) -> None:
+        """Stage a friendly-label override for the BGM at ``music_id``.
+
+        Empty or whitespace-only labels drop any prior override so the
+        Label field snaps back to the pinned research-doc default.
+        Writes through to :mod:`editor.prefs` immediately so labels
+        survive across sessions (keyed by ROM sha256 so different
+        ROMs get their own label sets). ROM save has nothing to do
+        with these — the ROM itself doesn't carry labels.
+        """
+        key = int(music_id) & 0xFFFF
+        text = (label or "").strip()
+        if text:
+            self._bgm_label_edits[key] = text
+        else:
+            self._bgm_label_edits.pop(key, None)
+        self._persist_bgm_label(key, text)
+
+    def bgm_label_edits(self) -> List[Tuple[int, str]]:
+        """Snapshot staged label overrides for the .romproj channel.
+
+        Sorted by ``music_id`` so project files diff cleanly across
+        edits — labels are keyed the same on save/load, so a stable
+        order avoids spurious diffs when the same edits are re-emitted.
+        """
+        return sorted(self._bgm_label_edits.items())
+
+    def apply_bgm_label_edits(self, edits: List[Tuple[int, str]]) -> None:
+        """Replay staged label overrides from a .romproj on load.
+
+        Each edit round-trips through :meth:`set_bgm_label` so the
+        prefs write-through fires — opening a shared .romproj enrolls
+        its labels into the local user's prefs too, keeping the two
+        stores in sync.
+        """
+        for music_id, label in edits:
+            self.set_bgm_label(int(music_id) & 0xFFFF, label)
 
     def set_sound_donor(
         self, path: str, data: bytes, rows: List[Any],

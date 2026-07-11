@@ -43,8 +43,8 @@ def _quest_name(ix: int) -> str:
     return "<unnamed>"
 
 
-def _record_label(ix: int, rec: model.QuestData) -> str:
-    return f"Quest {ix:03d}  ({rec.quest_stars}★)  {_quest_name(ix)}"
+def _record_columns(ix: int, rec: model.QuestData):
+    return (f"{ix:03d}", f"{rec.quest_stars}★", _quest_name(ix))
 
 
 class QuestEditor(QWidget):
@@ -64,7 +64,10 @@ class QuestEditor(QWidget):
         self._current_ix: int = -1
         self._all_widgets: List[object] = []  # everything supporting rebind/refresh
 
-        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
+        self._list_panel = RecordListPanel(
+            records, dirty_aware=True,
+            columns_for=_record_columns, headers=("Quest", "★", "Name"),
+        )
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()
@@ -228,8 +231,7 @@ class QuestEditor(QWidget):
     def _refresh_list_label(self) -> None:
         if not (0 <= self._current_ix < len(self._records)):
             return
-        target = self._records[self._current_ix]
-        self._list_panel.refresh_label(self._current_ix, _record_label(self._current_ix, target))
+        self._list_panel.refresh_label(self._current_ix)
 
     @staticmethod
     def _title_for(ix: int, target: model.QuestData) -> str:

@@ -152,6 +152,28 @@ def getLocationForAreaIndex(area_index: int) -> str:
     return constants.LOCATION_OFFSETS_TO_NAMES[location_offset]
 
 
+def buildWildAreaLabels(num_areas: int) -> List[str]:
+    """Label each wild-encounter area as ``<Location> Area <n>``.
+
+    ``n`` resets to 1 at each new location, so areas read as "Login
+    Mountain Area 1", "Login Mountain Area 2", … The single source of
+    truth shared by the Wild Encounters editor, the enemy editor's
+    cross-references, and the footer validator so all three agree.
+    """
+    labels: List[str] = []
+    last_location = ""
+    counter = 0
+    for ix in range(num_areas):
+        location = getLocationForAreaIndex(ix)
+        if location != last_location:
+            counter = 1
+            last_location = location
+        else:
+            counter += 1
+        labels.append(f"{location} Area {counter}")
+    return labels
+
+
 # ---- model-table loaders -----------------------------------------------------
 
 def loadBaseDigimonInfo(
@@ -497,6 +519,45 @@ def loadWildEncounterAreas(
         file_start, file_end = table.resolve(path)
         file_bytes = bytes(rom_data[file_start:file_end])
         out.append(model.WildEncounterArea(file_bytes, file_start))
+    return out
+
+
+# Field-map count in ENCTBL.BIN (maps 0..264); a trailing all-FFFF
+# terminator entry follows and is not loaded.
+MAP_ENCOUNTER_COUNT = 265
+
+
+def loadMapEncounterTable(
+    version: str,
+    rom_data: bytearray,
+    file_table: Optional[fnt.FileTable] = None,
+) -> List[model.MapEncounterEntry]:
+    """Parse ``DAT/ec/ENCTBL.BIN`` — the per-field-map encounter table.
+
+    265 fixed 8-byte entries, entry ``i`` == field map ``i``. Each assigns
+    the map a wild-encounter area + battle background (+ two still-undecoded
+    params). See ``model.MapEncounterEntry`` /
+    ``research_docs/claude_notes/map_encounter_table.md``. Returns an empty
+    list when ENCTBL.BIN isn't present (non-DWDD ROM / stripped build)."""
+    del version
+    table = _table(rom_data, file_table)
+    enctbl_path = None
+    for path in _iter_dir_files(table, "DAT/EC/E"):
+        if path.endswith("/ENCTBL.BIN"):
+            enctbl_path = path
+            break
+    if enctbl_path is None:
+        return []
+    file_start, file_end = table.resolve(enctbl_path)
+    out: List[model.MapEncounterEntry] = []
+    size = model.MapEncounterEntry.SIZE
+    for map_id in range(MAP_ENCOUNTER_COUNT):
+        eoff = file_start + map_id * size
+        if eoff + size > file_end:
+            break
+        out.append(model.MapEncounterEntry(
+            rom_data[eoff:eoff + size], eoff, map_id=map_id,
+        ))
     return out
 
 

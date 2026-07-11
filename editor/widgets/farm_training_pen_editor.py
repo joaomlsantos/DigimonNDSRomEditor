@@ -50,8 +50,8 @@ def _pen_name(ix: int) -> str:
     return f"<training pen {ix}>"
 
 
-def _record_label(ix: int, _rec: model.FarmTrainingPen) -> str:
-    return f"{ix:02d}  {_pen_name(ix)}"
+def _record_columns(ix: int, _rec: model.FarmTrainingPen):
+    return (f"{ix:02d}", _pen_name(ix))
 
 
 class FarmTrainingPenEditor(QWidget):
@@ -80,7 +80,10 @@ class FarmTrainingPenEditor(QWidget):
             except Exception:
                 self._chr_pak = self._pal_pak = self._cel_pak = None
 
-        self._list_panel = RecordListPanel(records, _record_label, dirty_aware=True)
+        self._list_panel = RecordListPanel(
+            records, dirty_aware=True,
+            columns_for=_record_columns, headers=("#", "Pen"),
+        )
         self._list_panel.indexSelected.connect(self._on_selection)
 
         self._detail = self._build_detail_container()

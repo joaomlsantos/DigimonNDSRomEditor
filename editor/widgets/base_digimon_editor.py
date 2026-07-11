@@ -37,7 +37,7 @@ from .form_helpers import (
     move_choices,
     trait_choices,
 )
-from .sprite_map_row import SpriteMapRow, displayed_as_suffix
+from .sprite_map_row import SpriteMapRow, displayed_as_name, displayed_as_suffix
 
 
 # Game-engine caps enforced by the level-up routine (see research_docs/
@@ -167,7 +167,8 @@ class BaseDigimonEditor(QWidget):
                 # user can tell at a glance which rows carry live data.
                 self._list_panel = DigimonListPanel(
                     entries,
-                    label_for=self._list_label_for,
+                    columns_for=self._list_columns_for,
+                    headers=("ID", "Name", "Displayed as"),
                     dirty_aware=True,
                     dim_for=lambda did: not bool(
                         getattr(entries.get(did), "is_scannable", 0)
@@ -625,22 +626,23 @@ class BaseDigimonEditor(QWidget):
                 f"{diverge}/{len(PROGRESSION_STATS)} stats diverge from base"
             )
 
-    def _list_label_for(self, digimon_id: int) -> str:
-        """Decorate the left-pane label with a [displayed-as] suffix.
+    def _list_columns_for(self, digimon_id: int):
+        """Return the ``(id, name, displayed-as)`` column strings for a row.
 
-        Same logic as the enemy editor — surfaces reskinned slots at a
-        glance. For base species ids the suffix usually matches the
-        entry's own name; if the slot has been reskinned (or carries
-        an unmapped sprite), it diverges.
+        Rendered as real QTreeView columns by :class:`DigimonListPanel`
+        — no monospace padding, columns size to content and scroll
+        horizontally when the pane is narrow. The "Displayed as" column
+        is empty for unreskinned slots (the common case) and carries
+        the reskin target's name otherwise.
         """
         own_name = self._session.digimon_display_name(digimon_id)
         sprite_row = getattr(self, "_sprite_row", None)
         sprite_to_base = sprite_row.sprite_to_base if sprite_row else {}
-        suffix = displayed_as_suffix(
+        disp = displayed_as_name(
             self._sprite_map, sprite_to_base, digimon_id, own_name,
             name_resolver=self._session.digimon_display_name,
         )
-        return f"0x{digimon_id:03x} — {own_name}{suffix}"
+        return (f"0x{digimon_id:03x}", own_name, disp)
 
     def _refresh_list_label_for_current(self, _index: int = 0) -> None:
         if self._current_id < 0:

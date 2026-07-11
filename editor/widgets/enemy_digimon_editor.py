@@ -17,12 +17,13 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from digimon_core import constants, model
+from digimon_core import constants, map_labels, model
 from digimon_core.stat_progression import (
     PROGRESSION_STATS,
     ProgressionMode,
@@ -45,7 +46,7 @@ from .form_helpers import (
     trait_choices,
     wrap_in_scroll,
 )
-from .sprite_map_row import SpriteMapRow, displayed_as_suffix
+from .sprite_map_row import SpriteMapRow, displayed_as_name, displayed_as_suffix
 
 
 # Enemy stats often legitimately exceed the engine caps that the base
@@ -156,12 +157,16 @@ class EnemyDigimonEditor(QWidget):
                 base_records = session.base_digimon
                 self._list_panel = DigimonListPanel(
                     entries,
-                    label_for=self._list_label_for,
+                    columns_for=self._list_columns_for,
+                    # Leading (unlabeled) column carries the 🌿/⚔ encounter
+                    # icons; id stays the numeric sort/marker column at index 1.
+                    headers=("", "ID", "Name", "Displayed as", "Encounter"),
+                    id_column=1,
                     dirty_aware=True,
                     mark_for=lambda did: bool(
                         getattr(base_records.get(did), "is_scannable", 0)
                     ),
-                    legend="▸ = Wild Encounter slot (Scannable on base)",
+                    legend="▸ = Wild Encounter slot  ·  🌿 = wild area  ·  ⚔ = scripted event",
                 )
             self._list_panel.digimonSelected.connect(self._on_selection)
 
@@ -220,10 +225,63 @@ class EnemyDigimonEditor(QWidget):
         self._id_spin = BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True)
         self._species_combo = BoundEnumCombo(first, "species", model.Species, self._undo_stack)
 
+        # Identity box carries the id/species form on the left and two
+        # cross-reference lists on the right — where this enemy shows up in
+        # wild encounter areas and in scripted events — so short editor rows
+        # (id + species) don't waste the horizontal space they leave empty,
+        # and the cross-references live near the id that indexes them.
         identity_box = QGroupBox("Identity")
-        identity_form = make_form(identity_box)
+        identity_row = QHBoxLayout(identity_box)
+        identity_row.setContentsMargins(6, 4, 6, 4)
+        identity_row.setSpacing(12)
+
+        identity_form_wrap = QWidget()
+        identity_form = make_form(identity_form_wrap)
         identity_form.addRow("ID", self._id_spin)
         identity_form.addRow("Species", self._species_combo)
+        identity_row.addWidget(identity_form_wrap, 1)
+
+        # Right side — two side-by-side cross-reference sections, each
+        # populated per-selection and capped by a scroll wrapper so an enemy
+        # with many occurrences doesn't stretch the Identity box past the id
+        # form on the left; short lists render inline without a scrollbar.
+        appears_wrap = QWidget()
+        appears_layout = QHBoxLayout(appears_wrap)
+        appears_layout.setContentsMargins(0, 0, 0, 0)
+        appears_layout.setSpacing(12)
+
+        def _appears_section(title: str, link_slot) -> Tuple[QWidget, QLabel]:
+            col = QWidget()
+            col_layout = QVBoxLayout(col)
+            col_layout.setContentsMargins(0, 0, 0, 0)
+            col_layout.setSpacing(2)
+            col_layout.addWidget(QLabel(f"<b>{title}</b>"))
+            label = QLabel()
+            label.setTextFormat(Qt.RichText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            label.linkActivated.connect(link_slot)
+            label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            scroll = QScrollArea()
+            scroll.setWidget(label)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.NoFrame)
+            scroll.setMaximumHeight(90)
+            col_layout.addWidget(scroll, 1)
+            return col, label
+
+        # Side-by-side: wild-area links (from ``session.wild_areas_by_
+        # digimon()``) on the left, scripted-event BATTLE occurrences
+        # (from ``session.battle_locations_by_digimon()``) on the right.
+        wild_col, self._wild_appears_label = _appears_section(
+            "Appears in Wild Encounters", self._on_wild_appears_link,
+        )
+        scripted_col, self._appears_in_label = _appears_section(
+            "Appears in scripted events", self._on_appears_in_link,
+        )
+        appears_layout.addWidget(wild_col, 1)
+        appears_layout.addWidget(scripted_col, 1)
+        identity_row.addWidget(appears_wrap, 2)
 
         with span("SpriteMapRow"):
             self._sprite_row = SpriteMapRow(
@@ -397,6 +455,153 @@ class EnemyDigimonEditor(QWidget):
         self._refresh_exp_total()
         self._refresh_expected_stats()
         self._refresh_base_resistances()
+        self._refresh_wild_appears(digimon_id)
+        self._refresh_appears_in(digimon_id)
+
+    def _refresh_wild_appears(self, digimon_id: int) -> None:
+        """Populate the 'Appears in Wild Encounters' section for ``digimon_id``.
+
+        One clickable link per wild-encounter area that stocks this
+        species; each jumps the Wild Encounters editor to that area.
+        Areas are listed in ascending index order (the order locked in
+        by :meth:`session.wild_areas_by_digimon`).
+        """
+        try:
+            area_ixs = self._session.wild_areas_by_digimon().get(digimon_id, [])
+        except Exception:  # noqa: BLE001 — headless / partial sessions
+            area_ixs = []
+        if not area_ixs:
+            self._wild_appears_label.setText(
+                "<span style='color:#888;'><i>Not found in any wild "
+                "encounter area.</i></span>"
+            )
+            return
+        parts: List[str] = []
+        for area_ix in area_ixs:
+            label = self._session.wild_encounter_area_label(area_ix)
+            parts.append(
+                f"<div><a href='wild:{area_ix}' "
+                "style='color:#4a9bd8;text-decoration:none;'>"
+                f"🌿 {label}</a></div>"
+            )
+        self._wild_appears_label.setText("".join(parts))
+
+    def _on_wild_appears_link(self, href: str) -> None:
+        """Dispatch a ``wild:AREA_IX`` link to the main window's Wild
+        Encounters navigation. Silently no-ops on a malformed link or a
+        harness that doesn't expose the navigation method."""
+        if not href.startswith("wild:"):
+            return
+        try:
+            area_ix = int(href[len("wild:"):])
+        except ValueError:
+            return
+        nav = getattr(self.window(), "navigate_to_wild_area", None)
+        if nav is None:
+            return
+        nav(area_ix)
+
+    def _refresh_appears_in(self, digimon_id: int) -> None:
+        """Populate the 'Appears in scripted events' section for ``digimon_id``.
+
+        Each BATTLE occurrence renders as a clickable link that jumps
+        the map browser to the exact chain. Rows are grouped by map
+        (via the chain's ``source_entry_ix`` → ``map_id_for``) so a
+        digimon that appears N times on one map reads as a single
+        map name with the block-offset annotations trailing behind.
+        """
+        try:
+            locations = self._session.battle_locations_by_digimon().get(
+                digimon_id, [],
+            )
+        except Exception:  # noqa: BLE001 — headless tests / partial sessions
+            locations = []
+        if not locations:
+            self._appears_in_label.setText(
+                "<span style='color:#888;'><i>Not referenced in any "
+                "scripted event.</i></span>"
+            )
+            return
+
+        # Group by (map_id, source_entry_ix) so multiple battles in the
+        # same scripted chain read as one anchor with follow-up offsets.
+        # Ordering preserves the sort locked in during the index build
+        # (map_id ascending, then entry_ix, then offset), so groups
+        # appear in map order.
+        parts: List[str] = []
+        current_key = None
+        for loc in locations:
+            key = (loc.map_id, loc.source_entry_ix)
+            if key != current_key:
+                current_key = key
+                if loc.map_id is not None:
+                    area = map_labels.area_name(loc.map_id)
+                    map_hdr = (
+                        f"<b>Map {loc.map_id}</b> — {area}"
+                        if area else f"<b>Map {loc.map_id}</b>"
+                    )
+                else:
+                    map_hdr = (
+                        f"<b>(non-map)</b> "
+                        f"<span style='color:#888;'>entry "
+                        f"{loc.source_entry_ix:04d}</span>"
+                    )
+                # Leading blank line separator between groups (except
+                # the first one) so the list scans by map at a glance.
+                if parts:
+                    parts.append("<br/>")
+                parts.append(f"<div>{map_hdr}</div>")
+            # Only offer a click-target when we have a real chain to
+            # navigate to; unresolved chains (-1) leave the link out
+            # so the row still shows the location for reference.
+            href_target = (
+                f"cutscene:{loc.map_id}/{loc.chain_ix}"
+                if loc.chain_ix >= 0 and loc.map_id is not None
+                else ""
+            )
+            offset_txt = f"entry {loc.entry_ix:04d} +0x{loc.block_offset:04x}"
+            if href_target:
+                parts.append(
+                    f"<div style='margin-left:12px;'>"
+                    f"<a href='{href_target}' "
+                    "style='color:#4a9bd8;text-decoration:none;'>"
+                    "Open cutscene</a>"
+                    f" <span style='color:#888;'>"
+                    f"({offset_txt})</span></div>"
+                )
+            else:
+                parts.append(
+                    f"<div style='margin-left:12px; color:#888;'>"
+                    f"{offset_txt}</div>"
+                )
+        self._appears_in_label.setText("".join(parts))
+
+    def _on_appears_in_link(self, href: str) -> None:
+        """Dispatch a ``cutscene:MAP/CHAIN`` link back to main_window.
+
+        The bulk of the navigation lives on ``MainWindow`` (it owns
+        the editor stack + the "highlight nav row" side effects), so
+        this handler is a thin bridge that parses the link and calls
+        the top-level API. Silently no-ops when the link is malformed
+        or the main window doesn't provide the navigation method
+        (headless tests, stripped-down harnesses).
+        """
+        if not href.startswith("cutscene:"):
+            return
+        try:
+            map_id_str, chain_ix_str = href[len("cutscene:"):].split("/", 1)
+            map_id = int(map_id_str)
+            chain_ix = int(chain_ix_str)
+        except (ValueError, IndexError):
+            return
+        # Walk up to the main window through the widget parent chain —
+        # the enemy editor doesn't get a direct reference at
+        # construction time.
+        w = self.window()
+        nav = getattr(w, "navigate_to_cutscene_chain", None)
+        if nav is None:
+            return
+        nav(map_id, chain_ix)
 
     def _refresh_form(self, _index: int) -> None:
         target = self._entries.get(self._current_id)
@@ -422,6 +627,13 @@ class EnemyDigimonEditor(QWidget):
             spin.refresh()
         self._refresh_exp_total()
         self._refresh_expected_stats()
+        # Keep the cross-reference lists in sync when undo/redo swaps
+        # around — the digimon_id itself doesn't change here, but the
+        # caches are deterministic so re-rendering is cheap (dict lookup
+        # + a few string joins).
+        if self._current_id >= 0:
+            self._refresh_wild_appears(self._current_id)
+            self._refresh_appears_in(self._current_id)
         self._refresh_base_resistances()
 
     def _refresh_exp_total(self) -> None:
@@ -497,26 +709,66 @@ class EnemyDigimonEditor(QWidget):
             else:
                 label.setStyleSheet("")
 
-    def _list_label_for(self, digimon_id: int) -> str:
-        """Decorate the left-pane label.
+    def _list_columns_for(self, digimon_id: int):
+        """Return the ``(icons, id, name, displayed-as, encounter)`` column
+        strings for a row.
 
-        Every id with a sprite-map slot picks up a ``[displayed-as]``
-        suffix derived from the slot's ``main_sprite`` via the reverse
-        sprite-map lookup — so the user can see at a glance which sprite
-        each entry actually renders as. For wild-encounter ids the
-        suffix usually matches the entry's own name; for reskinned
-        fixed enemies it diverges.
+        Rendered as real QTreeView columns by :class:`DigimonListPanel`.
+        The leading icon column shows 🌿 when the species is stocked in
+        at least one wild-encounter area and ⚔ when it appears in at
+        least one scripted (BATTLE) event — both when both apply. The
+        Encounter column names the first wild area, falling back to the
+        first scripted-event area when there's no wild data. Both are
+        read-only at-a-glance cues; the detail form's "Appears in …"
+        links are how the user actually jumps to a location.
         """
         own_name = self._session.digimon_display_name(digimon_id)
-        # _build_detail_container() creates _sprite_row, but the list panel
-        # asks for labels before that — guard against the bootstrap call.
         sprite_row = getattr(self, "_sprite_row", None)
         sprite_to_base = sprite_row.sprite_to_base if sprite_row else {}
-        suffix = displayed_as_suffix(
+        disp = displayed_as_name(
             self._sprite_map, sprite_to_base, digimon_id, own_name,
             name_resolver=self._session.digimon_display_name,
         )
-        return f"0x{digimon_id:03x} — {own_name}{suffix}"
+        wild_label = self._wild_area_label(digimon_id)
+        scripted_label = self._scripted_area_label(digimon_id)
+        icons = ("🌿" if wild_label else "") + ("⚔" if scripted_label else "")
+        encounter = wild_label or scripted_label
+        return (icons, f"0x{digimon_id:03x}", own_name, disp, encounter)
+
+    def _wild_area_label(self, digimon_id: int) -> str:
+        """Name of the first wild-encounter area that stocks this species,
+        or empty string when it isn't in any area. Reads through the lazily
+        built + cached ``session.wild_areas_by_digimon`` index."""
+        try:
+            area_ix = self._session.first_wild_area(digimon_id)
+        except Exception:  # noqa: BLE001 — headless / partial sessions
+            return ""
+        if area_ix is None:
+            return ""
+        return self._session.wild_encounter_area_label(area_ix)
+
+    def _scripted_area_label(self, digimon_id: int) -> str:
+        """Area name of the first scripted (BATTLE) event this species
+        appears in — ``entry NNNN`` for non-map locations — or empty
+        string otherwise.
+
+        Reads through :meth:`session.first_battle_location`; the cutscene
+        index is lazily built and cached, so this fires per label without
+        re-walking overlay5. Failures degrade silently to no tag rather
+        than blocking the list from rendering.
+        """
+        try:
+            loc = self._session.first_battle_location(digimon_id)
+        except Exception:  # noqa: BLE001 — headless / partial sessions
+            return ""
+        if loc is None:
+            return ""
+        if loc.map_id is not None:
+            area = map_labels.area_name(loc.map_id)
+            if area and area != "?":
+                return area
+            return f"map {loc.map_id}"
+        return f"entry {loc.source_entry_ix:04d}"
 
     def _refresh_list_label_for_current(self, _index: int = 0) -> None:
         if self._current_id < 0:

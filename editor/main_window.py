@@ -756,6 +756,10 @@ class MainWindow(QMainWindow):
             # Staged "Add As New Entry" additions; positional, applied
             # in list order by the same SDAT splice path.
             session.apply_bgm_addition_edits(project.get("bgm_addition_edits", []))
+            # User-editable BGM slot labels — pure UI metadata (the ROM
+            # itself doesn't carry them), so this replays into the
+            # session's override dict without touching any splice path.
+            session.apply_bgm_label_edits(project.get("bgm_label_edits", []))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Failed to load project", str(exc))
             return
@@ -813,6 +817,7 @@ class MainWindow(QMainWindow):
                 overlay5_entry_edits=self.session.overlay5_entry_edits(),
                 bgm_swap_edits=self.session.bgm_swap_edits(),
                 bgm_addition_edits=self.session.bgm_addition_edits(),
+                bgm_label_edits=self.session.bgm_label_edits(),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Failed to save project", str(exc))
@@ -1262,6 +1267,44 @@ class MainWindow(QMainWindow):
         self._highlight_nav_row("digivolution_trees")
         if hasattr(widget, "select_by_id"):
             widget.select_by_id(digimon_id)
+
+    def navigate_to_wild_area(self, area_index: int) -> None:
+        """Map browser Encounters tab → Wild Encounters editor at
+        ``area_index`` (the wild-encounter-area list index)."""
+        widget = self._build_editor_for("wild_encounter_areas")
+        if widget is None:
+            return
+        self.set_content(widget)
+        self._highlight_nav_row("wild_encounter_areas")
+        if hasattr(widget, "select_by_id"):
+            widget.select_by_id(area_index)
+
+    def navigate_to_map_encounters(self, map_id: int) -> None:
+        """Wild Encounters editor "Used by maps" link → the field-map
+        browser's Encounters tab at ``map_id``."""
+        widget = self._build_editor_for("map_browser")
+        if widget is None:
+            return
+        self.set_content(widget)
+        self._highlight_nav_row("map_browser")
+        widget.navigate_to_map_encounters(map_id)
+
+    def navigate_to_cutscene_chain(self, map_id: int, chain_ix: int) -> None:
+        """Open the field-map browser at ``map_id`` on the Cutscenes tab,
+        with the chain at global ``chain_ix`` selected.
+
+        Called from the enemy digimon editor's "Appears in scripted events"
+        cross-reference links. ``chain_ix`` is the position in
+        ``session.cutscene_index().chains`` (not the sorted per-map
+        subset the tab uses internally) — the MapBrowser handles the
+        translation so callers don't need to know about the sort order.
+        """
+        widget = self._build_editor_for("map_browser")
+        if widget is None:
+            return
+        self.set_content(widget)
+        self._highlight_nav_row("map_browser")
+        widget.navigate_to_cutscene_chain(map_id, chain_ix)
 
     def navigate_to_encounter_reward(self, slot_index: int) -> None:
         """Wild-encounter reward_slot → open the encounter-rewards editor at

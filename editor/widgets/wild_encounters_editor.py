@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from digimon_core import loaders, model
+from digimon_core import loaders, map_labels, model
 
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
@@ -39,18 +39,7 @@ from .record_list_panel import RecordListPanel
 def _build_area_labels(version: str, areas: List[model.WildEncounterArea]) -> List[str]:
     """Label each area as `<Location> Area <n>` with n resetting per location."""
     del version
-    labels: List[str] = []
-    last_location: str = ""
-    counter = 0
-    for ix, _area in enumerate(areas):
-        location = loaders.getLocationForAreaIndex(ix)
-        if location != last_location:
-            counter = 1
-            last_location = location
-        else:
-            counter += 1
-        labels.append(f"{location} Area {counter}")
-    return labels
+    return loaders.buildWildAreaLabels(len(areas))
 
 
 class _EncounterRow:
@@ -106,8 +95,13 @@ class WildEncountersEditor(QWidget):
 
         self._list_panel = RecordListPanel(
             areas,
-            lambda ix, _rec: self._labels[ix],
             dirty_aware=True,
+            columns_for=lambda ix, area: (
+                f"{ix:03d}",
+                self._labels[ix],
+                str(len(area.encounters)),
+            ),
+            headers=("#", "Area", "Encounters"),
         )
         self._list_panel.indexSelected.connect(self._on_selection)
 
@@ -147,6 +141,19 @@ class WildEncountersEditor(QWidget):
         self._enc_layout.setHorizontalSpacing(8)
         self._enc_layout.setVerticalSpacing(4)
 
+        # Reverse cross-reference: which field maps assign this area
+        # (via ENCTBL.BIN). Clickable — jumps to the map browser's
+        # Encounters tab. Populated per selection in _on_selection.
+        self._used_by_group = QGroupBox("Used by maps")
+        used_by_layout = QVBoxLayout(self._used_by_group)
+        used_by_layout.setContentsMargins(8, 4, 8, 4)
+        self._used_by_label = QLabel("—")
+        self._used_by_label.setWordWrap(True)
+        self._used_by_label.setTextFormat(Qt.RichText)
+        self._used_by_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self._used_by_label.linkActivated.connect(self._on_used_by_link)
+        used_by_layout.addWidget(self._used_by_label)
+
         self._content = QWidget()
         content_layout = QVBoxLayout(self._content)
 
@@ -155,6 +162,7 @@ class WildEncountersEditor(QWidget):
         content_layout.setSpacing(4)
         content_layout.addWidget(self._title)
         content_layout.addWidget(self._header_group)
+        content_layout.addWidget(self._used_by_group)
         content_layout.addWidget(self._enc_group)
         content_layout.addStretch(1)
 
@@ -188,6 +196,8 @@ class WildEncountersEditor(QWidget):
         self._header_form.addRow("Encounter Rate lower bound", self._rate_lo_spin)
         self._header_form.addRow("Encounter Rate upper bound", self._rate_hi_spin)
 
+        self._refresh_used_by(ix)
+
         # rebuild encounter grid
         self._clear_layout(self._enc_layout)
         self._encounter_rows = []
@@ -213,6 +223,11 @@ class WildEncountersEditor(QWidget):
         self._enc_layout.setColumnStretch(1, 1)
 
     def _on_undo_redo(self, _index: int) -> None:
+        # An edit here may have reassigned an encounter's digimon_id, so the
+        # enemy editor's reverse index is now potentially stale — drop it
+        # (rebuilds lazily on next access). Bounded to this editor's
+        # lifetime since it's the only surface that mutates encounters.
+        self._session.invalidate_wild_area_index()
         if not (0 <= self._current_ix < len(self._areas)):
             return
         if self._rate_lo_spin is not None:
@@ -221,6 +236,45 @@ class WildEncountersEditor(QWidget):
         for row in self._encounter_rows:
             row.id_combo.refresh()
             row.reward_spin.refresh()
+
+    def _refresh_used_by(self, area_index: int) -> None:
+        """Fill the 'Used by maps' group with clickable field-map links.
+
+        Reads ``session.maps_using_area`` (the ENCTBL.BIN reverse index).
+        Areas 0/1 are the Shine/Dark dummies shared by every
+        encounters-disabled town, so they can resolve to a long list —
+        that's expected, not a bug.
+        """
+        try:
+            map_ids = self._session.maps_using_area(area_index)
+        except Exception:  # noqa: BLE001 — headless / no encounter table
+            map_ids = []
+        if not map_ids:
+            self._used_by_label.setText(
+                "<span style='color:#888;'>No field map assigns this area "
+                "(unused, or reached only via script).</span>"
+            )
+            return
+        links = []
+        for mid in map_ids:
+            name = map_labels.area_name(mid)
+            label = f"{mid} {name}" if name and name != "?" else f"map {mid}"
+            links.append(
+                f"<a href='map:{mid}' style='color:#4a9bd8;"
+                f"text-decoration:none;'>{label}</a>"
+            )
+        self._used_by_label.setText(" &nbsp;·&nbsp; ".join(links))
+
+    def _on_used_by_link(self, href: str) -> None:
+        if not href.startswith("map:"):
+            return
+        try:
+            map_id = int(href[len("map:"):])
+        except ValueError:
+            return
+        nav = getattr(self.window(), "navigate_to_map_encounters", None)
+        if nav is not None:
+            nav(map_id)
 
     def select_by_id(self, area_index: int) -> bool:
         """Footer navigation hook — area index doubles as the record id."""

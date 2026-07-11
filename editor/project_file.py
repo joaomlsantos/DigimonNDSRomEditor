@@ -55,9 +55,13 @@ from digimon_core import qol as qol_module
 #     one BGM slot each. Positional: list order encodes the eventual
 #     bgm_id (vanilla_seq_count + position). Routed through the same SDAT
 #     splice path as bgm_swap_edits.
+# v10: adds bgm_label_edits channel — user-editable friendly labels for
+#      BGM slots, keyed by the SET_MUSIC sequential array id. Pure UI
+#      metadata; the ROM itself doesn't carry labels, so this channel
+#      never touches the byte diff or SDAT splice.
 # Loader accepts every prior version; saver always writes the current version.
-FORMAT_VERSION = 9
-_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
+FORMAT_VERSION = 10
+_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 EDITOR_VERSION = "0.1.0"
 
 
@@ -71,6 +75,7 @@ Overlay5EntryEdit = Tuple[int, bytes]  # (entry_ix, entry_bytes)
 BgmSwapEdit = Tuple[int, str, str, bytes, bytes, bytes]
 # (donor_label, donor_game_label, sseq_bytes, sbnk_bytes, swar_bytes)
 BgmAdditionEdit = Tuple[str, str, bytes, bytes, bytes]
+BgmLabelEdit = Tuple[int, str]  # (music_id / SET_MUSIC array id, label)
 
 
 def vanilla_sha256(rom_bytes: bytes) -> str:
@@ -138,6 +143,7 @@ def save_project(
     overlay5_entry_edits: List[Overlay5EntryEdit] = (),
     bgm_swap_edits: List[BgmSwapEdit] = (),
     bgm_addition_edits: List[BgmAdditionEdit] = (),
+    bgm_label_edits: List[BgmLabelEdit] = (),
 ) -> None:
     """Write a .romproj at `path`.
 
@@ -258,6 +264,10 @@ def save_project(
             }
             for donor_label, donor_game_label, sseq, sbnk, swar in bgm_addition_edits
         ],
+        "bgm_label_edits": [
+            {"music_id": music_id, "label": label}
+            for music_id, label in bgm_label_edits
+        ],
     }
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -332,5 +342,9 @@ def load_project(path: str) -> dict:
             base64.b64decode(entry["swar"]),
         )
         for entry in data.get("bgm_addition_edits", [])
+    ]
+    data["bgm_label_edits"] = [
+        (int(entry["music_id"]) & 0xFFFF, entry["label"])
+        for entry in data.get("bgm_label_edits", [])
     ]
     return data

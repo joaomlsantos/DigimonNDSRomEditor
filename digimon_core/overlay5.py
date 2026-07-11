@@ -761,6 +761,129 @@ def iter_dialogs_from_with_meta(
     return dialogs, unknowns
 
 
+# ---- unified events walker (dialog + set_music + reaction + battle) ------
+
+EVENT_KIND_DIALOG = "dialog"
+EVENT_KIND_SET_MUSIC = "set_music"
+EVENT_KIND_REACTION = "reaction"
+EVENT_KIND_BATTLE = "battle"
+
+
+@dataclass
+class RegionEvent:
+    """One decoded editable event inside a cutscene region.
+
+    ``kind`` selects the ``payload`` type — one of :class:`DialogBlock`,
+    :class:`SetMusicBlock`, :class:`ReactionBlock`, :class:`BattleBlock`.
+    ``rel`` is the in-entry offset the walker landed on (same as
+    ``payload.block_offset``, kept up top for cheap sort keys).
+    """
+    rel: int
+    kind: str
+    payload: object
+
+
+def iter_region_events_with_meta(
+    entry: bytes,
+    start_off: int,
+    end_off: Optional[int] = None,
+) -> Tuple[List[RegionEvent], List[Tuple[int, int]]]:
+    """Forgiving walker that emits every editable structural event
+    inside a cutscene region (or a sprite/hitbox script body).
+
+    Same fixed-size opcode table + END_SCRIPT / bounded-region semantics
+    as :func:`iter_dialogs_from_with_meta`, but returns a mixed event
+    stream so the cutscene detail panel can render dialog / music /
+    reaction / battle cards in offset order rather than emitting each
+    kind in a separate pass.
+
+    Unmapped opcodes are still surfaced through ``unknowns`` for the
+    debug section.
+    """
+    events: List[RegionEvent] = []
+    unknowns: List[Tuple[int, int]] = []
+    if start_off <= 0 or start_off >= len(entry):
+        return events, unknowns
+    bounded = end_off is not None
+    n = len(entry) if not bounded else min(end_off, len(entry))
+    seen_offsets: set = set()
+    p = start_off
+    while p + 2 <= n:
+        if _is_dialog_at(entry, p):
+            events.append(RegionEvent(
+                rel=p,
+                kind=EVENT_KIND_DIALOG,
+                payload=DialogBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += DIALOG_BLOCK_SIZE
+            continue
+        # BATTLE has variable length + its own D7 payload sink; try it
+        # before the generic opcode table so ``0xDA`` isn't confused
+        # with a SET_VAR value.
+        battle = _parse_battle_at(entry, p)
+        if battle is not None:
+            events.append(RegionEvent(
+                rel=p,
+                kind=EVENT_KIND_BATTLE,
+                payload=battle,
+            ))
+            seen_offsets.add(p)
+            p += battle.total_size
+            continue
+        opcode = struct.unpack_from("<H", entry, p)[0]
+        if opcode == SET_MUSIC_OPCODE and p + SET_MUSIC_BLOCK_SIZE <= n:
+            events.append(RegionEvent(
+                rel=p,
+                kind=EVENT_KIND_SET_MUSIC,
+                payload=SetMusicBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += SET_MUSIC_BLOCK_SIZE
+            continue
+        if opcode == REACTION_OPCODE and p + REACTION_BLOCK_SIZE <= n:
+            events.append(RegionEvent(
+                rel=p,
+                kind=EVENT_KIND_REACTION,
+                payload=ReactionBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += REACTION_BLOCK_SIZE
+            continue
+        if opcode in _DIALOG_TERMINATOR_OPCODES:
+            if not bounded:
+                break
+            unknowns.append((p, opcode))
+            p += 2
+            continue
+        size = _DIALOG_SKIP_OPCODE_SIZES.get(opcode)
+        if size is None:
+            unknowns.append((p, opcode))
+            p += 2
+            continue
+        if p + size > n:
+            break
+        p += size
+    # Same signature-sweep safety net as the dialog walker — catches
+    # DIALOG blocks the structured walk drifted past inside a mis-sized
+    # opcode. We only sweep for DIALOG (not the shorter opcodes) because
+    # its 3-marker signature is specific enough to avoid false positives.
+    if bounded:
+        sweep_p = start_off
+        sweep_end = n - DIALOG_BLOCK_SIZE + 1
+        while sweep_p < sweep_end:
+            if sweep_p not in seen_offsets and _is_dialog_at(entry, sweep_p):
+                events.append(RegionEvent(
+                    rel=sweep_p,
+                    kind=EVENT_KIND_DIALOG,
+                    payload=DialogBlock.from_bytes(entry, sweep_p),
+                ))
+                seen_offsets.add(sweep_p)
+            sweep_p += 2
+        events.sort(key=lambda e: e.rel)
+    return events, unknowns
+
+
 def iter_dialogs_from(entry: bytes, start_off: int) -> List[DialogBlock]:
     """Walk ``entry`` from ``start_off``, collecting DIALOG blocks.
 
@@ -795,6 +918,275 @@ def replace_dialog_field(
     struct.pack_into(
         "<H", buf, block_offset + field_offsets[field],
         int(new_value) & 0xFFFF,
+    )
+    return bytes(buf)
+
+
+# ---- SET_MUSIC (0e 00 [music_id:2]) -------------------------------------
+
+SET_MUSIC_OPCODE = 0x000E
+SET_MUSIC_BLOCK_SIZE = 4
+
+
+@dataclass
+class SetMusicBlock:
+    """Fixed 4-byte ``0e 00 [music_id:u16]`` BGM-select opcode.
+
+    Same opcode drives both the mid-map SET_MUSIC and the first-instruction
+    of every registered handler script — the byte layout is identical, so
+    the codec doesn't distinguish them.
+    """
+    block_offset: int
+    music_id: int
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "SetMusicBlock":
+        opcode, music_id = struct.unpack_from("<HH", entry, off)
+        if opcode != SET_MUSIC_OPCODE:
+            raise ValueError(
+                f"not a SET_MUSIC block at 0x{off:04x} (opcode 0x{opcode:04x})"
+            )
+        return cls(block_offset=off, music_id=music_id)
+
+
+def _is_set_music_at(entry: bytes, off: int) -> bool:
+    if off < 0 or off + SET_MUSIC_BLOCK_SIZE > len(entry):
+        return False
+    return entry[off] == 0x0E and entry[off + 1] == 0x00
+
+
+def replace_set_music_id(
+    entry: bytes, block_offset: int, new_music_id: int,
+) -> bytes:
+    """Rewrite the music id u16 at ``block_offset + 2``.
+
+    Same length in/out — annotated as SET_MUSIC only when the id
+    resolved to a known BGM in the research docs, but at splice-time
+    we trust the caller located the block via :func:`_is_set_music_at`
+    or the events walker below.
+    """
+    if not _is_set_music_at(entry, block_offset):
+        raise ValueError(
+            f"no SET_MUSIC block at offset 0x{block_offset:04x}"
+        )
+    buf = bytearray(entry)
+    struct.pack_into(
+        "<H", buf, block_offset + 2, int(new_music_id) & 0xFFFF,
+    )
+    return bytes(buf)
+
+
+# ---- REACTION_BALLOON (C0 00 [reaction:2] [target:2]) --------------------
+
+REACTION_OPCODE = 0x00C0
+REACTION_BLOCK_SIZE = 6
+
+# Named reactions we've pinned. Ids outside this set stay editable
+# (spinbox) — the annotator uses the same short list.
+REACTION_NAMES: Dict[int, str] = {
+    0: "!",
+    1: "...",
+    2: "waterdrop",
+    3: "anger",
+}
+
+
+@dataclass
+class ReactionBlock:
+    """6-byte ``C0 00 [reaction:u16] [target:u16]`` — over-head balloon.
+
+    ``target`` is a sprite slot (same convention as DIALOG.target), so
+    the reaction floats above the matching OVERWORLD_SPRITE placement.
+    """
+    block_offset: int
+    reaction: int
+    target: int
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "ReactionBlock":
+        opcode, reaction, target = struct.unpack_from("<HHH", entry, off)
+        if opcode != REACTION_OPCODE:
+            raise ValueError(
+                f"not a REACTION_BALLOON block at 0x{off:04x} "
+                f"(opcode 0x{opcode:04x})"
+            )
+        return cls(block_offset=off, reaction=reaction, target=target)
+
+
+def _is_reaction_at(entry: bytes, off: int) -> bool:
+    if off < 0 or off + REACTION_BLOCK_SIZE > len(entry):
+        return False
+    return entry[off] == 0xC0 and entry[off + 1] == 0x00
+
+
+def replace_reaction_field(
+    entry: bytes, block_offset: int, field: str, new_value: int,
+) -> bytes:
+    """Rewrite ``reaction`` or ``target`` u16 inside a REACTION_BALLOON block."""
+    if not _is_reaction_at(entry, block_offset):
+        raise ValueError(
+            f"no REACTION_BALLOON block at offset 0x{block_offset:04x}"
+        )
+    field_offsets = {"reaction": 2, "target": 4}
+    if field not in field_offsets:
+        raise ValueError(f"unknown reaction field {field!r}")
+    buf = bytearray(entry)
+    struct.pack_into(
+        "<H", buf, block_offset + field_offsets[field],
+        int(new_value) & 0xFFFF,
+    )
+    return bytes(buf)
+
+
+# ---- BATTLE (DA 00 [5×enemy:2] D7 00 [payload] D8 00 [bg:2] D9 00 [music:2] BA 00)
+
+BATTLE_HEADER_OPCODE = 0x00DA
+BATTLE_D7_OPCODE = 0x00D7
+BATTLE_D8_OPCODE = 0x00D8
+BATTLE_D9_OPCODE = 0x00D9
+BATTLE_TERMINATOR_OPCODE = 0x00BA
+BATTLE_ENEMY_SLOTS = 5
+BATTLE_ENEMY_EMPTY = 0xFFFF
+
+
+@dataclass
+class BattleBlock:
+    """Variable-length battle setup found in overlay5 cutscenes.
+
+    Byte layout::
+
+        DA 00 [e0:u16][e1:u16][e2:u16][e3:u16][e4:u16]    # 12 bytes
+        D7 00 <payload — variable u16 stream>              # 2 + N bytes
+        D8 00 [bg_id:u16]                                  # 4 bytes
+        D9 00 [music_id:u16]                               # 4 bytes
+        BA 00                                              # 2 bytes
+
+    The five enemy u16s use ``0xFFFF`` as "empty slot"; ``bg_id`` /
+    ``music_id`` index the same BG map / SDAT-BGM tables the rest of
+    the codec uses. The ``D7`` payload's semantics aren't fully pinned,
+    so the codec surfaces it as opaque bytes; the editor only touches
+    the enemy / bg / music u16s.
+
+    Offsets stored on the block make in-place field replacement cheap
+    for the ``replace_battle_*`` helpers — no re-walk needed.
+    """
+    block_offset: int
+    total_size: int
+    enemies: Tuple[int, ...]         # length BATTLE_ENEMY_SLOTS
+    d7_payload: bytes                # opaque
+    bg_id: int
+    music_id: int
+    # Absolute in-entry offsets of each editable u16 field.
+    bg_field_offset: int
+    music_field_offset: int
+
+    def enemy_field_offset(self, slot_ix: int) -> int:
+        if not 0 <= slot_ix < BATTLE_ENEMY_SLOTS:
+            raise ValueError(
+                f"BATTLE enemy slot {slot_ix} out of range 0..{BATTLE_ENEMY_SLOTS - 1}"
+            )
+        return self.block_offset + 2 + 2 * slot_ix
+
+
+def _parse_battle_at(entry: bytes, off: int) -> Optional[BattleBlock]:
+    """Try to decode a BATTLE block at ``off``. Returns ``None`` when the
+    bytes don't fit — used by both the events walker and the splice
+    helpers so field replacement re-validates the block shape.
+    """
+    n = len(entry)
+    if off < 0 or off + 12 > n:
+        return None
+    if entry[off] != 0xDA or entry[off + 1] != 0x00:
+        return None
+    enemies = tuple(
+        struct.unpack_from("<H", entry, off + 2 + 2 * i)[0]
+        for i in range(BATTLE_ENEMY_SLOTS)
+    )
+    cursor = off + 12
+    if cursor + 2 > n or entry[cursor] != 0xD7 or entry[cursor + 1] != 0x00:
+        return None
+    cursor += 2
+    d7_start = cursor
+    # Same 64-byte payload ceiling as the annotator / chain decoder.
+    while cursor + 1 < n and not (
+        entry[cursor] == 0xD8 and entry[cursor + 1] == 0x00
+    ):
+        cursor += 2
+        if cursor - d7_start > 64:
+            return None
+    if cursor + 8 > n:
+        return None
+    d7_payload = bytes(entry[d7_start:cursor])
+    cursor += 2  # past D8 00
+    bg_field_offset = cursor
+    bg_id = struct.unpack_from("<H", entry, cursor)[0]
+    cursor += 2
+    if entry[cursor] != 0xD9 or entry[cursor + 1] != 0x00:
+        return None
+    cursor += 2  # past D9 00
+    music_field_offset = cursor
+    music_id = struct.unpack_from("<H", entry, cursor)[0]
+    cursor += 2
+    if entry[cursor] != 0xBA or entry[cursor + 1] != 0x00:
+        return None
+    cursor += 2
+    return BattleBlock(
+        block_offset=off,
+        total_size=cursor - off,
+        enemies=enemies,
+        d7_payload=d7_payload,
+        bg_id=bg_id,
+        music_id=music_id,
+        bg_field_offset=bg_field_offset,
+        music_field_offset=music_field_offset,
+    )
+
+
+def replace_battle_enemy(
+    entry: bytes, block_offset: int, slot_ix: int, new_enemy_id: int,
+) -> bytes:
+    """Rewrite one enemy u16 (0..4) inside the BATTLE block at ``block_offset``."""
+    block = _parse_battle_at(entry, block_offset)
+    if block is None:
+        raise ValueError(
+            f"no BATTLE block at offset 0x{block_offset:04x}"
+        )
+    buf = bytearray(entry)
+    struct.pack_into(
+        "<H", buf, block.enemy_field_offset(slot_ix),
+        int(new_enemy_id) & 0xFFFF,
+    )
+    return bytes(buf)
+
+
+def replace_battle_bg(
+    entry: bytes, block_offset: int, new_bg_id: int,
+) -> bytes:
+    """Rewrite the ``D8 00 [bg]`` u16 inside a BATTLE block."""
+    block = _parse_battle_at(entry, block_offset)
+    if block is None:
+        raise ValueError(
+            f"no BATTLE block at offset 0x{block_offset:04x}"
+        )
+    buf = bytearray(entry)
+    struct.pack_into(
+        "<H", buf, block.bg_field_offset, int(new_bg_id) & 0xFFFF,
+    )
+    return bytes(buf)
+
+
+def replace_battle_music(
+    entry: bytes, block_offset: int, new_music_id: int,
+) -> bytes:
+    """Rewrite the ``D9 00 [music]`` u16 inside a BATTLE block."""
+    block = _parse_battle_at(entry, block_offset)
+    if block is None:
+        raise ValueError(
+            f"no BATTLE block at offset 0x{block_offset:04x}"
+        )
+    buf = bytearray(entry)
+    struct.pack_into(
+        "<H", buf, block.music_field_offset, int(new_music_id) & 0xFFFF,
     )
     return bytes(buf)
 
