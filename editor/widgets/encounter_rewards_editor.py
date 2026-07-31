@@ -363,3 +363,56 @@ class EncounterRewardsEditor(QWidget):
                 f"⚠ Probability sum: {total} / {EXPECTED_PROBABILITY_SUM} "
                 f"({sign}{diff}) — must equal {EXPECTED_PROBABILITY_SUM}"
             )
+
+
+from digimon_core import constants  # noqa: E402 — bottom-of-file utility
+
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+
+
+def encounter_reward_issues(
+    records: List[model.EncounterRewardTable],
+) -> List[ValidationIssue]:
+    """Footer issues for encounter reward tables.
+
+    Probability sum: the per-slot probabilities must total
+    ``EXPECTED_PROBABILITY_SUM`` (200 on every vanilla Dusk/Dawn table). An
+    off-total table skews the whole roll — the same invariant the detail panel
+    surfaces inline. Warning-only; nothing blocks saving.
+
+    Unknown reward item: a populated (probability > 0), non-money slot whose
+    id doesn't resolve to a known item would render as ``<item …>`` and hand
+    out an undefined item in-game.
+    """
+    issues: List[ValidationIssue] = []
+    for ix, rec in enumerate(records):
+        total = sum(rec.probabilitiesArray)
+        if total != EXPECTED_PROBABILITY_SUM:
+            diff = total - EXPECTED_PROBABILITY_SUM
+            sign = "+" if diff > 0 else ""
+            issues.append(ValidationIssue(
+                section="Encounter Rewards",
+                category="Probability Sum",
+                message=(
+                    f"Table #{ix:03d} — probabilities sum to {total}, not "
+                    f"{EXPECTED_PROBABILITY_SUM} ({sign}{diff})."
+                ),
+                editor_key="encounter_rewards",
+                record_id=ix,
+            ))
+        for slot, (prob, reward) in enumerate(
+            zip(rec.probabilitiesArray, rec.rewardsArray)
+        ):
+            if prob > 0 and 0 < reward < MONEY_BOUNDARY \
+                    and reward not in constants.ITEM_ID_TO_STR:
+                issues.append(ValidationIssue(
+                    section="Encounter Rewards",
+                    category="Unknown Reward Item",
+                    message=(
+                        f"Table #{ix:03d} slot {slot + 1} — reward points at "
+                        f"unknown item id 0x{reward:03x}."
+                    ),
+                    editor_key="encounter_rewards",
+                    record_id=ix,
+                ))
+    return issues

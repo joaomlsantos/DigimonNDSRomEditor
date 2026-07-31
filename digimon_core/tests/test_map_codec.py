@@ -181,16 +181,21 @@ class WalkabilityOverlayTests(unittest.TestCase):
         for y in range(walk_h):
             ix = y * walk_w + 5
             bits[ix >> 3] |= 1 << (ix & 7)
+        tint = (255, 0, 0)
         out = mapmod.apply_walkability_overlay(
             composite, bytes(bits), walk_w, walk_h,
-            tint=(255, 0, 0), alpha=255,
+            tint=tint, alpha=255,
         )
         # Every row, only x=5 should be tinted; other columns stay black.
+        # Blocked pixels where (x+y)%4==0 render the darker diagonal-hatch
+        # red (tint[0]-120) instead of the flat tint.
+        hatch_r = max(0, tint[0] - 120)
         for y in range(comp_h):
             for x in range(comp_w):
                 off = (y * comp_w + x) * 4
                 if x == 5:
-                    self.assertEqual(out.rgba[off], 255, f"({x},{y}) R")
+                    expected = hatch_r if (x + y) % 4 == 0 else tint[0]
+                    self.assertEqual(out.rgba[off], expected, f"({x},{y}) R")
                 else:
                     self.assertEqual(out.rgba[off], 0, f"({x},{y}) R")
 
@@ -200,15 +205,17 @@ class WalkabilityOverlayTests(unittest.TestCase):
         composite = mapmod.MapPreview(
             rgba=bytes([0] * w * h * 4), width=w, height=h,
         )
-        bits = bytes([0xFF, 0x00, 0xFF, 0x00])
-        # bits row 0 = 0xFF → x=0..7 blocked; row 1 = 0x00 → none blocked.
-        # Hmm w=8, h=2 → n_bits=16, bytes_needed=2. Use first two bytes.
+        # row 0 = 0xFF → x=0..7 blocked; row 1 = 0x00 → none blocked.
         bits = bytes([0xFF, 0x00])
+        tint = (255, 0, 0)
         out = mapmod.apply_walkability_overlay(
-            composite, bits, w, h, tint=(255, 0, 0), alpha=255,
+            composite, bits, w, h, tint=tint, alpha=255,
         )
+        # Blocked pixels where (x+y)%4==0 get the darker diagonal hatch.
+        hatch_r = max(0, tint[0] - 120)
         for x in range(w):
-            self.assertEqual(out.rgba[(0 * w + x) * 4], 255)
+            expected = hatch_r if x % 4 == 0 else tint[0]
+            self.assertEqual(out.rgba[(0 * w + x) * 4], expected)
             self.assertEqual(out.rgba[(1 * w + x) * 4], 0)
 
 

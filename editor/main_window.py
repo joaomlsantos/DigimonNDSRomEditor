@@ -51,13 +51,16 @@ from .widgets.armor_digivolution_editor import (
     armor_digivolution_issues,
 )
 from .widgets.base_digimon_editor import BaseDigimonEditor, base_digimon_issues
-from .widgets.consumable_editor import ConsumableEditor
+from .widgets.consumable_editor import ConsumableEditor, consumable_issues
 from .widgets.digivolution_tree_editor import DigivolutionTreeEditor
 from .widgets.dna_digivolution_editor import (
     DNADigivolutionEditor,
     dna_digivolution_issues,
 )
-from .widgets.encounter_rewards_editor import EncounterRewardsEditor
+from .widgets.encounter_rewards_editor import (
+    EncounterRewardsEditor,
+    encounter_reward_issues,
+)
 from .widgets.enemy_digimon_editor import EnemyDigimonEditor
 from .widgets.equipment_editor import EquipmentEditor
 from .widgets.farm_item_editor import FarmItemEditor, farm_item_issues
@@ -928,6 +931,8 @@ class MainWindow(QMainWindow):
             session.wild_encounter_areas,
             len(session.encounter_rewards),
         ))
+        reg.register(lambda: encounter_reward_issues(session.encounter_rewards))
+        reg.register(lambda: consumable_issues(session.consumables))
         reg.register(lambda: farm_terrain_issues(session.farm_terrains))
         reg.register(lambda: farm_item_issues(session.farm_items))
         reg.register(lambda: farm_training_pen_issues(

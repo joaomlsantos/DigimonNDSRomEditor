@@ -117,12 +117,12 @@ class DNADigivolutionEditor(QWidget):
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.addWidget(self._list_panel)
         splitter.addWidget(self._detail)
-        # The detail form (three combos + three conditions) is compact, so
-        # give the list the bulk of the width and let it absorb extra space
-        # on resize — its four columns are what the user actually scans.
+        # Even 50/50 split — the list's four columns want room to scan, and
+        # the detail form's combos want room to show full digimon names. Both
+        # panes share extra width equally on resize.
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([600, 400])
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([500, 500])
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

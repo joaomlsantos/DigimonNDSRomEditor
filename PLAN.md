@@ -225,7 +225,7 @@ The data-coverage milestones (M0–M6) are all done. The active push is on workf
 
 Ordered by load-bearing-ness:
 
-1. **Cross-reference / "Used by" panel** (§10) — when viewing a digimon (or move, or item), show every record that references it: evolutions in both directions, encounters, starters, drops, quest rewards, DNA recipes. Uniquely valuable for this game's interconnected data; can't be done outside the editor. Reuses the existing nav-handler routing.
+1. **Cross-reference / "Used by" panel** (§10) — **partially shipped as of `bb173af` (2026-07)**, ad-hoc per editor rather than the generic `xref.py` index §10 describes: the enemy-digimon editor has clickable "Appears in Wild Encounters" + "Appears in scripted events" sections, the wild-encounters editor a "Used by maps" group, the base-digimon editor a "Used by" line, and the map browser cross-links to the encounters editor. **Remaining:** consolidate these into the shared `XrefIndex` (§10.2) and extend coverage to moves, items, DNA recipes, and both-direction evolutions in one panel. Uniquely valuable for this game's interconnected data; can't be done outside the editor.
 2. **Cross-page search** — single search box that queries every editor's record list (digimon names, move names, item names, in-game strings) and routes click-throughs via the nav handlers / footer routing.
 3. **Bulk-edit operations** — apply a transform across a record set with a diff preview before commit. Saves hundreds of clicks for balance passes.
 4. **Header toolbar with icon buttons** — Ghidra-style icon row for Save ROM / Save Project / Export (saved memory: `project_future_header_bar.md`).
@@ -237,7 +237,7 @@ Beyond plan but possibly worth picking up:
 - Before/after value capture in changelog entries (currently action-text only).
 - "Revert this entry to vanilla" per editor (needs the `session.original` reference path; partly implementable today via re-parsing a slice of `original_rom_data`).
 - ~~About dialog with editor version + ROM version readback.~~ Done — `action_about` → `_show_about` in `main_window.py`.
-- Wider validation coverage (encounter rewards, equipment, consumables, farm items have no `*_issues()` collectors yet).
+- Wider validation coverage. **Landed 2026-07:** `encounter_reward_issues` (probability-sum ≠ 200 + unknown reward item id) and `consumable_issues` (edited `consumable_marker` ≠ the constant 10 every vanilla record uses); farm items already had `farm_item_issues`. **Equipment deliberately has no collector** — every editable field is an independent widget-capped magnitude with no cross-field or reference invariant, so a collector would be either dead or a fabricated rule. Still open: `WildEncounterArea` header bounds beyond `reward_slot`, and any quest-reward integrity checks.
 - Strings export/import (CSV/JSON) — deferred: byte-budget per string limits translation workflow value.
 - Randomizer integration — seed-based randomization of evolution trees / starters / encounters; pairs with the cross-reference panel.
 
@@ -246,6 +246,8 @@ Beyond plan but possibly worth picking up:
 ## 10. Plan: Cross-reference / "Used by" panel
 
 **Goal.** From any record in the editor, see every other record that references it, with click-to-jump for each reference. Initial scope: digimon, moves, items, standard digivolutions (the four most interconnected entity types). Romhackers routinely break routes by editing a digimon without seeing what's wired into it; this panel is the antidote.
+
+> **Status (2026-07).** A first slice of this shipped **ad-hoc**, not via the `XrefIndex` module below: enemy-digimon "Appears in Wild Encounters / scripted events", wild-encounters "Used by maps", base-digimon "Used by", and map↔encounters cross-links (`bb173af`). The reverse-lookup logic is duplicated inline in each editor. The plan below still stands as the **consolidation** target — extract the shared index, dedupe the inline walks, and cover moves / items / DNA / both-direction evolutions. Treat §10.1–10.4 as the refactor + coverage-completion spec, not a greenfield build.
 
 ### 10.1 Reference inventory
 
@@ -460,6 +462,16 @@ Both paths share validation (`min_tiles_required`, palette compatibility for 4bp
 - **Phase F (met).** Multi-pak grow correctness verified by `test_sprite_ncer.SpritePakGrowSpliceTests` (descending-order shift, downstream FAT shift, byte-content equality).
 - **Phase G (met — structural).** OAM overlay + structural metadata labels shipped. Named-category labels deferred per the row's note — acceptance for that piece is on hold until the research notes repo grows a sprite-ID → role table.
 
+### 11.7 Battle sprites (`BTCHR.PAK`) — shipped, tracked separately from SPR_*
+
+The battle-sprite editor grew alongside §11 but on a **different file format**, so it lives in its own module set rather than the SPR_*.PAK flow above. Documented here so the plan reflects reality; there is no separate milestone table because it landed incrementally across `0d529f1`…`bb173af`.
+
+- **Format.** `DAT/BTCHR.PAK` is 8bpp battle sprites: 415 digimon × 5 entries per digimon (`mini_header`, NCGR-8bpp, NCLR-256, NCER-5cells, NANR) — *not* the 4bpp SPR_* layout (memory `project_btchr_format.md`). Codec + model in [digimon_core/btchr.py](digimon_core/btchr.py); the `.btchrspr` custom export/import container in [digimon_core/btchrspr.py](digimon_core/btchrspr.py).
+- **Editor.** [editor/widgets/btchr_browser.py](editor/widgets/btchr_browser.py) — per-frame preview, PNG + cell-sheet (OAM) export/import, **OAM-limit overlay** visualisation, per-frame offset editing, and structural field labels (some deliberately marked `<unknown>`). `mini_header` field semantics captured in `project_btchr_mini_header_fields.md` / `project_btchr_vertical_pivots.md`.
+- **Expansion.** Adding entries works reliably at **+1** but breaks around **+4** (a hidden engine cap, likely a VRAM tile-per-frame budget — memory `project_btchr_extensible.md`, not yet pinned). Appended entries ride the sprite grow machinery; their `chrsize`/`btchrsize` u32 pairs persist through the **`.romproj` v4 `btchr_appended_sidecars`** channel.
+- **Tests.** `test_btchr.py`, `test_btchr_save_roundtrip.py`, `test_btchrspr.py`.
+- **Open.** The ~+4 expansion cap is unpinned; treat additions past +1 as experimental until the budget is located.
+
 ---
 
 ## 12. Plan: ROM-level capacity — compaction, FAT shifts, sub-range injection
@@ -612,9 +624,9 @@ Identity holds across all 80 files on both regions: `file_size == 0x10 + num_enc
 
 5 files; sizes 0x40 → 0x280. No header — each file is a flat array of `0x20`-byte `EncounterReward` records. Page parser doesn't apply; loaders read `file_size / 0x20` records directly.
 
-#### 13.3.c — `DAT/ec/ENCTBL.BIN`
+#### 13.3.c — `DAT/ec/ENCTBL.BIN` — **decoded**
 
-Single 0x84C-byte file. Format and purpose currently unknown; likely a cross-reference table between areas (`E0XX.BIN`) and reward sets (`I0XX.BIN`), but unverified. Out of scope for Phase B unless a downstream loader actually depends on it.
+Single 0x84C-byte file = **265 × 8-byte entries (entry `i` = field map `i`) + 4 trailing `00` bytes**; not the areas↔rewards cross-table originally guessed. Each entry is 4 × u16 LE: `area_index` (wild-encounter area), `battle_bg` (`DAT/btmap/<id>`), a per-map `unknown_0x4` role/region category, and `wild_battle_bgm` (music id). Loaded by `loaders.loadMapEncounterTable` → `model.MapEncounterEntry`, edited via the map browser's Encounters tab, and drives the "Used by maps" reverse-links. Full decode + verification in [`research_docs/claude_notes/map_encounter_table.md`](../research_docs/claude_notes/map_encounter_table.md). (Note: the file's leading `FF FF FF FF` is entry 0's empty area/bg for the unused dev map — **not** a `u32` table header.)
 
 **Save side.** For page-headered files, editing a record in place doesn't touch the header. Growing a record means the page-header offsets shift downstream — straightforward `u32` array rewrite, no inner pak directory like §12's MSG.PAK case. For `DAT/ec/` sub-formats, save-side behavior is per-file: reward arrays just rewrite contiguous records; per-area records depend on the layout reversed in §13.3.a. Vanilla writers don't need to handle grow for §13 itself (no editor surface grows these records today); flag for §12-style routing only when a future feature does.
 
@@ -825,7 +837,7 @@ Editor scope for §14.9 is x/y only. Other fields are documented for later.
 
 **Entry → map mapping.** `entry_ix - 235` for entries 235..499. 265 field-map entries, 1-to-1 with map ids 0..264. Same offset can be shared by multiple entries (farm islands 0288..0304 all point at entry 0235's blob); for v1 each map picks its `235+map_id` entry directly. Multi-entry-per-map (alternate game states like "shop system down") is deferred.
 
-**`DAT/EC/ENCTBL.BIN` shape** (not for this milestone — captured here for the wild-encounter rework). Total 0x84c = 2124 bytes. Layout: `u32 header (0xffffffff) + 265 × 8-byte entries`. 265 = exact map count, so this is the map → encounter-area lookup. First record bytes `01 00 10 00 00 00 4a 00`. Decode TBD; do not edit until the table is decoded.
+**`DAT/EC/ENCTBL.BIN` shape** — **decoded** (see §13.3.c and [`map_encounter_table.md`](../research_docs/claude_notes/map_encounter_table.md)). Total 0x84c = 2124 bytes = `265 × 8-byte entries` (entry `i` = field map `i`) + 4 trailing `00` bytes — there is no leading `u32` header (the first `FF FF FF FF` is entry 0's empty area/bg for the unused dev map). Each entry = 4 × u16: `area_index`, `battle_bg`, `unknown_0x4` (per-map role/region category — verified NOT the encounter rate, which is the area header's rate bounds), `wild_battle_bgm`. Editable today via `map_encounter_tab.py`.
 
 ### 14.9.2 Architecture
 
@@ -1098,9 +1110,12 @@ the splice runs from `serialize_all` like every other channel.
   SDAT doesn't push every later file into the byte diff.
 
 **`.romproj` channel** (`editor/project_file.py`):
-- `FORMAT_VERSION = 9` (v8 added `bgm_swap_edits`, v9 added
-  `bgm_addition_edits`; v1–v8 still load with the addition channel
-  empty).
+- `FORMAT_VERSION = 10` (v8 added `bgm_swap_edits`, v9 added
+  `bgm_addition_edits`, v10 added `bgm_label_edits` — user-editable
+  friendly BGM labels, editor-only metadata the ROM doesn't carry;
+  v1–v9 still load with the newer channels empty). The authoritative
+  per-version channel history lives in the header comment of
+  `editor/project_file.py`.
 - `BgmSwapEdit = Tuple[int, str, str, bytes, bytes, bytes]` carries
   the swap blob as base64-encoded SSEQ/SBNK/SWAR plus the donor labels
   used for the staged-slot marker.
@@ -1243,21 +1258,25 @@ user — swapped tracks play correctly without engine glitches.
   tooltip; PySide6-safe custom `__lt__` (handles all three columns
   without calling `super`).
 - *`sound.sbin` reconnaissance.* Confirmed PMD BRT's `sound.sbin` is
-  a vanilla SDAT under a different extension. Filter widen deferred —
-  user prefers to scan donor sources directly from NDS ROMs (the
-  workflow `nds_extract_sdat.py` prototypes) rather than maintain a
-  per-extension allow-list.
+  a vanilla SDAT under a different extension.
+- *In-editor "Import from NDS ROM" picker* **(landed 2026-07).** An
+  "Import from NDS ROM…" button beside "Import SDAT…" pulls the donor's
+  SDAT straight out of a `.nds` via FAT walk — no pre-extraction. Codec
+  is the pure `digimon_core/sound/rom_scan.find_sdats`, which scans
+  FAT-listed files by the `b"SDAT"` magic at offset 0 (not extension),
+  so PMD's `sound.sbin` and any other odd name are found for free; FNT
+  names are resolved best-effort for the multi-SDAT picker only. The
+  chosen archive flows through the same `audit_donor` path as a
+  file import; the `.nds` path is kept as the donor "path" so its stem
+  becomes the donor game label. Tests: `test_rom_scan.py`. This
+  supersedes the earlier "filter widen" idea — no per-extension
+  allow-list is needed.
 
 **Deferred / pending.**
 
 - *Audit-results refresh.* `audit_results/*.txt` was generated before
   the cap accounting switched to SSEQ-inclusive; numbers there are
   stale by the SSEQ size. Cheap to rerun when next opened.
-- *In-editor "Import from NDS ROM" picker.* Pulls SDATs straight out
-  of a donor NDS ROM via FAT walk (same logic as
-  `nds_extract_sdat.py`), instead of asking the user to extract first.
-  Would also subsume the `.sbin` case naturally without a per-extension
-  filter.
 - *In-editor track preview.* Considered three tiers in conversation:
   (1) SSEQ → MIDI + system-soundfont playback (~1-2 d, cheap but
   unfaithful — fine for *recognition*); (2) authentic DS-chip

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -46,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from digimon_core.sound.donor import CAP_BYTES, DonorBgmRow, audit_donor
+from digimon_core.sound.rom_scan import SdatFile, find_sdats
 from digimon_core.sound.swap import build_swap
 
 from editor.commands import (
@@ -206,6 +208,17 @@ class SoundEditor(QWidget):
         )
         self._import_btn.clicked.connect(self._on_import_clicked)
         row.addWidget(self._import_btn)
+
+        self._import_rom_btn = QToolButton()
+        self._import_rom_btn.setText("Import from NDS ROM…")
+        self._import_rom_btn.setToolTip(
+            "Pick a donor NDS ROM directly; the editor pulls its SDAT sound "
+            "archive out via a FAT walk, so there's no need to extract it "
+            "first. Detected by the SDAT magic, so odd extensions (e.g. "
+            "PMD's sound.sbin) work too."
+        )
+        self._import_rom_btn.clicked.connect(self._on_import_from_rom_clicked)
+        row.addWidget(self._import_rom_btn)
 
         self._replace_btn = QToolButton()
         self._replace_btn.setText("Replace\u2026")
@@ -596,17 +609,84 @@ class SoundEditor(QWidget):
             QMessageBox.warning(self, "Import SDAT", f"Could not read file:\n{exc}")
             return
 
+        self._apply_donor(Path(path), data)
+
+    def _on_import_from_rom_clicked(self) -> None:
+        start_dir = str(self._donor_path.parent) if self._donor_path else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import donor from NDS ROM",
+            start_dir,
+            "NDS ROMs (*.nds);;All files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            rom = Path(path).read_bytes()
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Import from NDS ROM", f"Could not read file:\n{exc}"
+            )
+            return
+
+        try:
+            sdats = find_sdats(rom)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self, "Import from NDS ROM", f"Not a readable NDS ROM:\n{exc}"
+            )
+            return
+
+        if not sdats:
+            QMessageBox.information(
+                self,
+                "Import from NDS ROM",
+                "No SDAT sound archive was found in this ROM.\n\nIts audio may "
+                "be stored in a non-SDAT format (streamed PCM/ADPCM, DSE, …), "
+                "which cannot be used as a donor.",
+            )
+            return
+
+        chosen = sdats[0] if len(sdats) == 1 else self._pick_sdat(sdats)
+        if chosen is None:
+            return
+
+        # Keep the .nds path as the donor "path": its stem becomes the donor
+        # game label on Replace/Add (e.g. "awds"), and .parent seeds the next
+        # dialog. The extracted archive bytes are what actually get audited.
+        self._apply_donor(Path(path), rom[chosen.start:chosen.end])
+
+    def _pick_sdat(self, sdats: List[SdatFile]) -> Optional[SdatFile]:
+        labels = [f"{s.label}  ({_fmt_kb(s.size)})" for s in sdats]
+        label, ok = QInputDialog.getItem(
+            self,
+            "Pick sound archive",
+            "This ROM contains more than one SDAT — pick one:",
+            labels,
+            0,
+            False,
+        )
+        if not ok:
+            return None
+        return sdats[labels.index(label)]
+
+    def _apply_donor(self, donor_path: Path, data: bytes) -> bool:
+        """Audit ``data`` as a donor SDAT and, if valid, make it the active
+        donor. Shared by the file-based and ROM-based import paths. Returns
+        True on success."""
         try:
             rows = audit_donor(data)
         except ValueError as exc:
-            QMessageBox.warning(self, "Import SDAT", f"Not a valid SDAT:\n{exc}")
-            return
+            QMessageBox.warning(self, "Import donor", f"Not a valid SDAT:\n{exc}")
+            return False
 
-        self._donor_path = Path(path)
+        self._donor_path = donor_path
         self._donor_bytes = data
         self._donor_rows = rows
-        self._session.set_sound_donor(path, data, rows)
+        self._session.set_sound_donor(str(donor_path), data, rows)
         self._populate_donor_list()
+        return True
 
     def _populate_donor_list(self) -> None:
         # Disable sorting while we batch-add rows so the items end up at

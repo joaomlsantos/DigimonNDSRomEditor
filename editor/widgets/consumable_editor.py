@@ -146,3 +146,34 @@ class ConsumableEditor(QWidget):
             return
         for w in self._all_widgets:
             w.refresh()
+
+
+from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility
+
+# `consumable_marker` (byte 0x02) is 10 on every vanilla consumable in both
+# regions — a constant type tag, not a per-item value. Flagging a deviation
+# doesn't claim what the marker does in-game; it just surfaces a record that
+# stopped matching the shape the other 56 share. The effect-id / flags fields
+# carry per-item variety with no documented constraint, so they're left
+# un-validated rather than guessed at.
+VANILLA_CONSUMABLE_MARKER = 10
+
+
+def consumable_issues(records: List[model.Consumable]) -> List[ValidationIssue]:
+    """Footer issues for consumables: an edited `consumable_marker` is the
+    only field with a table-wide invariant to check. Warning-only."""
+    issues: List[ValidationIssue] = []
+    for rec in records:
+        if rec.consumable_marker != VANILLA_CONSUMABLE_MARKER:
+            issues.append(ValidationIssue(
+                section="Consumables",
+                category="Marker",
+                message=(
+                    f"{_item_name(rec.id)} — consumable marker is "
+                    f"{rec.consumable_marker}; every vanilla consumable uses "
+                    f"{VANILLA_CONSUMABLE_MARKER}."
+                ),
+                editor_key="consumables",
+                record_id=rec.id,
+            ))
+    return issues

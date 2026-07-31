@@ -1264,8 +1264,12 @@ class MapEncounterEntry:
       Shine/Dark-side dummies used by towns; ``0xFFFF`` = no area.
     - 0x02 ``battle_bg`` — battle background id (``DAT/btmap/<id>``);
       ``0xFFFF`` = none.
-    - 0x04 ``unknown_0x4`` — per-map parameter (1..10; likely an encounter
-      rate/frequency band, unconfirmed). Kept raw + editable.
+    - 0x04 ``unknown_0x4`` — per-map category (values 1..8, 10; no 9). NOT
+      the encounter rate — that lives in the ``WildEncounterArea`` header's
+      rate bounds, read by arm9 ``FUN_0013f6e4``. Clusters by map
+      role/region: 3 = boss/special battle rooms (every btmap-49 boss
+      arena), 1/2 = Shine/Dark hubs, 4/5 = Shine/Dark routes. Exact runtime
+      use unconfirmed. Kept raw + editable.
     - 0x06 ``wild_battle_bgm`` — BGM played during a wild encounter on this
       map (music id, same id space as the overlay5 SET_MUSIC opcode / the
       Sound editor's BGM list). Vanilla uses only 0x10 Normal Battle Theme,

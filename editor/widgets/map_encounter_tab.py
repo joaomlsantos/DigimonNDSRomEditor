@@ -107,18 +107,26 @@ class MapEncounterTab(QWidget):
                 seed, "battle_bg", self._bg_choices, self._undo_stack,
                 none_value=0xFFFF, none_label="(none)",
             )
-            # +6 = wild-encounter battle BGM (music id). +4 is still
-            # undecoded — surfaced as a raw editable spin (likely an
-            # encounter rate, unconfirmed) rather than pretending a
-            # meaning. See feedback_no_fabricated_game_mechanics.
+            # +6 = wild-encounter battle BGM (music id). +4 is a per-map
+            # category — NOT the encounter rate (that's the area header's
+            # rate_lower/upper, read by arm9 FUN_0013f6e4). It clusters by
+            # map role/region: 3 = boss/special battle rooms (every btmap-49
+            # boss arena), 1/2 = Shine/Dark hubs, 4/5 = Shine/Dark routes.
+            # Exact runtime use isn't pinned, so it stays a raw editable spin.
+            # See feedback_no_fabricated_game_mechanics.
             self._bgm_combo = BoundIdCombo(
                 seed, "wild_battle_bgm", self._bgm_choices, self._undo_stack,
             )
             self._u4_spin = BoundSpinBox(seed, "unknown_0x4", 2, self._undo_stack)
+            self._u4_spin.setToolTip(
+                "Per-map category (offset +4). Not the encounter rate. "
+                "3 = boss/special battle rooms; 1/2 = Shine/Dark hubs; "
+                "4/5 = Shine/Dark routes. Exact runtime use unconfirmed."
+            )
             form.addRow("Wild encounter area", self._area_combo)
             form.addRow("Battle background", self._bg_combo)
             form.addRow("Wild battle music", self._bgm_combo)
-            form.addRow("Unknown +4", self._u4_spin)
+            form.addRow("Map category (+4)", self._u4_spin)
             self._info = QLabel("—")
             self._info.setStyleSheet("color: #888; font-size: 10px;")
             form.addRow("", self._info)
