@@ -545,7 +545,6 @@ class BtchrBrowser(QWidget):
             | QAbstractItemView.SelectedClicked
         )
         self._anim_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._anim_table.setMaximumHeight(180)
         self._anim_table.itemChanged.connect(self._on_anim_step_edited)
         # Re-entrancy guard: programmatic table population must not
         # trip itemChanged → re-encode.
@@ -653,14 +652,13 @@ class BtchrBrowser(QWidget):
         meta_form.addRow("Attack", self._meta_attack)
         meta_form.addRow("Defend", self._meta_defend)
 
-        # ---- Cells tab: preview only ---------------------------------
+        # ---- Cells tab: preview (left) + animation editor (right) ----
         # Cell spinner + show-all-cells toggle moved to the actions row
         # below the tabs so they sit alongside the import/export and
         # metadata controls — no per-tab subheader.
         cells_tab = QWidget()
         cells_layout = QVBoxLayout(cells_tab)
         cells_layout.setContentsMargins(8, 8, 8, 8)
-        cells_layout.addWidget(self._scroll, 1)
 
         # Coverage-gap note lives above the footer (see right_layout
         # below) so it's visible from both the Cells and Tile-sheet
@@ -673,36 +671,21 @@ class BtchrBrowser(QWidget):
         )
         self._coverage_note.setVisible(False)
 
-        # Animation panel sits below the preview so playback animates
-        # the same preview the user is already looking at. Controls row
-        # first, then the editable steps table. Collapsed by default —
-        # most browsing sessions just need the preview, so reclaiming the
-        # vertical space keeps the cells tab compact.
-        self._anim_group = CollapsibleSection("Animation", expanded=False)
-        anim_content = QWidget()
-        anim_content_layout = QVBoxLayout(anim_content)
-        anim_content_layout.setContentsMargins(0, 0, 0, 0)
-        anim_controls_row = QHBoxLayout()
-        anim_controls_row.addWidget(QLabel("Track:"))
-        anim_controls_row.addWidget(self._anim_track_combo)
-        anim_controls_row.addWidget(self._anim_play_btn)
-        anim_controls_row.addWidget(self._anim_fps_spin)
-        anim_controls_row.addStretch(1)
-        anim_controls_row.addWidget(self._anim_add_btn)
-        anim_controls_row.addWidget(self._anim_remove_btn)
-        anim_content_layout.addLayout(anim_controls_row)
-        anim_content_layout.addWidget(self._anim_table)
-        self._anim_group.set_content_widget(anim_content)
-        cells_layout.addWidget(self._anim_group)
+        # Left column: the composite preview with the Frame-offsets editor
+        # collapsed beneath it.
+        cells_left = QWidget()
+        cells_left_layout = QVBoxLayout(cells_left)
+        cells_left_layout.setContentsMargins(0, 0, 0, 0)
+        cells_left_layout.addWidget(self._scroll, 1)
 
         # Frame offsets: each cell's on-screen position, editable. The
         # position of a frame is baked into all its OAM x/y (no dedicated
         # pivot field — see project memory), so shifting a frame moves
         # every OAM in that cell uniformly. Values are the absolute OAM
-        # origin as stored in the data. Collapsed by default like
-        # Animation. "True positions" makes the preview + playback honour
-        # these offsets (normally each frame is drawn tight to its own
-        # bbox, hiding the movement).
+        # origin as stored in the data. Collapsed by default.
+        # "True positions" makes the preview + playback honour these
+        # offsets (normally each frame is drawn tight to its own bbox,
+        # hiding the movement).
         self._frame_off_group = CollapsibleSection("Frame offsets", expanded=False)
         fo_content = QWidget()
         fo_content_layout = QVBoxLayout(fo_content)
@@ -730,7 +713,40 @@ class BtchrBrowser(QWidget):
         fo_grid_host.setLayout(self._frame_off_grid)
         fo_content_layout.addWidget(fo_grid_host)
         self._frame_off_group.set_content_widget(fo_content)
-        cells_layout.addWidget(self._frame_off_group)
+        cells_left_layout.addWidget(self._frame_off_group)
+
+        # Right column: the Animation editor, always visible so the track
+        # picker, playback controls, and editable step list sit beside the
+        # preview instead of hidden in a bottom drawer.
+        anim_panel = QWidget()
+        anim_panel_layout = QVBoxLayout(anim_panel)
+        anim_panel_layout.setContentsMargins(0, 0, 0, 0)
+        anim_header = QLabel("Animation")
+        _hf = anim_header.font()
+        _hf.setBold(True)
+        anim_header.setFont(_hf)
+        anim_panel_layout.addWidget(anim_header)
+        anim_controls_row = QHBoxLayout()
+        anim_controls_row.addWidget(QLabel("Track:"))
+        anim_controls_row.addWidget(self._anim_track_combo)
+        anim_controls_row.addWidget(self._anim_play_btn)
+        anim_controls_row.addWidget(self._anim_fps_spin)
+        anim_controls_row.addStretch(1)
+        anim_panel_layout.addLayout(anim_controls_row)
+        anim_panel_layout.addWidget(self._anim_table, 1)
+        anim_btn_row = QHBoxLayout()
+        anim_btn_row.addStretch(1)
+        anim_btn_row.addWidget(self._anim_add_btn)
+        anim_btn_row.addWidget(self._anim_remove_btn)
+        anim_panel_layout.addLayout(anim_btn_row)
+
+        cells_split = QSplitter(Qt.Horizontal)
+        cells_split.addWidget(cells_left)
+        cells_split.addWidget(anim_panel)
+        cells_split.setStretchFactor(0, 1)
+        cells_split.setStretchFactor(1, 0)
+        cells_split.setSizes([560, 300])
+        cells_layout.addWidget(cells_split, 1)
 
         # ---- Tile sheet tab: width + columns spinners + sheet preview
         sheet_tab = QWidget()

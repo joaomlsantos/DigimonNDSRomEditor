@@ -32,24 +32,30 @@ import os
 import re
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QImage, QPixmap, QUndoStack, qRgba
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QUndoStack, qRgba
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from digimon_core import mchr, pak, sprite
+from digimon_core import mchr, mchr_anm, pak, sprite
 
 from ..commands import ReplaceSpriteCommand
 from ._png_palette import build_palette_from_png, nearest_idx_opaque
@@ -63,6 +69,7 @@ PALETTE_SLOTS = 16
 
 MCHR_CHR = "DAT/MCHR_CHR.PAK"
 MCHR_PAL = "DAT/MCHR_PAL.PAK"
+MCHR_ANM = "DAT/MCHR_ANM.PAK"
 
 
 def _decoded_palette(pal_pak: pak.PakFile, pal_idx: int) -> Optional[mchr.Palette]:
@@ -138,11 +145,26 @@ class MchrBrowser(QWidget):
         self._undo_stack = undo_stack  # reserved for the import phase
         self._chr_pak: pak.PakFile = session.sprite_pak(MCHR_CHR)
         self._pal_pak: pak.PakFile = session.sprite_pak(MCHR_PAL)
+        # MCHR_ANM is the parallel animation pak (one entry per sprite). Read
+        # for the Animation tab; not part of the frame preview pipeline.
+        self._anm_pak: pak.PakFile = session.sprite_pak(MCHR_ANM)
         self._count = self._chr_pak.count
 
         self._current_idx: Optional[int] = None
         self._current_frame: int = 0
         self._current_palette_idx: int = 0
+
+        # Animation playback state (MCHR_ANM). ``_anim_flat`` is one frame
+        # per output tick; the timer advances ``_anim_pos`` and paints the
+        # named MCHR_CHR frame into the Animation tab's preview. 60 fps to
+        # match the tick basis the durations are counted in.
+        self._anim: Optional[mchr_anm.MchrAnm] = None
+        self._anim_idx: int = 0
+        self._anim_flat: List[mchr_anm.MchrAnimFrame] = []
+        self._anim_pos: int = 0
+        self._anim_fps: int = 60
+        self._anim_editing_frame: int = -1
+        self._anim_table_loading: bool = False
         # ``None`` lets render_frame_rgba use the NDS-OAM heuristic; we only
         # set this when the user moves the override spinner off zero.
         self._width_tiles_override: Optional[int] = None
@@ -238,6 +260,20 @@ class MchrBrowser(QWidget):
         self._all_frames_check = QCheckBox("Show all frames (strip)")
         self._all_frames_check.toggled.connect(self._on_all_frames_toggled)
 
+        # In-app "add a frame": duplicate the current frame, growing the CHR
+        # entry. Lets a single-frame sprite gain frames to animate between
+        # without a PNG round-trip. (A wider frames-sheet import also adds
+        # frames — this is the quick path.) Hidden in read-only mode.
+        self._dup_frame_btn = QPushButton("+ Duplicate frame")
+        self._dup_frame_btn.setToolTip(
+            "Append a copy of the current frame, growing this sprite's frame "
+            "count. Edit it via the Frames PNG tools, then reference it from "
+            "the Animation tab."
+        )
+        self._dup_frame_btn.clicked.connect(self._on_duplicate_frame)
+        if self._undo_stack is None:
+            self._dup_frame_btn.setVisible(False)
+
         # Palette index — the key control. Default tracks sprite index for
         # 0..662 (vanilla 1:1 mapping); past that the user pins it manually
         # until we figure out the real mapping table.
@@ -257,6 +293,7 @@ class MchrBrowser(QWidget):
         controls = QFormLayout()
         controls.addRow("Frame", self._frame_spin)
         controls.addRow("", self._all_frames_check)
+        controls.addRow("", self._dup_frame_btn)
         controls.addRow("Palette index", self._palette_spin)
         controls.addRow("Width (tiles)", self._width_spin)
 
@@ -342,7 +379,22 @@ class MchrBrowser(QWidget):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(8, 8, 8, 8)
-        right_layout.addWidget(self._scroll, 1)
+
+        # Frame preview lives in a "Frames" tab; the animation player + its
+        # editor live in an "Animation" tab (disabled for sprites with no
+        # real animation). Mirrors the SPR_* browser's tab split.
+        frames_tab = QWidget()
+        frames_tab_layout = QVBoxLayout(frames_tab)
+        frames_tab_layout.setContentsMargins(0, 0, 0, 0)
+        frames_tab_layout.addWidget(self._scroll, 1)
+
+        self._preview_tabs = QTabWidget()
+        self._preview_tabs.addTab(frames_tab, "Frames")
+        self._preview_tabs.addTab(self._build_anim_tab(), "Animation")
+        self._anim_tab_index = self._preview_tabs.count() - 1
+        self._preview_tabs.setTabEnabled(self._anim_tab_index, False)
+        self._preview_tabs.currentChanged.connect(self._on_preview_tab_changed)
+        right_layout.addWidget(self._preview_tabs, 1)
 
         # Single row under the preview: nav controls, then the two
         # button columns, then the metadata block, then stretch. Keeps
@@ -406,10 +458,44 @@ class MchrBrowser(QWidget):
         self._width_spin.setValue(remembered if remembered is not None else 0)
         self._width_spin.blockSignals(False)
         self._refresh_meta_and_preview()
+        self._stop_anim_playback()
+        self._refresh_anim_panel()
 
     def _on_frame_changed(self, value: int) -> None:
         self._current_frame = value
         self._refresh_preview_only()
+
+    def _on_duplicate_frame(self) -> None:
+        """Append a copy of the *selected* frame to the END of the sheet.
+
+        Appending (never inserting) is deliberate: existing animations
+        reference frames by index, so inserting in the middle would shift
+        every later frame and desync every sequence. The new frame lands at
+        index ``frame_count`` and nothing else moves."""
+        if self._current_idx is None or self._undo_stack is None:
+            return
+        ix = self._current_idx
+        entry = _decoded_entry(self._chr_pak, ix)
+        if entry is None or entry.frame_count == 0:
+            QMessageBox.warning(self, "Cannot duplicate", "No frame to copy.")
+            return
+        frames = list(entry.frames)
+        src = min(self._current_frame, len(frames) - 1)
+        frames.append(frames[src])
+        try:
+            new_raw = mchr.encode_mchr_chr_entry(frames)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Encode failed", str(exc))
+            return
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(MCHR_CHR, ix, sprite.compress_rle30(new_raw))],
+            description=(
+                f"Duplicate frame {src} → {len(frames) - 1} of MCHR 0x{ix:04x}"
+            ),
+            on_change=self._on_chr_entry_replaced,
+        )
+        self._undo_stack.push(cmd)
 
     def _on_palette_changed(self, value: int) -> None:
         self._current_palette_idx = value
@@ -423,8 +509,9 @@ class MchrBrowser(QWidget):
 
     def _on_all_frames_toggled(self, checked: bool) -> None:
         self._show_all_frames = checked
-        # Spinner is meaningless in strip mode; gray it out for clarity.
-        self._frame_spin.setEnabled(not checked)
+        # The Frame spinner stays live even in strip mode: it picks which
+        # frame is highlighted in the strip and which one "Duplicate frame"
+        # copies.
         self._refresh_preview_only()
 
     def _refresh_meta_and_preview(self) -> None:
@@ -451,7 +538,6 @@ class MchrBrowser(QWidget):
         self._frame_spin.blockSignals(True)
         self._frame_spin.setRange(0, max(0, entry.frame_count - 1))
         self._frame_spin.setValue(0)
-        self._frame_spin.setEnabled(not self._show_all_frames)
         self._frame_spin.blockSignals(False)
 
         self._refresh_preview_only()
@@ -487,6 +573,16 @@ class MchrBrowser(QWidget):
             pixmap.width() * 4, pixmap.height() * 4,
             Qt.KeepAspectRatio, Qt.FastTransformation,
         )
+        # In strip mode, outline the picked frame (the one "Duplicate frame"
+        # copies). Frames sit side by side with a 1px gutter, so frame i
+        # starts at x = i*(fw+1) in source pixels → ×4 in the scaled pixmap.
+        if self._show_all_frames and entry.frame_count > 0:
+            fw, _fh = self._frame_dims(entry)
+            cur = min(self._current_frame, entry.frame_count - 1)
+            painter = QPainter(scaled)
+            painter.setPen(QPen(QColor(0x2E, 0x9A, 0xFF), 3))
+            painter.drawRect(cur * (fw + 1) * 4, 0, fw * 4 - 1, scaled.height() - 1)
+            painter.end()
         self._image_label.setPixmap(scaled)
         # Force the QScrollArea to honor the pixmap's size so a wide
         # "show all frames" strip gets a horizontal scroll bar instead
@@ -530,6 +626,430 @@ class MchrBrowser(QWidget):
         else:
             wt, ht = mchr.pick_tile_grid(entry.tiles_per_frame)
         return wt * 8, ht * 8
+
+    # ---- animation (MCHR_ANM) -------------------------------------------
+
+    def _build_anim_tab(self) -> QWidget:
+        """Assemble the Animation preview tab: a play surface on the left,
+        the animation picker + editable frame list on the right.
+
+        Each frame record carries a frame index + duration (both editable)
+        plus a block of position/OAM params that are still unidentified —
+        those are preserved verbatim and not surfaced for editing."""
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(max(1, 1000 // self._anim_fps))
+        self._anim_timer.timeout.connect(self._on_anim_tick)
+
+        self._anim_label = QLabel("Select an animated sprite.")
+        self._anim_label.setAlignment(Qt.AlignCenter)
+        self._anim_label.setMinimumSize(256, 256)
+        self._anim_scroll = QScrollArea()
+        self._anim_scroll.setWidget(self._anim_label)
+        self._anim_scroll.setWidgetResizable(True)
+        self._anim_scroll.setAlignment(Qt.AlignCenter)
+
+        self._anim_combo = QComboBox()
+        self._anim_combo.currentIndexChanged.connect(self._on_anim_combo_changed)
+        self._anim_play_btn = QPushButton("▶ Play")
+        self._anim_play_btn.setCheckable(True)
+        self._anim_play_btn.toggled.connect(self._on_anim_play_toggled)
+        self._anim_fps_spin = QSpinBox()
+        self._anim_fps_spin.setRange(1, 120)
+        self._anim_fps_spin.setValue(self._anim_fps)
+        self._anim_fps_spin.setSuffix(" fps")
+        self._anim_fps_spin.valueChanged.connect(self._on_anim_fps_changed)
+
+        editable = self._undo_stack is not None
+        self._anim_table = QTableWidget(0, 2)
+        self._anim_table.setHorizontalHeaderLabels(["Frame", "Duration"])
+        self._anim_table.verticalHeader().setVisible(False)
+        self._anim_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+        self._anim_table.setEditTriggers(
+            (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+            if editable else QAbstractItemView.NoEditTriggers
+        )
+        self._anim_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._anim_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._anim_table.setMinimumHeight(220)
+        self._anim_table.itemSelectionChanged.connect(self._on_anim_row_selected)
+        self._anim_table.itemChanged.connect(self._on_anim_step_edited)
+
+        self._anim_add_btn = QPushButton("+ Add frame")
+        self._anim_add_btn.clicked.connect(self._on_anim_add_step)
+        self._anim_remove_btn = QPushButton("- Remove frame")
+        self._anim_remove_btn.clicked.connect(self._on_anim_remove_step)
+        self._anim_remove_btn.setEnabled(False)
+
+        note = QLabel(
+            "Frame = MCHR_CHR frame index · Duration = ticks.\n"
+            "Per-frame position/OAM params are preserved unchanged."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #888; font-size: 11px;")
+
+        combo_row = QHBoxLayout()
+        combo_row.addWidget(QLabel("Animation:"))
+        combo_row.addWidget(self._anim_combo, 1)
+        play_row = QHBoxLayout()
+        play_row.addWidget(self._anim_play_btn)
+        play_row.addWidget(self._anim_fps_spin)
+        play_row.addStretch(1)
+        step_row = QHBoxLayout()
+        step_row.addWidget(self._anim_add_btn)
+        step_row.addWidget(self._anim_remove_btn)
+        step_row.addStretch(1)
+
+        editor_panel = QWidget()
+        editor_panel.setMinimumWidth(320)
+        ep_layout = QVBoxLayout(editor_panel)
+        ep_layout.setContentsMargins(0, 0, 0, 0)
+        ep_layout.addLayout(combo_row)
+        ep_layout.addLayout(play_row)
+        ep_layout.addWidget(self._anim_table, 1)
+        if self._undo_stack is not None:
+            ep_layout.addLayout(step_row)
+        ep_layout.addWidget(note)
+
+        anim_split = QSplitter(Qt.Horizontal)
+        anim_split.addWidget(self._anim_scroll)
+        anim_split.addWidget(editor_panel)
+        anim_split.setStretchFactor(0, 1)
+        anim_split.setStretchFactor(1, 0)
+        anim_split.setSizes([460, 360])
+
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
+        tab_layout.addWidget(anim_split, 1)
+        return tab
+
+    def _refresh_anim_panel(self) -> None:
+        """Parse the current sprite's MCHR_ANM entry, repopulate the picker
+        + frame list, and enable/disable the Animation tab.
+
+        The tab is enabled when the sprite can actually show motion: it
+        already animates, or it has ≥2 CHR frames to cycle between — which
+        lets a modder build a new animation on a currently-static sprite by
+        adding frames to any of its (single-frame) animation slots."""
+        self._anim = None
+        if self._current_idx is not None and self._current_idx < self._anm_pak.count:
+            try:
+                self._anim = mchr_anm.parse_mchr_anm(
+                    self._anm_pak.entries[self._current_idx]
+                )
+            except (ValueError, IndexError):
+                self._anim = None
+        animations = self._anim.animations if self._anim else []
+
+        self._anim_combo.blockSignals(True)
+        self._anim_combo.clear()
+        for ai, anim in enumerate(animations):
+            self._anim_combo.addItem(self._anim_label_for(ai, anim), ai)
+        self._anim_combo.blockSignals(False)
+
+        entry = (
+            _decoded_entry(self._chr_pak, self._current_idx)
+            if self._current_idx is not None else None
+        )
+        frame_count = entry.frame_count if entry is not None else 0
+        can_animate = bool(
+            animations and (self._anim.has_animation or frame_count >= 2)
+        )
+        was_on_anim = self._preview_tabs.currentIndex() == self._anim_tab_index
+        if not can_animate and was_on_anim:
+            self._preview_tabs.setCurrentIndex(0)  # fall back to Frames
+        self._preview_tabs.setTabEnabled(self._anim_tab_index, can_animate)
+
+        self._anim_idx = 0
+        self._anim_pos = 0
+        self._anim_editing_frame = -1
+        if can_animate:
+            self._anim_combo.setCurrentIndex(0)
+        self._refresh_anim_table()
+        if not can_animate:
+            self._anim_label.setText(
+                "This sprite has a single frame — import more frames in the "
+                "Frames tab to build an animation."
+                if frame_count < 2 else "This sprite has no animation."
+            )
+        elif self._preview_tabs.currentIndex() == self._anim_tab_index:
+            self._show_current_anim_frame_static()
+
+    @staticmethod
+    def _anim_label_for(ai: int, anim: "mchr_anm.MchrAnimation") -> str:
+        n = len(anim.frames)
+        return f"Anim {ai} — {n} frame{'s' if n != 1 else ''}"
+
+    def _current_animation(self) -> Optional["mchr_anm.MchrAnimation"]:
+        if self._anim is None:
+            return None
+        if not (0 <= self._anim_idx < len(self._anim.animations)):
+            return None
+        return self._anim.animations[self._anim_idx]
+
+    def _refresh_anim_table(self) -> None:
+        anim = self._current_animation()
+        frames = anim.frames if anim else []
+        self._anim_table_loading = True
+        self._anim_table.blockSignals(True)
+        self._anim_table.setRowCount(len(frames))
+        for r, fr in enumerate(frames):
+            self._anim_table.setItem(r, 0, QTableWidgetItem(str(fr.frame)))
+            self._anim_table.setItem(r, 1, QTableWidgetItem(str(fr.duration)))
+        self._anim_table.blockSignals(False)
+        self._anim_table_loading = False
+        self._recompute_anim_flat()
+        self._update_anim_step_buttons()
+
+    def _recompute_anim_flat(self) -> None:
+        anim = self._current_animation()
+        self._anim_flat = mchr_anm.flatten_animation(anim) if anim else []
+        if self._anim_pos >= len(self._anim_flat):
+            self._anim_pos = 0
+
+    def _on_anim_combo_changed(self, _idx: int) -> None:
+        data = self._anim_combo.currentData()
+        self._anim_idx = int(data) if data is not None else 0
+        self._anim_pos = 0
+        self._anim_editing_frame = -1
+        self._refresh_anim_table()
+        if self._anim_timer.isActive() and self._anim_flat:
+            self._show_anim_frame(self._anim_flat[0])
+        elif self._preview_tabs.currentIndex() == self._anim_tab_index:
+            self._show_current_anim_frame_static()
+
+    def _on_anim_fps_changed(self, fps: int) -> None:
+        self._anim_fps = fps
+        self._anim_timer.setInterval(max(1, 1000 // fps))
+
+    def _on_preview_tab_changed(self, idx: int) -> None:
+        if idx == self._anim_tab_index:
+            self._show_current_anim_frame_static()
+        elif self._anim_timer.isActive():
+            self._stop_anim_playback()
+
+    def _on_anim_play_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._stop_anim_playback()
+            return
+        if not self._anim_flat:
+            self._recompute_anim_flat()
+        if not self._anim_flat:
+            self._anim_play_btn.setChecked(False)
+            return
+        self._anim_play_btn.setText("■ Stop")
+        self._anim_pos = 0
+        self._show_anim_frame(self._anim_flat[0])
+        self._anim_timer.start()
+
+    def _stop_anim_playback(self) -> None:
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+        self._anim_play_btn.blockSignals(True)
+        self._anim_play_btn.setChecked(False)
+        self._anim_play_btn.setText("▶ Play")
+        self._anim_play_btn.blockSignals(False)
+
+    def _on_anim_tick(self) -> None:
+        if not self._anim_flat:
+            return
+        self._anim_pos = (self._anim_pos + 1) % len(self._anim_flat)
+        self._show_anim_frame(self._anim_flat[self._anim_pos])
+
+    def _show_current_anim_frame_static(self) -> None:
+        if self._anim_timer.isActive():
+            return
+        anim = self._current_animation()
+        if anim is None or not anim.frames:
+            return
+        idx = self._anim_editing_frame if self._anim_editing_frame >= 0 else 0
+        idx = max(0, min(idx, len(anim.frames) - 1))
+        self._show_anim_frame(anim.frames[idx])
+
+    def _show_anim_frame(self, fr: "mchr_anm.MchrAnimFrame") -> None:
+        """Render the MCHR_CHR frame the record names into the Animation
+        preview, using the current palette + width override."""
+        if self._current_idx is None:
+            return
+        entry = _decoded_entry(self._chr_pak, self._current_idx)
+        palette = _decoded_palette(self._pal_pak, self._current_palette_idx)
+        if entry is None or palette is None:
+            return
+        if not (0 <= fr.frame < entry.frame_count):
+            self._anim_label.setText(
+                f"(frame {fr.frame} out of range — sprite has "
+                f"{entry.frame_count})"
+            )
+            return
+        pm = self._render_single_frame(
+            entry.frames[fr.frame], palette, self._width_tiles_override
+        )
+        scaled = pm.scaled(
+            pm.width() * 4, pm.height() * 4,
+            Qt.KeepAspectRatio, Qt.FastTransformation,
+        )
+        self._anim_label.setPixmap(scaled)
+        self._anim_label.setMinimumSize(scaled.size())
+
+    def _on_anim_row_selected(self) -> None:
+        rows = self._anim_table.selectionModel().selectedRows()
+        self._anim_editing_frame = rows[0].row() if rows else -1
+        self._update_anim_step_buttons()
+        if not self._anim_timer.isActive():
+            anim = self._current_animation()
+            if anim and 0 <= self._anim_editing_frame < len(anim.frames):
+                self._show_anim_frame(anim.frames[self._anim_editing_frame])
+
+    def _update_anim_step_buttons(self) -> None:
+        anim = self._current_animation()
+        editable = self._undo_stack is not None and anim is not None
+        self._anim_add_btn.setEnabled(editable)
+        self._anim_remove_btn.setEnabled(
+            editable
+            and len(anim.frames) > 1
+            and 0 <= self._anim_editing_frame < len(anim.frames)
+        )
+
+    def _on_anim_step_edited(self, item: QTableWidgetItem) -> None:
+        """Apply an in-cell Frame or Duration edit; invalid input reverts."""
+        if self._anim_table_loading or self._undo_stack is None:
+            return
+        if self._current_idx is None:
+            return
+        anim = self._current_animation()
+        if anim is None:
+            return
+        row, col = item.row(), item.column()
+        if not (0 <= row < len(anim.frames)) or col not in (0, 1):
+            return
+        fr = anim.frames[row]
+        try:
+            value = int(item.text())
+        except ValueError:
+            self._refresh_anim_table()
+            return
+        if value < 0:
+            self._refresh_anim_table()
+            return
+        if col == 0:
+            entry = _decoded_entry(self._chr_pak, self._current_idx)
+            n_frames = entry.frame_count if entry is not None else None
+            if n_frames and value >= n_frames:
+                value = n_frames - 1
+            if value == fr.frame:
+                return
+            fr.frame = value
+        else:
+            if value > 0xFFFF:
+                value = 0xFFFF
+            if value == fr.duration:
+                return
+            fr.duration = value
+        self._push_anim_change(
+            f"Edit MCHR 0x{self._current_idx:04x} anim {self._anim_idx} "
+            f"frame {row} {'index' if col == 0 else 'duration'}"
+        )
+
+    def _on_anim_add_step(self) -> None:
+        if self._undo_stack is None or self._current_idx is None:
+            return
+        anim = self._current_animation()
+        if anim is None:
+            return
+        row = self._anim_editing_frame
+        insert_at = row + 1 if 0 <= row < len(anim.frames) else len(anim.frames)
+        src = (
+            anim.frames[row] if 0 <= row < len(anim.frames)
+            else (anim.frames[-1] if anim.frames else None)
+        )
+        new = mchr_anm.MchrAnimFrame(
+            frame=src.frame if src else 0,
+            duration=src.duration if src else 4,
+            params=src.params if src else (0, 0, 0, 0, 0),
+        )
+        anim.frames.insert(insert_at, new)
+        self._anim_editing_frame = insert_at
+        self._push_anim_change(
+            f"Add MCHR 0x{self._current_idx:04x} anim {self._anim_idx} frame"
+        )
+
+    def _on_anim_remove_step(self) -> None:
+        if self._undo_stack is None or self._current_idx is None:
+            return
+        anim = self._current_animation()
+        if anim is None:
+            return
+        row = self._anim_editing_frame
+        if not (0 <= row < len(anim.frames)) or len(anim.frames) <= 1:
+            return
+        del anim.frames[row]
+        self._anim_editing_frame = min(row, len(anim.frames) - 1)
+        self._push_anim_change(
+            f"Remove MCHR 0x{self._current_idx:04x} anim {self._anim_idx} "
+            f"frame {row}"
+        )
+
+    def _push_anim_change(self, description: str) -> None:
+        if self._current_idx is None or self._undo_stack is None or self._anim is None:
+            return
+        try:
+            new_raw = mchr_anm.serialize_mchr_anm(self._anim)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Build failed", f"MCHR_ANM rebuild: {exc}")
+            return
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(MCHR_ANM, self._current_idx, sprite.compress_rle30(new_raw))],
+            description=description,
+            on_change=self._reload_anim_after_edit,
+        )
+        self._undo_stack.push(cmd)
+
+    def _reload_anim_after_edit(self) -> None:
+        """on_change after a frame edit (and its undo/redo). Re-parse and
+        refresh the table for the current animation, preserving which
+        animation is shown and the selected frame."""
+        if self._current_idx is None:
+            return
+        try:
+            self._anim = mchr_anm.parse_mchr_anm(
+                self._anm_pak.entries[self._current_idx]
+            )
+        except (ValueError, IndexError):
+            self._anim = None
+        if self._anim is None or not (
+            0 <= self._anim_idx < len(self._anim.animations)
+        ):
+            self._refresh_anim_panel()
+            return
+        anim = self._anim.animations[self._anim_idx]
+        if self._anim_table.rowCount() == len(anim.frames):
+            self._anim_table_loading = True
+            self._anim_table.blockSignals(True)
+            for r, fr in enumerate(anim.frames):
+                for col, text in ((0, str(fr.frame)), (1, str(fr.duration))):
+                    it = self._anim_table.item(r, col)
+                    if it is not None:
+                        it.setText(text)
+            self._anim_table.blockSignals(False)
+            self._anim_table_loading = False
+            self._recompute_anim_flat()
+            self._update_anim_step_buttons()
+            self._show_current_anim_frame_static()
+        else:
+            keep = self._anim_editing_frame
+            self._refresh_anim_table()
+            if anim.frames:
+                row = keep if 0 <= keep < len(anim.frames) else len(anim.frames) - 1
+                self._anim_table.selectRow(row)
+            self._show_current_anim_frame_static()
+
+    def aboutToTeardown(self) -> None:
+        """Stop the playback timer before the widget is deleted."""
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
 
     # ---- PNG export / import -------------------------------------------
 
@@ -1085,6 +1605,10 @@ class MchrBrowser(QWidget):
             )
             self._list.refresh_label(self._current_idx)
         self._refresh_meta_and_preview()
+        # Frame count may have changed (wider sheet = more frames), which can
+        # flip a static sprite into an animatable one — re-evaluate the tab.
+        self._stop_anim_playback()
+        self._refresh_anim_panel()
 
     def _build_indexed_strip(
         self, entry: mchr.MchrEntry, palette: mchr.Palette

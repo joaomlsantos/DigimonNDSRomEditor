@@ -191,6 +191,69 @@ class NcerFromExtractedFilesTests(unittest.TestCase):
                 )
 
 
+class AppendCellTests(unittest.TestCase):
+    """``append_cloned_cell`` grows an NCER by one cell that clones a source
+    cell's OAM layout with a tile-slot offset — the structural half of
+    "add an animation frame" (caller grows the NCGR alongside)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(DUSK_US):
+            raise unittest.SkipTest("Dusk ROM missing")
+        cls.chr_pak = _load_pak_from_rom(DUSK_US, "DAT/SPR_CHR.PAK")
+        cls.cel_pak = _load_pak_from_rom(DUSK_US, "DAT/SPR_CEL.PAK")
+
+    def _first_slot_linear_sprite(self):
+        """Find a sprite whose NCER mapping has slot == linear tile (2D,
+        boundary == bytes_per_tile) — the case the browser supports."""
+        count = min(self.chr_pak.count, self.cel_pak.count)
+        for ix in range(count):
+            try:
+                _tb, bd, *_ = sprite.parse_ncgr(self.chr_pak.entries[ix])
+                parsed = ncer.parse_ncer(self.cel_pak.entries[ix])
+            except (ValueError, IndexError):
+                continue
+            bpt = 32 if bd == 3 else 64
+            if not parsed.is_1d and parsed.boundary_bytes == bpt and parsed.cells:
+                return ix, bd, parsed
+        self.skipTest("no slot==linear sprite found")
+
+    def test_append_grows_cell_count_and_reparses(self):
+        ix, bd, parsed = self._first_slot_linear_sprite()
+        used = ncer.min_tiles_required(parsed, bpp4=(bd == 3))
+        grown = ncer.append_cloned_cell(self.cel_pak.entries[ix], 0, used)
+        reparsed = ncer.parse_ncer(grown)
+        self.assertEqual(len(reparsed.cells), len(parsed.cells) + 1)
+        # The new cell mirrors cell 0's OAM shapes/positions...
+        src, new = parsed.cells[0], reparsed.cells[-1]
+        self.assertEqual(len(new.oams), len(src.oams))
+        for so, no in zip(src.oams, new.oams):
+            self.assertEqual((no.x, no.y, no.w, no.h), (so.x, so.y, so.w, so.h))
+            # ...but its tiles point at the appended block.
+            self.assertEqual(no.tile, so.tile + used)
+        # The extra cell requires the grown tile bank.
+        self.assertEqual(
+            ncer.min_tiles_required(reparsed, bpp4=(bd == 3)), 2 * used
+        )
+
+    def test_existing_cells_unchanged(self):
+        ix, bd, parsed = self._first_slot_linear_sprite()
+        used = ncer.min_tiles_required(parsed, bpp4=(bd == 3))
+        reparsed = ncer.parse_ncer(
+            ncer.append_cloned_cell(self.cel_pak.entries[ix], 0, used)
+        )
+        for ci, cell in enumerate(parsed.cells):
+            for a, b in zip(cell.oams, reparsed.cells[ci].oams):
+                self.assertEqual(
+                    (a.x, a.y, a.w, a.h, a.tile), (b.x, b.y, b.w, b.h, b.tile)
+                )
+
+    def test_out_of_range_source_raises(self):
+        ix, _bd, parsed = self._first_slot_linear_sprite()
+        with self.assertRaises(IndexError):
+            ncer.append_cloned_cell(self.cel_pak.entries[ix], len(parsed.cells), 0)
+
+
 class SpriteBboxTests(unittest.TestCase):
     """``sprite_bbox`` collapses every cell's screen footprint into a single
     ``(w, h)`` tuple — the largest extent the sprite reaches in any cell.

@@ -17,18 +17,31 @@ Layout:
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import QEvent, Qt
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QUndoStack
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTransform,
+    QUndoStack,
+)
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -36,12 +49,14 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from digimon_core import ncer as ncer_mod, pak, sprite
+from digimon_core import nanr, ncer as ncer_mod, pak, sprite
 
 from ..commands import AppendPakEntriesCommand, ReplaceSpriteCommand
 from ._png_palette import build_palette_from_png
@@ -172,6 +187,10 @@ class SpriteBrowser(QWidget):
         self._chr_pak: pak.PakFile = session.sprite_pak(SPR_CHR)
         self._pal_pak: pak.PakFile = session.sprite_pak(SPR_PAL)
         self._cel_pak: pak.PakFile = session.sprite_pak(SPR_CEL)
+        # SPR_ANM is the fourth parallel pak (one NANR per sprite). Only
+        # read for the animation viewer — not part of the CHR/PAL/CEL
+        # preview pipeline, so it stays out of the _count clamp below.
+        self._anm_pak: pak.PakFile = session.sprite_pak(SPR_ANM)
         # Sanity: pair heuristic requires equal counts. Don't crash if the
         # ROM is unusual — just clamp browsing to the smallest.
         self._count = min(self._chr_pak.count, self._pal_pak.count, self._cel_pak.count)
@@ -206,6 +225,30 @@ class SpriteBrowser(QWidget):
         # both the footer warning text and the gating of the four cell-
         # mode export/import buttons. ``None`` before any selection.
         self._current_conflicts: Optional[OamTileConflicts] = None
+
+        # Animation playback state (SPR_ANM / NANR). ``_anim_flat`` is one
+        # cell index per output tick (see :func:`nanr.flatten_sequence`);
+        # the timer drives ``_anim_pos`` forward and each tick paints that
+        # cell into the Cells tab preview. Default FPS = 60 to match the
+        # NDS vblank the NANR frame durations are counted in — same basis
+        # as the BTCHR animation viewer.
+        self._anim: Optional[nanr.Nanr] = None
+        self._anim_seq_idx: int = 0
+        self._anim_flat: List[nanr.NanrFrame] = []
+        self._anim_pos: int = 0
+        self._anim_fps: int = 60
+        # Shared canvas for transformed playback: (ox, oy, w, h) fitting
+        # every frame's SRT-transformed bounds so the sprite scales / rotates
+        # / slides without the preview jumping. ``None`` for index (no
+        # transform) sequences. ``_anim_editing_frame`` is the frame row the
+        # transform editor targets; ``_anim_editor_loading`` guards the
+        # spinbox valueChanged signals during programmatic refresh.
+        self._anim_canvas: Optional[Tuple[int, int, int, int]] = None
+        self._anim_editing_frame: int = -1
+        self._anim_editor_loading: bool = False
+        # Guards the frame table's itemChanged handler against programmatic
+        # (re)population re-triggering a cell/duration re-encode.
+        self._anim_table_loading: bool = False
 
         # Reverse lookups: SPR index -> first sprite-map slot that points at
         # it. SpriteMapEntry.upperscreen_low is the portrait sprite, and
@@ -341,6 +384,16 @@ class SpriteBrowser(QWidget):
         self._cells_columns_spin.setValue(4)
         self._cells_columns_spin.setMaximumWidth(80)
         self._cells_columns_spin.valueChanged.connect(self._on_cells_columns_changed)
+        # Cell selector: picks the cell shown in single-cell view and the
+        # one "Add cell" clones. Lives in the general controls (always
+        # visible) so it's usable even from the Tiles tab.
+        self._cell_view_spin = QSpinBox()
+        self._cell_view_spin.setRange(0, 0)
+        self._cell_view_spin.valueChanged.connect(self._on_cell_view_changed)
+        # "Show all cells" grid (default) vs. a single selected cell.
+        self._cells_show_all_cb = QCheckBox("Show all cells")
+        self._cells_show_all_cb.setChecked(True)
+        self._cells_show_all_cb.toggled.connect(self._on_cells_show_all_toggled)
         # Tile-conflict heads-up: shows when the sprite has OAMs that
         # share source tiles. The cells composite still renders fine
         # (preview is read-only), but the import path would last-write-
@@ -418,6 +471,7 @@ class SpriteBrowser(QWidget):
         controls = QFormLayout()
         controls.addRow("Width (tiles)", self._width_spin)
         controls.addRow("Palette bank", self._palette_combo)
+        controls.addRow("Cell", self._cell_view_spin)
         controls.addRow("Transparent color", transparent_widget)
         # controls.addRow("OAM gaps", self._oam_overlay_check)
 
@@ -546,8 +600,27 @@ class SpriteBrowser(QWidget):
         # Footer (not header) per user request — the column control + the
         # conflict warning stay close to the preview but out of the way
         # of the actual cells render.
+        # "Add cell" appends a new, independently-editable cell (a copy of
+        # the last one pointing at a freshly-duplicated tile block) so a
+        # single-cell sprite can gain frames to animate between. Hidden in
+        # read-only mode.
+        self._add_cell_btn = QPushButton("+ Add cell (new frame)")
+        self._add_cell_btn.setToolTip(wrap_tooltip(
+            "Append a new cell that starts as a pixel-perfect copy of the "
+            "last one, backed by its own duplicated tiles (the NCGR grows). "
+            "Paint it independently via the tile / cell PNG tools, then "
+            "reference it from the Animation tab to build a new frame — e.g. "
+            "an eyes-closed copy of a portrait for a blink."
+        ))
+        self._add_cell_btn.clicked.connect(self._on_add_cell)
+        self._add_cell_btn.setEnabled(False)
+        if self._undo_stack is None:
+            self._add_cell_btn.setVisible(False)
+
         cells_footer = QHBoxLayout()
         cells_footer.setContentsMargins(0, 0, 0, 0)
+        cells_footer.addWidget(self._cells_show_all_cb)
+        cells_footer.addSpacing(12)
         cells_footer.addWidget(QLabel("Columns"))
         cells_footer.addWidget(self._cells_columns_spin)
         cells_footer.addSpacing(12)
@@ -559,6 +632,10 @@ class SpriteBrowser(QWidget):
         self._preview_tabs = QTabWidget()
         self._preview_tabs.addTab(tiles_tab, "Tiles")
         self._preview_tabs.addTab(cells_tab, "Cells")
+        self._preview_tabs.addTab(self._build_anim_tab(), "Animation")
+        self._anim_tab_index = self._preview_tabs.count() - 1
+        # Disabled until a sprite with real animation is selected.
+        self._preview_tabs.setTabEnabled(self._anim_tab_index, False)
         self._preview_tabs.currentChanged.connect(self._on_preview_tab_changed)
         right_layout.addWidget(self._preview_tabs, 1)
         # Action buttons grouped by target format: PNG column (lossy via
@@ -584,6 +661,7 @@ class SpriteBrowser(QWidget):
         native_col.addWidget(self._export_native_btn)
         native_col.addWidget(self._replace_native_btn)
         native_col.addWidget(self._duplicate_entry_btn)
+        native_col.addWidget(self._add_cell_btn)
         native_col.addStretch(1)
         controls_row = QHBoxLayout()
         controls_row.addLayout(controls)
@@ -646,8 +724,14 @@ class SpriteBrowser(QWidget):
             self._replace_png_btn.setEnabled(True)
             self._replace_native_btn.setEnabled(True)
             self._duplicate_entry_btn.setEnabled(True)
+            self._add_cell_btn.setEnabled(True)
         self._refresh_palette_combo()
         self._refresh_meta_and_preview()
+        # A new sprite has different cells/sequences — blindly continuing
+        # playback would render against the wrong tile bank. Stop first
+        # (after _refresh_meta_and_preview so the grid restore reads the
+        # fresh _cached), then repopulate the animation panel.
+        self._stop_anim_playback()
         # Recompute shared-tile detection so the four cell-mode buttons
         # are gated correctly for the freshly selected sprite. Has to
         # run *after* ``_refresh_meta_and_preview`` because the cached
@@ -661,6 +745,7 @@ class SpriteBrowser(QWidget):
         self._cells_dirty = True
         if self._preview_tabs.currentIndex() == 1:
             self._refresh_cells_preview()
+        self._refresh_anim_panel()
 
     def _on_palette_changed(self, bank: int) -> None:
         if bank < 0:
@@ -682,6 +767,12 @@ class SpriteBrowser(QWidget):
     def _on_preview_tab_changed(self, idx: int) -> None:
         if idx == 1 and self._cells_dirty:
             self._refresh_cells_preview()
+        if idx == self._anim_tab_index:
+            self._show_current_anim_frame_static()
+        elif self._anim_timer.isActive():
+            # Left the Animation tab — stop playback so the timer isn't
+            # updating a hidden surface.
+            self._stop_anim_playback()
 
     def _on_cells_columns_changed(self, value: int) -> None:
         if self._current_idx is not None:
@@ -712,31 +803,64 @@ class SpriteBrowser(QWidget):
             self._cells_label.setText("(no cells)")
             return
         n_cells = len(ctx.ncer.cells)
-        # Spinner sync: use the per-entry override if present, otherwise
-        # cap the live value at n_cells so a sprite with fewer cells
-        # than the previous one doesn't render a half-empty grid.
-        if self._current_idx in self._cells_columns_overrides:
-            columns = max(1, min(n_cells, self._cells_columns_overrides[self._current_idx]))
+        sel = max(0, min(self._cell_view_spin.value(), n_cells - 1))
+        show_all = self._cells_show_all_cb.isChecked()
+        # Columns only apply to the grid; disable the spinner in single view.
+        self._cells_columns_spin.setEnabled(show_all)
+        if not show_all:
+            img = shared_render_one_cell_qimage(ctx, sel)
+            columns = 1
         else:
-            columns = max(1, min(n_cells, self._cells_columns_spin.value()))
-        # Block signals so updating the spinner to match clamped value
-        # doesn't fire _on_cells_columns_changed → re-render loop.
-        self._cells_columns_spin.blockSignals(True)
-        self._cells_columns_spin.setValue(columns)
-        self._cells_columns_spin.blockSignals(False)
-        img = shared_render_cells_qimage(ctx, columns)
+            # Spinner sync: use the per-entry override if present, otherwise
+            # cap the live value at n_cells so a sprite with fewer cells
+            # than the previous one doesn't render a half-empty grid.
+            if self._current_idx in self._cells_columns_overrides:
+                columns = max(1, min(n_cells, self._cells_columns_overrides[self._current_idx]))
+            else:
+                columns = max(1, min(n_cells, self._cells_columns_spin.value()))
+            # Block signals so updating the spinner to match clamped value
+            # doesn't fire _on_cells_columns_changed → re-render loop.
+            self._cells_columns_spin.blockSignals(True)
+            self._cells_columns_spin.setValue(columns)
+            self._cells_columns_spin.blockSignals(False)
+            img = shared_render_cells_qimage(ctx, columns)
         if img is None:
             self._cells_label.setText("(empty render)")
             return
         pm = QPixmap.fromImage(img)
+        scale = 1
         # Match the tile preview's 2× zoom for small sprites.
         if max(pm.width(), pm.height()) < 256:
             pm = pm.scaled(
                 pm.width() * 2, pm.height() * 2,
                 Qt.KeepAspectRatio, Qt.FastTransformation,
             )
+            scale = 2
+        # Outline the selected cell in the grid (the one "Add cell" clones).
+        if show_all and n_cells > 1:
+            _rects, max_w, max_h = layout
+            col, row = sel % columns, sel // columns
+            painter = QPainter(pm)
+            painter.setPen(QPen(QColor(0x2E, 0x9A, 0xFF), 2))
+            painter.drawRect(
+                col * max_w * scale, row * max_h * scale,
+                max_w * scale - 1, max_h * scale - 1,
+            )
+            painter.end()
         self._cells_label.setPixmap(pm)
         self._cells_label.setMinimumSize(pm.size())
+
+    def _on_cell_view_changed(self, _value: int) -> None:
+        # Re-render the Cells tab (single-cell view or grid highlight) when
+        # the selected cell changes.
+        self._cells_dirty = True
+        if self._preview_tabs.currentIndex() == 1:
+            self._refresh_cells_preview()
+
+    def _on_cells_show_all_toggled(self, _checked: bool) -> None:
+        self._cells_dirty = True
+        if self._preview_tabs.currentIndex() == 1:
+            self._refresh_cells_preview()
 
     def _recompute_current_conflicts(self) -> None:
         """Refresh ``_current_conflicts`` from the currently-cached NCER.
@@ -770,25 +894,28 @@ class SpriteBrowser(QWidget):
             return
         if allow_shared_tile_exports():
             msg = (
-                f"{conflicts.shared_tiles} shared tiles: per-cell edits "
-                f"may not round-trip cleanly. Prefer Export/Import tiles "
-                f"PNG for this sprite."
+                f"{conflicts.shared_tiles} shared tiles: export is fine, but "
+                f"per-cell import may not round-trip cleanly. Prefer "
+                f"Export/Import tiles PNG to edit this sprite."
             )
         else:
             msg = (
-                f"{conflicts.shared_tiles} shared tiles: per-cell edits "
-                f"disabled. Use Export/Import tiles PNG to edit this sprite."
+                f"{conflicts.shared_tiles} shared tiles: export is fine, but "
+                f"per-cell import is disabled. Use Export/Import tiles PNG to "
+                f"edit this sprite."
             )
         self._cells_conflict_label.setText(msg)
 
     def _refresh_cell_export_button_states(self) -> None:
         """Gate the four cell-mode export/import buttons.
 
-        Buttons stay visible (so users can see they exist) but are
-        disabled when the sprite has shared tiles *and* the Edit-menu
-        override is off. Selection must also be set, and import buttons
-        additionally require an undo stack (read-only mode hides them
-        outright, see ``__init__``).
+        Export is read-only — it can never corrupt the sprite — so the two
+        export buttons follow selection alone, even for shared-tile sprites
+        (e.g. the Digi-Egg animations, whose 37 cells reuse 8 tile blocks).
+        Only *import* is gated: writing per-cell PNGs back through shared
+        tiles is last-write-wins, so it stays disabled when the sprite has
+        shared tiles and the Edit-menu override is off. Import buttons also
+        require an undo stack (read-only mode hides them, see ``__init__``).
         """
         has_selection = self._current_idx is not None
         conflicts = self._current_conflicts
@@ -797,12 +924,12 @@ class SpriteBrowser(QWidget):
             and conflicts.has_any
             and not allow_shared_tile_exports()
         )
-        cells_ok = has_selection and not blocked_by_conflicts
-        self._export_cells_png_btn.setEnabled(cells_ok)
-        self._export_per_cell_btn.setEnabled(cells_ok)
+        import_ok = has_selection and not blocked_by_conflicts
+        self._export_cells_png_btn.setEnabled(has_selection)
+        self._export_per_cell_btn.setEnabled(has_selection)
         if self._undo_stack is not None:
-            self._import_cells_png_btn.setEnabled(cells_ok)
-            self._import_per_cell_btn.setEnabled(cells_ok)
+            self._import_cells_png_btn.setEnabled(import_ok)
+            self._import_per_cell_btn.setEnabled(import_ok)
 
     def _on_cell_policy_changed(self, _enabled: bool) -> None:
         """Menu fired — re-evaluate button gating + warning text.
@@ -920,6 +1047,14 @@ class SpriteBrowser(QWidget):
         # reparsing the NCER on every preview refresh.
         self._cached = (tile_bytes, bit_depth, palettes, is_bitmap)
         self._cached_ncer = parsed_ncer
+        # Keep the cell selector in range for the (possibly new) cell count.
+        n_cells = len(parsed_ncer.cells)
+        self._cell_view_spin.blockSignals(True)
+        self._cell_view_spin.setRange(0, max(0, n_cells - 1))
+        if self._cell_view_spin.value() > max(0, n_cells - 1):
+            self._cell_view_spin.setValue(max(0, n_cells - 1))
+        self._cell_view_spin.setEnabled(n_cells > 0)
+        self._cell_view_spin.blockSignals(False)
         self._refresh_preview_only()
 
     def _refresh_preview_only(self) -> None:
@@ -2249,6 +2384,732 @@ class SpriteBrowser(QWidget):
         )
         self._undo_stack.push(cmd)
 
+    # ---- animation viewer (SPR_ANM / NANR) ------------------------------
+
+    def _build_anim_tab(self) -> QWidget:
+        """Assemble the standalone Animation preview tab.
+
+        Mirrors the BTCHR animation viewer (sequence picker, play/stop,
+        FPS) and extends it with the NANR affine transform: playback
+        renders into this tab's own preview surface, applying each frame's
+        scale / rotation / translation, and selecting a frame row exposes
+        an editor for those values. The tab is disabled for sprites with no
+        real animation (see :meth:`_refresh_anim_panel`)."""
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(max(1, 1000 // self._anim_fps))
+        self._anim_timer.timeout.connect(self._on_anim_tick)
+
+        # Dedicated preview surface — playback no longer borrows the Cells
+        # label, so switching tabs never disturbs the composite grid.
+        self._anim_label = QLabel("Select an animated sprite.")
+        self._anim_label.setAlignment(Qt.AlignCenter)
+        self._anim_label.setMinimumSize(256, 256)
+        self._anim_scroll = QScrollArea()
+        self._anim_scroll.setWidget(self._anim_label)
+        self._anim_scroll.setWidgetResizable(True)
+        self._anim_scroll.setAlignment(Qt.AlignCenter)
+
+        self._anim_seq_combo = QComboBox()
+        self._anim_seq_combo.currentIndexChanged.connect(self._on_anim_seq_changed)
+        self._anim_play_btn = QPushButton("▶ Play")
+        self._anim_play_btn.setCheckable(True)
+        self._anim_play_btn.toggled.connect(self._on_anim_play_toggled)
+        self._anim_fps_spin = QSpinBox()
+        self._anim_fps_spin.setRange(1, 120)
+        self._anim_fps_spin.setValue(self._anim_fps)
+        self._anim_fps_spin.setSuffix(" fps")
+        self._anim_fps_spin.valueChanged.connect(self._on_anim_fps_changed)
+
+        # Frame list: cell + duration are editable in-cell; the transform
+        # summary column is read-only (edit those via the fields below).
+        # Selecting a row loads that frame into the transform editor and
+        # shows it (transformed) in the preview.
+        self._anim_table = QTableWidget(0, 3)
+        self._anim_table.setHorizontalHeaderLabels(["Cell", "Duration", "Transform"])
+        self._anim_table.verticalHeader().setVisible(False)
+        self._anim_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+        editable = self._undo_stack is not None
+        self._anim_table.setEditTriggers(
+            (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+            if editable else QAbstractItemView.NoEditTriggers
+        )
+        self._anim_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._anim_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._anim_table.setMinimumHeight(220)
+        self._anim_table.itemSelectionChanged.connect(self._on_anim_row_selected)
+        self._anim_table.itemChanged.connect(self._on_anim_step_edited)
+
+        # Add / remove frame buttons — sit under the frame list. Remove is
+        # gated on a selection and on keeping at least one frame (the codec
+        # and engine both expect ≥1 frame per sequence).
+        self._anim_add_btn = QPushButton("+ Add frame")
+        self._anim_add_btn.clicked.connect(self._on_anim_add_step)
+        self._anim_remove_btn = QPushButton("- Remove frame")
+        self._anim_remove_btn.clicked.connect(self._on_anim_remove_step)
+        self._anim_remove_btn.setEnabled(False)
+
+        # Transform editor — edits the selected frame's SRT. Scale/rotation
+        # need an SRT sequence (element 1); translate needs SRT or the
+        # translate format (element 2). Widgets enable per the sequence's
+        # element in _load_transform_editor. Edits re-encode the whole NANR
+        # entry and push a ReplaceSpriteCommand on SPR_ANM.
+        self._tf_scale_x = QDoubleSpinBox()
+        self._tf_scale_x.setRange(-32.0, 31.999)
+        self._tf_scale_x.setSingleStep(0.05)
+        self._tf_scale_x.setDecimals(3)
+        self._tf_scale_y = QDoubleSpinBox()
+        self._tf_scale_y.setRange(-32.0, 31.999)
+        self._tf_scale_y.setSingleStep(0.05)
+        self._tf_scale_y.setDecimals(3)
+        self._tf_rot = QDoubleSpinBox()
+        self._tf_rot.setRange(0.0, 359.999)
+        self._tf_rot.setSingleStep(1.0)
+        self._tf_rot.setDecimals(1)
+        self._tf_rot.setSuffix("°")
+        self._tf_rot.setWrapping(True)
+        self._tf_tx = QSpinBox()
+        self._tf_tx.setRange(-512, 511)
+        self._tf_ty = QSpinBox()
+        self._tf_ty.setRange(-512, 511)
+        self._tf_scale_x.valueChanged.connect(lambda _v: self._on_transform_edited())
+        self._tf_scale_y.valueChanged.connect(lambda _v: self._on_transform_edited())
+        self._tf_rot.valueChanged.connect(lambda _v: self._on_transform_edited())
+        self._tf_tx.valueChanged.connect(lambda _v: self._on_transform_edited())
+        self._tf_ty.valueChanged.connect(lambda _v: self._on_transform_edited())
+        for w in (self._tf_scale_x, self._tf_scale_y, self._tf_rot,
+                  self._tf_tx, self._tf_ty):
+            w.setMaximumWidth(90)
+
+        # Transform editor as a compact form so it fits the right sidebar.
+        # Fields enable per the sequence's element in _load_transform_editor.
+        self._tf_row_widget = QWidget()
+        tf_form = QFormLayout(self._tf_row_widget)
+        tf_form.setContentsMargins(0, 0, 0, 0)
+        scale_row = QHBoxLayout()
+        scale_row.setContentsMargins(0, 0, 0, 0)
+        scale_row.addWidget(self._tf_scale_x)
+        scale_row.addWidget(self._tf_scale_y)
+        scale_row.addStretch(1)
+        scale_host = QWidget()
+        scale_host.setLayout(scale_row)
+        tf_form.addRow("Scale", scale_host)
+        tf_form.addRow("Rotate", self._tf_rot)
+        trans_row = QHBoxLayout()
+        trans_row.setContentsMargins(0, 0, 0, 0)
+        trans_row.addWidget(self._tf_tx)
+        trans_row.addWidget(self._tf_ty)
+        trans_row.addStretch(1)
+        trans_host = QWidget()
+        trans_host.setLayout(trans_row)
+        tf_form.addRow("Translate", trans_host)
+        # Read-only viewers (no undo stack) can't push edits — hide the
+        # editor entirely so the panel reads as a pure visualizer.
+        if self._undo_stack is None:
+            self._tf_row_widget.setVisible(False)
+
+        # "Enable transforms" upgrades an index/translate sequence to the SRT
+        # format so scale/rotation/translation become editable. Lossless — the
+        # frames keep identity transforms, so the animation looks unchanged
+        # until a value is edited. Disabled once the sequence is already SRT.
+        self._anim_srt_btn = QPushButton("Enable transforms (SRT)")
+        self._anim_srt_btn.setToolTip(wrap_tooltip(
+            "Most move sequences store only a cell index per frame — no room "
+            "for scale/rotation/translation, so those fields are greyed out. "
+            "This converts the sequence to the SRT format (frames start at "
+            "identity, so nothing changes visually) and unlocks the transform "
+            "fields. Note: whether the transform actually shows in-game "
+            "depends on how that sprite is drawn."
+        ))
+        self._anim_srt_btn.clicked.connect(self._on_enable_srt)
+        self._anim_srt_btn.setEnabled(False)
+
+        # Right sidebar: sequence picker, play controls, frame list, the
+        # add/remove buttons, and the transform editor — sits beside the
+        # preview rather than under it.
+        seq_row = QHBoxLayout()
+        seq_row.addWidget(QLabel("Sequence:"))
+        seq_row.addWidget(self._anim_seq_combo, 1)
+        play_row = QHBoxLayout()
+        play_row.addWidget(self._anim_play_btn)
+        play_row.addWidget(self._anim_fps_spin)
+        play_row.addStretch(1)
+        step_btn_row = QHBoxLayout()
+        step_btn_row.addWidget(self._anim_add_btn)
+        step_btn_row.addWidget(self._anim_remove_btn)
+        step_btn_row.addStretch(1)
+        editor_panel = QWidget()
+        editor_panel.setMinimumWidth(360)
+        editor_layout = QVBoxLayout(editor_panel)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.addLayout(seq_row)
+        editor_layout.addLayout(play_row)
+        editor_layout.addWidget(self._anim_table, 1)
+        # Read-only viewers can't add/remove frames — hide the buttons.
+        if self._undo_stack is not None:
+            editor_layout.addLayout(step_btn_row)
+            srt_row = QHBoxLayout()
+            srt_row.addWidget(self._anim_srt_btn)
+            srt_row.addStretch(1)
+            editor_layout.addLayout(srt_row)
+        editor_layout.addWidget(self._tf_row_widget)
+
+        anim_split = QSplitter(Qt.Horizontal)
+        anim_split.addWidget(self._anim_scroll)
+        anim_split.addWidget(editor_panel)
+        anim_split.setStretchFactor(0, 1)
+        anim_split.setStretchFactor(1, 0)
+        anim_split.setSizes([440, 400])
+
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
+        tab_layout.addWidget(anim_split, 1)
+        return tab
+
+    def _refresh_anim_panel(self) -> None:
+        """Parse the current sprite's NANR, repopulate the sequence picker +
+        frame list, and enable/disable the Animation tab.
+
+        The tab is enabled only for sprites that actually animate (a
+        sequence with more than one frame). Single-frame stubs (icons /
+        portraits / UI) and pose-only sheets leave it disabled. If the
+        Animation tab is showing when a non-animated sprite is selected,
+        fall back to the Cells tab so the user isn't left on a dead pane."""
+        self._anim = None
+        if (
+            self._current_idx is not None
+            and self._current_idx < self._anm_pak.count
+        ):
+            try:
+                self._anim = nanr.parse_nanr(
+                    self._anm_pak.entries[self._current_idx]
+                )
+            except (ValueError, IndexError):
+                self._anim = None
+        sequences = self._anim.sequences if self._anim else []
+
+        self._anim_seq_combo.blockSignals(True)
+        self._anim_seq_combo.clear()
+        for si, seq in enumerate(sequences):
+            self._anim_seq_combo.addItem(self._seq_label(si, seq), si)
+        self._anim_seq_combo.blockSignals(False)
+
+        # Enable the tab when the sprite can show motion: it already
+        # animates, or it has ≥2 NCER cells to cycle between — so a modder
+        # can build an animation on a currently-static sprite by adding
+        # frames to its (single-frame) sequence.
+        ncer_obj = getattr(self, "_cached_ncer", None)
+        n_cells = len(ncer_obj.cells) if ncer_obj is not None else 0
+        can_animate = bool(
+            sequences and (self._anim.has_animation or n_cells >= 2)
+        )
+        was_on_anim_tab = (
+            self._preview_tabs.currentIndex() == self._anim_tab_index
+        )
+        if not can_animate and was_on_anim_tab:
+            self._preview_tabs.setCurrentIndex(1)  # fall back to Cells
+        self._preview_tabs.setTabEnabled(self._anim_tab_index, can_animate)
+
+        self._anim_seq_idx = 0
+        self._anim_pos = 0
+        self._anim_editing_frame = -1
+        if can_animate:
+            self._anim_seq_combo.setCurrentIndex(0)
+        self._refresh_anim_table()
+        if not can_animate:
+            self._anim_label.setText(
+                "This sprite has a single cell — nothing to animate between."
+                if n_cells < 2 else "This sprite has no animation."
+            )
+        elif self._preview_tabs.currentIndex() == self._anim_tab_index:
+            self._show_current_anim_frame_static()
+
+    @staticmethod
+    def _seq_label(si: int, seq: nanr.NanrSequence) -> str:
+        n = len(seq.frames)
+        mode = "loop" if seq.loops else "once"
+        tag = ""
+        if seq.element == nanr.ELEMENT_SRT:
+            tag = " · SRT"
+        elif seq.element == nanr.ELEMENT_INDEX_T:
+            tag = " · move"
+        return f"Seq {si} — {n} frame{'s' if n != 1 else ''} ({mode}){tag}"
+
+    @staticmethod
+    def _transform_summary(fr: nanr.NanrFrame) -> str:
+        if fr.is_identity:
+            return "—"
+        parts: List[str] = []
+        if fr.scale_x != nanr.SCALE_ONE or fr.scale_y != nanr.SCALE_ONE:
+            if fr.scale_x == fr.scale_y:
+                parts.append(f"scale {fr.scale_x_f:.2f}")
+            else:
+                parts.append(f"scale {fr.scale_x_f:.2f},{fr.scale_y_f:.2f}")
+        if fr.rot:
+            parts.append(f"rot {fr.rotation_deg:.0f}°")
+        if fr.trans_x or fr.trans_y:
+            parts.append(f"move {fr.trans_x},{fr.trans_y}")
+        return "  ".join(parts)
+
+    def _current_sequence(self) -> Optional[nanr.NanrSequence]:
+        if self._anim is None:
+            return None
+        if not (0 <= self._anim_seq_idx < len(self._anim.sequences)):
+            return None
+        return self._anim.sequences[self._anim_seq_idx]
+
+    def _refresh_anim_table(self) -> None:
+        seq = self._current_sequence()
+        frames = seq.frames if seq else []
+        self._anim_table_loading = True
+        self._anim_table.blockSignals(True)
+        self._anim_table.setRowCount(len(frames))
+        for r, fr in enumerate(frames):
+            cell_item = QTableWidgetItem(str(fr.cell))
+            dur_item = QTableWidgetItem(str(fr.duration))
+            tf_item = QTableWidgetItem(self._transform_summary(fr))
+            # Transform column is read-only — edit it via the fields below.
+            tf_item.setFlags(tf_item.flags() & ~Qt.ItemIsEditable)
+            self._anim_table.setItem(r, 0, cell_item)
+            self._anim_table.setItem(r, 1, dur_item)
+            self._anim_table.setItem(r, 2, tf_item)
+        self._anim_table.blockSignals(False)
+        self._anim_table_loading = False
+        self._recompute_anim_flat()
+        self._compute_anim_canvas()
+        self._load_transform_editor()
+        self._update_anim_step_buttons()
+
+    def _recompute_anim_flat(self) -> None:
+        """Expand the active sequence into a per-tick frame list. Resets
+        ``_anim_pos`` if it now points past the new length so playback
+        keeps a valid index after a sequence switch."""
+        seq = self._current_sequence()
+        self._anim_flat = nanr.flatten_sequence(seq) if seq else []
+        if self._anim_pos >= len(self._anim_flat):
+            self._anim_pos = 0
+
+    # ---- transform geometry ---------------------------------------------
+
+    def _base_sprite_size(self) -> Optional[Tuple[int, int]]:
+        """The union slot size every cell renders at (max cell bbox)."""
+        layout = self._cell_layout()
+        if layout is None:
+            return None
+        _, max_w, max_h = layout
+        if max_w <= 0 or max_h <= 0:
+            return None
+        return max_w, max_h
+
+    @staticmethod
+    def _frame_transform(fr: nanr.NanrFrame, w: int, h: int) -> QTransform:
+        """Affine for one frame: scale + rotate about the sprite centre,
+        then translate. Matches the NDS OAM-affine convention closely
+        enough for a faithful preview (the cell fills its slot, so the
+        slot centre ≈ the sprite centre)."""
+        t = QTransform()
+        t.translate(w / 2.0 + fr.trans_x, h / 2.0 + fr.trans_y)
+        t.rotate(fr.rotation_deg)
+        t.scale(fr.scale_x_f, fr.scale_y_f)
+        t.translate(-w / 2.0, -h / 2.0)
+        return t
+
+    def _compute_anim_canvas(self) -> None:
+        """Size a shared canvas that fits every frame's transformed bounds.
+
+        Keeps the preview stable across ticks (a shrinking egg or a sliding
+        projectile doesn't resize the label each frame). ``None`` for a
+        sequence with no transform, so those fall back to the plain cell
+        render."""
+        self._anim_canvas = None
+        seq = self._current_sequence()
+        size = self._base_sprite_size()
+        if seq is None or size is None:
+            return
+        if all(fr.is_identity for fr in seq.frames):
+            return
+        w, h = size
+        minx = miny = math.inf
+        maxx = maxy = -math.inf
+        corners = ((0, 0), (w, 0), (0, h), (w, h))
+        for fr in seq.frames:
+            t = self._frame_transform(fr, w, h)
+            for cx, cy in corners:
+                px, py = t.map(float(cx), float(cy))
+                minx, miny = min(minx, px), min(miny, py)
+                maxx, maxy = max(maxx, px), max(maxy, py)
+        ox, oy = math.floor(minx), math.floor(miny)
+        cw = max(1, math.ceil(maxx) - ox)
+        ch = max(1, math.ceil(maxy) - oy)
+        self._anim_canvas = (ox, oy, cw, ch)
+
+    def _on_anim_seq_changed(self, _idx: int) -> None:
+        data = self._anim_seq_combo.currentData()
+        self._anim_seq_idx = int(data) if data is not None else 0
+        self._anim_pos = 0
+        self._anim_editing_frame = -1
+        self._refresh_anim_table()
+        if self._anim_timer.isActive() and self._anim_flat:
+            self._show_anim_frame(self._anim_flat[0])
+
+    def _on_anim_fps_changed(self, fps: int) -> None:
+        self._anim_fps = fps
+        self._anim_timer.setInterval(max(1, 1000 // fps))
+
+    def _on_anim_play_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._stop_anim_playback()
+            return
+        if not self._anim_flat:
+            self._recompute_anim_flat()
+        if not self._anim_flat or self._cell_ctx() is None:
+            self._anim_play_btn.setChecked(False)
+            return
+        self._anim_play_btn.setText("■ Stop")
+        self._anim_pos = 0
+        self._show_anim_frame(self._anim_flat[0])
+        self._anim_timer.start()
+
+    def _stop_anim_playback(self) -> None:
+        """Halt the timer and reset the play button. The Animation tab has
+        its own preview surface, so nothing else needs restoring — the
+        last-shown frame simply stays put."""
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+        self._anim_play_btn.blockSignals(True)
+        self._anim_play_btn.setChecked(False)
+        self._anim_play_btn.setText("▶ Play")
+        self._anim_play_btn.blockSignals(False)
+
+    def _on_anim_tick(self) -> None:
+        if not self._anim_flat:
+            return
+        self._anim_pos = (self._anim_pos + 1) % len(self._anim_flat)
+        self._show_anim_frame(self._anim_flat[self._anim_pos])
+
+    def _show_current_anim_frame_static(self) -> None:
+        """Paint the selected (or first) frame into the Animation preview
+        without starting playback — used when the tab becomes visible or a
+        new sprite is selected while the tab is open."""
+        if self._anim_timer.isActive():
+            return
+        seq = self._current_sequence()
+        if seq is None or not seq.frames:
+            return
+        idx = self._anim_editing_frame if self._anim_editing_frame >= 0 else 0
+        idx = max(0, min(idx, len(seq.frames) - 1))
+        self._show_anim_frame(seq.frames[idx])
+
+    def _show_anim_frame(self, frame: nanr.NanrFrame) -> None:
+        """Render one animation frame — its NCER cell with the frame's SRT
+        transform applied — into the Animation tab's preview label.
+
+        Index (untransformed) frames draw the cell in place at the union
+        slot size, matching the BTCHR viewer. Transformed frames composite
+        the cell into the shared canvas so scale / rotation / translation
+        show correctly and stay stable across ticks."""
+        img = self._render_one_cell_qimage(frame.cell)
+        if img is None:
+            return
+        cell_pm = QPixmap.fromImage(img)
+        if self._anim_canvas is None or frame.is_identity:
+            pm = cell_pm
+        else:
+            ox, oy, cw, ch = self._anim_canvas
+            canvas = QImage(cw, ch, QImage.Format_ARGB32)
+            canvas.fill(0)
+            painter = QPainter(canvas)
+            painter.translate(-ox, -oy)
+            painter.setWorldTransform(
+                self._frame_transform(frame, cell_pm.width(), cell_pm.height()),
+                combine=True,
+            )
+            painter.drawPixmap(0, 0, cell_pm)
+            painter.end()
+            pm = QPixmap.fromImage(canvas)
+        if max(pm.width(), pm.height()) < 256:
+            pm = pm.scaled(
+                pm.width() * 2, pm.height() * 2,
+                Qt.KeepAspectRatio, Qt.FastTransformation,
+            )
+        self._anim_label.setPixmap(pm)
+        self._anim_label.setMinimumSize(pm.size())
+
+    # ---- transform editing ----------------------------------------------
+
+    def _on_anim_row_selected(self) -> None:
+        rows = self._anim_table.selectionModel().selectedRows()
+        self._anim_editing_frame = rows[0].row() if rows else -1
+        self._load_transform_editor()
+        self._update_anim_step_buttons()
+        # Show the selected frame (transformed) when not playing so edits
+        # are visible immediately.
+        if not self._anim_timer.isActive():
+            seq = self._current_sequence()
+            if seq and 0 <= self._anim_editing_frame < len(seq.frames):
+                self._show_anim_frame(seq.frames[self._anim_editing_frame])
+
+    def _update_anim_step_buttons(self) -> None:
+        seq = self._current_sequence()
+        editable = self._undo_stack is not None and seq is not None
+        self._anim_add_btn.setEnabled(editable)
+        self._anim_remove_btn.setEnabled(
+            editable
+            and len(seq.frames) > 1
+            and 0 <= self._anim_editing_frame < len(seq.frames)
+        )
+        # "Enable transforms" only makes sense on a non-SRT sequence.
+        self._anim_srt_btn.setEnabled(
+            editable and seq.element != nanr.ELEMENT_SRT
+        )
+
+    def _on_enable_srt(self) -> None:
+        """Upgrade the current sequence to the SRT element format so its
+        frames can carry scale / rotation / translation. Lossless: existing
+        frames keep their (identity, or translate-only) transform values."""
+        if self._undo_stack is None or self._current_idx is None:
+            return
+        seq = self._current_sequence()
+        if seq is None or seq.element == nanr.ELEMENT_SRT:
+            return
+        seq.element = nanr.ELEMENT_SRT
+        self._push_anim_change(
+            f"Enable transforms (SRT) on SPR 0x{self._current_idx:04x} anim "
+            f"seq {self._anim_seq_idx}"
+        )
+        # Reflect the new element in the sequence picker label + editors.
+        if self._anim and 0 <= self._anim_seq_idx < len(self._anim.sequences):
+            self._anim_seq_combo.blockSignals(True)
+            self._anim_seq_combo.setItemText(
+                self._anim_seq_idx,
+                self._seq_label(self._anim_seq_idx,
+                                self._anim.sequences[self._anim_seq_idx]),
+            )
+            self._anim_seq_combo.blockSignals(False)
+        self._update_anim_step_buttons()
+        self._load_transform_editor()
+
+    def _on_anim_step_edited(self, item: QTableWidgetItem) -> None:
+        """Apply an in-cell edit of a frame's Cell or Duration. Invalid
+        input reverts from the model. The Transform column is read-only."""
+        if self._anim_table_loading or self._undo_stack is None:
+            return
+        if self._current_idx is None:
+            return
+        seq = self._current_sequence()
+        if seq is None:
+            return
+        row, col = item.row(), item.column()
+        if not (0 <= row < len(seq.frames)) or col not in (0, 1):
+            return
+        fr = seq.frames[row]
+        try:
+            value = int(item.text())
+        except ValueError:
+            self._refresh_anim_table()  # silent revert to the model value
+            return
+        if value < 0:
+            self._refresh_anim_table()
+            return
+        if col == 0:
+            ncer_obj = getattr(self, "_cached_ncer", None)
+            n_cells = len(ncer_obj.cells) if ncer_obj is not None else None
+            if n_cells and value >= n_cells:
+                value = n_cells - 1
+            if value == fr.cell:
+                return
+            fr.cell = value
+        else:  # duration
+            if value > 0xFFFF:
+                value = 0xFFFF
+            if value == fr.duration:
+                return
+            fr.duration = value
+        self._push_anim_change(
+            f"Edit SPR 0x{self._current_idx:04x} anim seq {self._anim_seq_idx} "
+            f"frame {row} {'cell' if col == 0 else 'duration'}"
+        )
+
+    def _on_anim_add_step(self) -> None:
+        """Insert a frame after the selected one (duplicating it), or append
+        when nothing is selected."""
+        if self._undo_stack is None or self._current_idx is None:
+            return
+        seq = self._current_sequence()
+        if seq is None:
+            return
+        row = self._anim_editing_frame
+        insert_at = row + 1 if 0 <= row < len(seq.frames) else len(seq.frames)
+        src = (
+            seq.frames[row] if 0 <= row < len(seq.frames)
+            else (seq.frames[-1] if seq.frames else None)
+        )
+        new = nanr.NanrFrame(
+            cell=src.cell if src else 0,
+            duration=src.duration if src else 4,
+            rot=src.rot if src else 0,
+            scale_x=src.scale_x if src else nanr.SCALE_ONE,
+            scale_y=src.scale_y if src else nanr.SCALE_ONE,
+            trans_x=src.trans_x if src else 0,
+            trans_y=src.trans_y if src else 0,
+        )
+        seq.frames.insert(insert_at, new)
+        self._anim_editing_frame = insert_at
+        self._push_anim_change(
+            f"Add SPR 0x{self._current_idx:04x} anim seq {self._anim_seq_idx} frame"
+        )
+
+    def _on_anim_remove_step(self) -> None:
+        """Delete the selected frame. Guarded to keep at least one frame —
+        the codec and engine both need a non-empty sequence."""
+        if self._undo_stack is None or self._current_idx is None:
+            return
+        seq = self._current_sequence()
+        if seq is None:
+            return
+        row = self._anim_editing_frame
+        if not (0 <= row < len(seq.frames)) or len(seq.frames) <= 1:
+            return
+        del seq.frames[row]
+        self._anim_editing_frame = min(row, len(seq.frames) - 1)
+        self._push_anim_change(
+            f"Remove SPR 0x{self._current_idx:04x} anim seq {self._anim_seq_idx} "
+            f"frame {row}"
+        )
+
+    def _push_anim_change(self, description: str) -> None:
+        """Serialize the live ``_anim`` and push it as a SPR_ANM replace."""
+        if self._current_idx is None or self._undo_stack is None or self._anim is None:
+            return
+        try:
+            new_nanr = nanr.serialize_nanr(
+                self._anim, self._anm_pak.entries[self._current_idx]
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Build failed", f"NANR rebuild: {exc}")
+            return
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(SPR_ANM, self._current_idx, sprite.compress_rle30(new_nanr))],
+            description=description,
+            on_change=self._reload_anim_after_edit,
+        )
+        self._undo_stack.push(cmd)
+
+    def _load_transform_editor(self) -> None:
+        """Populate the transform spinboxes from the selected frame and
+        enable only the fields the sequence's element format can store."""
+        seq = self._current_sequence()
+        fr = None
+        if seq and 0 <= self._anim_editing_frame < len(seq.frames):
+            fr = seq.frames[self._anim_editing_frame]
+        srt = bool(seq and seq.element == nanr.ELEMENT_SRT)
+        translate = bool(seq and seq.element in (nanr.ELEMENT_SRT, nanr.ELEMENT_INDEX_T))
+        self._anim_editor_loading = True
+        try:
+            self._tf_scale_x.setValue(fr.scale_x_f if fr else 1.0)
+            self._tf_scale_y.setValue(fr.scale_y_f if fr else 1.0)
+            self._tf_rot.setValue(fr.rotation_deg if fr else 0.0)
+            self._tf_tx.setValue(fr.trans_x if fr else 0)
+            self._tf_ty.setValue(fr.trans_y if fr else 0)
+        finally:
+            self._anim_editor_loading = False
+        has_frame = fr is not None
+        self._tf_scale_x.setEnabled(has_frame and srt)
+        self._tf_scale_y.setEnabled(has_frame and srt)
+        self._tf_rot.setEnabled(has_frame and srt)
+        self._tf_tx.setEnabled(has_frame and translate)
+        self._tf_ty.setEnabled(has_frame and translate)
+
+    def _on_transform_edited(self) -> None:
+        """Write the edited transform back into the NANR and push it as a
+        SPR_ANM replace command."""
+        if self._anim_editor_loading or self._undo_stack is None:
+            return
+        if self._current_idx is None:
+            return
+        seq = self._current_sequence()
+        if seq is None or not (0 <= self._anim_editing_frame < len(seq.frames)):
+            return
+        fr = seq.frames[self._anim_editing_frame]
+        new_scale_x = int(round(self._tf_scale_x.value() * nanr.SCALE_ONE))
+        new_scale_y = int(round(self._tf_scale_y.value() * nanr.SCALE_ONE))
+        new_rot = int(round(self._tf_rot.value() / 360.0 * nanr.ROT_FULL)) & 0xFFFF
+        new_tx = self._tf_tx.value()
+        new_ty = self._tf_ty.value()
+        if (new_scale_x, new_scale_y, new_rot, new_tx, new_ty) == (
+            fr.scale_x, fr.scale_y, fr.rot, fr.trans_x, fr.trans_y
+        ):
+            return
+        fr.scale_x = new_scale_x
+        fr.scale_y = new_scale_y
+        fr.rot = new_rot
+        fr.trans_x = new_tx
+        fr.trans_y = new_ty
+        self._push_anim_change(
+            f"Edit SPR 0x{self._current_idx:04x} anim seq "
+            f"{self._anim_seq_idx} frame {self._anim_editing_frame} transform"
+        )
+
+    def _reload_anim_after_edit(self) -> None:
+        """on_change hook after any frame edit (cell / duration / transform /
+        add / remove) — fires on the edit's own redo and on later undo/redo.
+
+        Re-parses the live entry and refreshes the table for the *current*
+        sequence, preserving which sequence is shown and the selected frame.
+        Same-count edits update the cells in place so the selection and any
+        active spinbox survive a run of edits; add/remove rebuilds the rows
+        and restores the selection. A blanket ``_refresh_anim_panel`` here
+        would reset the sequence to 0 and drop ``_anim_editing_frame``,
+        disabling the editors after a single click."""
+        if self._current_idx is None:
+            return
+        try:
+            self._anim = nanr.parse_nanr(self._anm_pak.entries[self._current_idx])
+        except (ValueError, IndexError):
+            self._anim = None
+        if self._anim is None or not (
+            0 <= self._anim_seq_idx < len(self._anim.sequences)
+        ):
+            self._refresh_anim_panel()
+            return
+        seq = self._anim.sequences[self._anim_seq_idx]
+        if self._anim_table.rowCount() == len(seq.frames):
+            self._anim_table_loading = True
+            self._anim_table.blockSignals(True)
+            for r, fr in enumerate(seq.frames):
+                for col, text in (
+                    (0, str(fr.cell)),
+                    (1, str(fr.duration)),
+                    (2, self._transform_summary(fr)),
+                ):
+                    item = self._anim_table.item(r, col)
+                    if item is not None:
+                        item.setText(text)
+            self._anim_table.blockSignals(False)
+            self._anim_table_loading = False
+            self._recompute_anim_flat()
+            self._compute_anim_canvas()
+            self._load_transform_editor()
+            self._update_anim_step_buttons()
+            self._show_current_anim_frame_static()
+        else:
+            # Frame added or removed — rebuild rows, then restore selection.
+            keep = self._anim_editing_frame
+            self._refresh_anim_table()
+            if seq.frames:
+                row = keep if 0 <= keep < len(seq.frames) else len(seq.frames) - 1
+                self._anim_table.selectRow(row)
+            self._show_current_anim_frame_static()
+
+    def aboutToTeardown(self) -> None:
+        """Stop the playback timer before the widget is deleted so a
+        deferred tick can't fire against a half-torn-down browser."""
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+
     def _reload_current_entry(self) -> None:
         """on_change hook fired from :class:`ReplaceSpriteCommand` after a
         redo or undo. Re-reads the live pak bytes and rebuilds both the
@@ -2259,3 +3120,94 @@ class SpriteBrowser(QWidget):
             return
         self._refresh_palette_combo()
         self._refresh_meta_and_preview()
+
+    # ---- add cell (grow into a new animation frame) ---------------------
+
+    def _on_add_cell(self) -> None:
+        """Append a new cell that clones the *selected* cell, backed by a
+        fresh copy of only that cell's tiles, so it can be edited
+        independently. This is how a single-cell sprite gains a frame to
+        animate between."""
+        if self._current_idx is None or self._undo_stack is None:
+            return
+        ix = self._current_idx
+        cached = getattr(self, "_cached", None)
+        ncer_obj = getattr(self, "_cached_ncer", None)
+        if cached is None or ncer_obj is None or not ncer_obj.cells:
+            QMessageBox.warning(
+                self, "Cannot add cell", "This entry has no cell to clone."
+            )
+            return
+        tile_bytes, bit_depth, _palettes, _ib = cached
+        bpt = 64 if bit_depth == 4 else 32
+        # OAM ``tile`` is a slot index whose unit is ``slot_bytes`` (the NCER
+        # boundary for 1D, 32B for 2D).
+        slot_bytes = ncer_obj.boundary_bytes if ncer_obj.is_1d else 32
+        n_tiles = len(tile_bytes) // bpt
+        src_idx = max(0, min(self._cell_view_spin.value(), len(ncer_obj.cells) - 1))
+        src_cell = ncer_obj.cells[src_idx]
+        if not src_cell.oams:
+            QMessageBox.warning(
+                self, "Cannot add cell", "The selected cell references no tiles."
+            )
+            return
+        # Copy *only the selected cell's* linear tile range (not the whole
+        # bank), then shift the clone's OAM slots to point at the copy. The
+        # copy must start on a slot boundary so the shift is a whole number
+        # of slots.
+        starts = [(o.tile * slot_bytes) // bpt for o in src_cell.oams]
+        ends = [(o.tile * slot_bytes) // bpt + o.n_tiles for o in src_cell.oams]
+        src_lo, src_hi = min(starts), max(ends)
+        min_slot = min(o.tile for o in src_cell.oams)
+        max_slot = max(o.tile for o in src_cell.oams)
+        align = slot_bytes // math.gcd(bpt, slot_bytes)   # tiles per slot unit
+        append_start = ((n_tiles + align - 1) // align) * align
+        slot_delta = append_start * bpt // slot_bytes - min_slot
+        if max_slot + slot_delta > 0x3FF:
+            QMessageBox.warning(
+                self, "Sprite too large",
+                "Adding a cell would push an OAM tile index past the 10-bit "
+                "hardware limit for this sprite. Its tile bank is already "
+                "near the maximum.",
+            )
+            return
+        pad = append_start - n_tiles
+        new_tiles = (
+            tile_bytes + b"\x00" * (pad * bpt)
+            + tile_bytes[src_lo * bpt:src_hi * bpt]
+        )
+        try:
+            new_ncgr = sprite.build_ncgr_from_template(
+                new_tiles, self._chr_pak.entries[ix]
+            )
+            new_cel = ncer_mod.append_cloned_cell(
+                self._cel_pak.entries[ix], src_idx, slot_delta,
+            )
+        except (ValueError, IndexError) as exc:
+            QMessageBox.critical(self, "Add cell failed", str(exc))
+            return
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [
+                (SPR_CHR, ix, sprite.compress_rle30(new_ncgr)),
+                (SPR_CEL, ix, sprite.compress_rle30(new_cel)),
+            ],
+            description=f"Add cell (from cell {src_idx}) to sprite 0x{ix:04x}",
+            on_change=self._reload_after_structural_change,
+        )
+        self._undo_stack.push(cmd)
+
+    def _reload_after_structural_change(self) -> None:
+        """on_change after a cell add/undo — the cell count changed, so
+        re-parse everything and refresh both previews + the animation
+        panel (which gates on cell count)."""
+        if self._current_idx is None:
+            return
+        self._refresh_palette_combo()
+        self._refresh_meta_and_preview()
+        self._recompute_current_conflicts()
+        self._refresh_cell_export_button_states()
+        self._cells_dirty = True
+        if self._preview_tabs.currentIndex() == 1:
+            self._refresh_cells_preview()
+        self._refresh_anim_panel()

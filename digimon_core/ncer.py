@@ -272,3 +272,74 @@ def cell_tile_ranges(ncer: Ncer, bpp4: bool = True) -> List[List[Tuple[int, int]
             ranges.append((start, end))
         out.append(ranges)
     return out
+
+
+def append_cloned_cell(raw: bytes, src_cell_idx: int, tile_slot_delta: int) -> bytes:
+    """Return a copy of ``raw`` NCER with a new cell appended that clones
+    ``src_cell_idx``'s OAM layout, shifting every OAM's ``tile`` slot by
+    ``tile_slot_delta``.
+
+    This is the structural half of "add an animation frame": the caller
+    grows the NCGR by a duplicated tile block, then adds a cell whose OAMs
+    point at that block (``tile_slot_delta`` = where the copy landed, in
+    OAM slot units). The new cell is initially a pixel-perfect duplicate of
+    the source — editable independently afterwards because it references
+    its own tiles.
+
+    Only the cell array + OAM data are rebuilt (n_cells + 1, one new cell
+    entry, the source's OAMs re-appended with patched tile fields); the
+    NCER header, mapping, and any trailing LABL/UEXT blocks are preserved.
+    Raises ``ValueError`` on a non-NCER payload, and ``IndexError`` for an
+    out-of-range source cell.
+    """
+    raw = maybe_decompress(raw)
+    if raw[:4] != b"RECN":
+        raise ValueError(f"not NCER: {raw[:4]!r}")
+    cebk = find_block(raw, b"KBEC")
+    block_size = struct.unpack_from("<I", raw, cebk + 4)[0]
+    n_cells = struct.unpack_from("<H", raw, cebk + 8)[0]
+    bank_attr = struct.unpack_from("<H", raw, cebk + 10)[0]
+    cell_data_off = struct.unpack_from("<I", raw, cebk + 12)[0]
+    if not (0 <= src_cell_idx < n_cells):
+        raise IndexError(f"src cell {src_cell_idx} out of range (n_cells={n_cells})")
+    cell_size = 16 if (bank_attr & 1) else 8
+    cells_base = cebk + 8 + cell_data_off
+    oam_base = cells_base + n_cells * cell_size
+
+    # OAM data used length = furthest (oam_off + n_oam*6) over every cell.
+    used_oam_bytes = 0
+    for ci in range(n_cells):
+        off = cells_base + ci * cell_size
+        n_oam = struct.unpack_from("<H", raw, off)[0]
+        oam_off = struct.unpack_from("<I", raw, off + 4)[0]
+        used_oam_bytes = max(used_oam_bytes, oam_off + n_oam * 6)
+
+    src_off = cells_base + src_cell_idx * cell_size
+    src_n_oam = struct.unpack_from("<H", raw, src_off)[0]
+    src_oam_off = struct.unpack_from("<I", raw, src_off + 4)[0]
+
+    # New cell entry clones the source (incl. its bbox when cell_size==16)
+    # but points its OAMs at the freshly-appended block.
+    new_cell = bytearray(raw[src_off:src_off + cell_size])
+    struct.pack_into("<I", new_cell, 4, used_oam_bytes)
+
+    # New OAMs clone the source's, offsetting each tile slot.
+    new_oams = bytearray(raw[oam_base + src_oam_off:oam_base + src_oam_off + src_n_oam * 6])
+    for oi in range(src_n_oam):
+        a2 = struct.unpack_from("<H", new_oams, oi * 6 + 4)[0]
+        tile = ((a2 & 0x3FF) + tile_slot_delta) & 0x3FF
+        struct.pack_into("<H", new_oams, oi * 6 + 4, (a2 & ~0x3FF) | tile)
+
+    header = raw[cebk:cells_base]                 # KBEC header up to cell array
+    old_cells = raw[cells_base:oam_base]
+    old_oams = raw[oam_base:oam_base + used_oam_bytes]
+    content = bytearray(header + old_cells + bytes(new_cell) + old_oams + bytes(new_oams))
+    while len(content) % 4:                        # NDS blocks are 4-aligned
+        content.append(0)
+    struct.pack_into("<H", content, 8, n_cells + 1)
+    struct.pack_into("<I", content, 4, len(content))
+
+    trailer = raw[cebk + block_size:]              # LABL / UEXT, position-independent
+    out = bytearray(raw[:cebk]) + content + trailer
+    struct.pack_into("<I", out, 8, len(out))       # NCER file size
+    return bytes(out)

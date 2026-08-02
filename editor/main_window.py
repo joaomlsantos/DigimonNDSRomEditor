@@ -175,6 +175,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Digimon NDS ROM Editor")
         self.resize(1280, 820)
+        # Let users open a ROM or project by dropping the file onto the window
+        # (see dragEnterEvent/dropEvent below).
+        self.setAcceptDrops(True)
 
         self.session: Optional[RomSession] = None
         self._last_nav_key: Optional[str] = None
@@ -429,6 +432,52 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+    # ---- drag & drop -----------------------------------------------------
+
+    # Extensions we know how to open. `.nds` → ROM, `.romproj` → project;
+    # str.endswith accepts this tuple directly.
+    _DROPPABLE_SUFFIXES = (".nds", ".romproj")
+
+    def _droppable_path(self, event) -> Optional[str]:
+        """First local .nds/.romproj path in a drag payload, or None.
+
+        Shared by dragEnterEvent (to decide whether to show the accept cursor)
+        and dropEvent (to pick which file to open) so both agree on what counts
+        as droppable. Only the first match is used — dropping a batch just opens
+        one file, since a session holds a single ROM.
+        """
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return None
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if path.lower().endswith(self._DROPPABLE_SUFFIXES):
+                return path
+        return None
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 — Qt override name
+        if self._droppable_path(event) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 — Qt override name
+        path = self._droppable_path(event)
+        if path is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        # Route through the same discard-guard + open paths the File menu uses,
+        # so a drop behaves exactly like Open ROM / Open Project.
+        if not self._confirm_discard_changes():
+            return
+        if path.lower().endswith(".romproj"):
+            self._open_project_at(path)
+        else:
+            self._load_rom(path)
 
     # ---- window state persistence ---------------------------------------
 
