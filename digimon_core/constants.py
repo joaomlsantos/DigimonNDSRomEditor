@@ -84,6 +84,23 @@ SPRITE_MAPPING_TABLE_OFFSET = {
     "DAWN_US": (0x000FCD08, 0x00100738)
 }
 
+
+# Overworld-sprite definition table (ARM9 static): one 8-byte record per
+# overworld-sprite id (906 records in vanilla). Record layout:
+#   u16 chr_index   (index into MCHR_CHR/ANM/HIT — the compacted 890-space)
+#   u16 chr_index   (repeated)
+#   u16 pal_index   (index into MCHR_PAL — always == this record's own id)
+#   u16 (unused / 0xFFFF for most records)
+# The id space is 1:1 with MCHR_PAL (906), but MCHR_CHR is compacted to 890:
+# 13 sprites reuse one graphic under 2-3 palettes, so chr_index == pal_index
+# holds only up to id 0x296. Past id 0x0297 the palette drifts ahead of the
+# CHR index (by up to +16, matching PAL count - CHR count). See
+# loaders.loadMchrChrToPalMap. Value is (start_offset, record_count).
+MCHR_OW_SPRITE_TABLE_OFFSET = {
+    "DUSK_US": (0x00102ED4, 906),
+    "DAWN_US": (0x00102DD8, 906),
+}
+
 STRING_BATTLE_TABLE_OFFSET = {
     "DUSK_US": (0x00116A94, 0x00117920),
     "DAWN_US": (0X00116998, 0x00117824)
@@ -252,6 +269,17 @@ FARM_TRAINING_PEN_NAMES = [
 CONSUMABLE_OFFSETS = {
     "DUSK_US": (0x000F34A4, 0x000F3918),
     "DAWN_US": (0x000F33A8, 0x000F381C),
+}
+
+# Traits: 177 records × 8 bytes ([index:u16, kind:u16, effect_type:u8,
+# value_mode:u8, magnitude:u16]), contiguous in ARM9. Indexed 1:1 with
+# TRAIT_ARRAY_STR (the trait names). value_mode: 0=flat, 1=percent-of-base.
+# DAWN_US was derived from the −0xFC DUSK→DAWN arm9 delta and CONFIRMED by the
+# Dawn round-trip test (177 sequential-index records, byte-exact). loadTraitData
+# still guards any offset with an index-sequence sanity check.
+TRAIT_DATA_OFFSETS = {
+    "DUSK_US": (0x000F42EC, 0x000F4874),
+    "DAWN_US": (0x000F41F0, 0x000F4778),
 }
 
 # Equipment: 146 records × 0x48 bytes, scattered across ~19 paged sub-regions.
@@ -3744,6 +3772,64 @@ TRAIT_ARRAY_STR = [
     "Attack Up6",
     "Empty",
 ]
+
+# Human labels for TraitData.effect_type (the single byte at +0x04). Whether the
+# trait's `magnitude` (Value) is a flat add or a percentage is a SEPARATE byte
+# (`value_mode` at +0x05), not part of the type — earlier revisions read +0x04..05
+# as one u16, so percent traits showed up here as 0x1xx (e.g. Reduce MP was 0x11B
+# = type 0x1B + percent flag). Values not in this map are effect types with no
+# confirmed meaning — the editor renders those as "Unknown_0x<type>".
+TRAIT_EFFECT_TYPE_NAMES = {
+    0x01: "Attack",
+    0x02: "Defense",
+    0x03: "Spirit",
+    0x04: "Speed",
+    0x05: "Dark Resistance",
+    0x06: "Light Resistance",
+    0x07: "Steel Resistance",
+    0x08: "Fire Resistance",
+    0x09: "Thunder Resistance",
+    0x0A: "Water Resistance",
+    0x0B: "Wind Resistance",
+    0x0C: "All Elements Resistances",
+    0x0D: "Poison Resistance",
+    0x0E: "Confusion Resistance",
+    0x0F: "Death Resistance",
+    0x10: "Paralyze Resistance",
+    0x11: "Sleep Resistance",
+    0x12: "All Status Conditions Resistances",
+    0x13: "Hit Rate",
+    0x14: "Evasion",
+    0x15: "Critical Hit Rate",
+    0x16: "Flee From Battle Chance",
+    0x17: "Damage Dealt",
+    0x18: "Money Earned",
+    0x19: "EXP Earned",
+    0x1A: "Item Drop Rate",
+    0x1B: "Reduce MP Consumption",
+    0x1C: "Effect Duration",
+    0x1D: "Poison Immunity",
+    0x1E: "Paralyze Immunity",
+    0x1F: "Confusion Immunity",
+    0x20: "Sleep Immunity",
+    0x21: "Stun Immunity",
+    # 0x24-0x2B: elemental damage-reduction (the "Aura"/"Lord" traits), keyed by
+    # incoming element in ov2 FUN_0017fc58 and subtracted at the TraitDef step —
+    # distinct from the resistance-VALUE traits (0x05-0x0C) above. Earth has no
+    # such type. Dark/Light/Steel are code-mapped but no shipped trait uses them.
+    0x24: "Dark Damage Reduction",
+    0x25: "Light Damage Reduction",
+    0x26: "Steel Damage Reduction",
+    0x27: "Fire Damage Reduction",
+    0x28: "Thunder Damage Reduction",
+    0x29: "Water Damage Reduction",
+    0x2A: "Wind Damage Reduction",
+    0x2B: "All Damage Reduction",
+    # 0x2C: item/skill-use handler (arm9 FUN_000589a8) scales HP restore (op 0x10)
+    # and MP restore (op 0x11) by this percent — the SoothingHand/HealingWave traits.
+    0x2C: "Recovery Amount",
+    0x32: "Earth Resistance",
+}
 
 ENEMY_NAME_ARRAY_STR = [
     "Red DigiEgg",

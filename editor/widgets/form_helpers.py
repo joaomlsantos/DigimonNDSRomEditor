@@ -1203,6 +1203,41 @@ class BoundCheckBox(QCheckBox):
         self._undo_stack.push(SetAttrCommand(self._target, self._attr, new_value))
 
 
+class BoundBitCheckBox(QCheckBox):
+    """Checkbox bound to a single bit of an int bitmask attribute.
+
+    Toggling flips only ``1 << bit`` in the field, leaving the other bits
+    untouched, so a row of these edits one shared mask (e.g. a per-element
+    affinity byte) without stepping on each other.
+    """
+
+    def __init__(self, target, attr: str, bit: int, undo_stack: QUndoStack, label: str = ""):
+        super().__init__(label)
+        self._target = target
+        self._attr = attr
+        self._mask = 1 << bit
+        self._undo_stack = undo_stack
+        with silenced(self):
+            self.setChecked(bool(getattr(target, attr) & self._mask))
+        self.toggled.connect(self._on_toggled)
+
+    def rebind(self, new_target) -> None:
+        self._target = new_target
+        with silenced(self):
+            self.setChecked(bool(getattr(new_target, self._attr) & self._mask))
+
+    def refresh(self) -> None:
+        with silenced(self):
+            self.setChecked(bool(getattr(self._target, self._attr) & self._mask))
+
+    def _on_toggled(self, checked: bool) -> None:
+        cur = getattr(self._target, self._attr)
+        new_value = (cur | self._mask) if checked else (cur & ~self._mask)
+        if new_value == cur:
+            return
+        self._undo_stack.push(SetAttrCommand(self._target, self._attr, new_value))
+
+
 # ---- cached choice-list builders ----------------------------------------
 
 _digimon_choices_cache: Optional[List[Tuple[int, str]]] = None
@@ -1232,6 +1267,22 @@ def trait_choices() -> List[Tuple[int, str]]:
     if _trait_choices_cache is None:
         _trait_choices_cache = [(i, name) for i, name in enumerate(constants.TRAIT_ARRAY_STR)]
     return _trait_choices_cache
+
+
+def trait_effect_summary(session, trait_id) -> str:
+    """``+<Value> <Effect>`` for a trait id (e.g. ``+5 Speed``), or "" for none.
+
+    Reads the session's TraitData table; unmapped effect types fall back to
+    ``Unknown_0x<type>``.
+    """
+    traits = getattr(session, "traits", None) or []
+    if isinstance(trait_id, int) and 0 <= trait_id < len(traits):
+        t = traits[trait_id]
+        effect = constants.TRAIT_EFFECT_TYPE_NAMES.get(
+            t.effect_type, f"Unknown_0x{t.effect_type:X}")
+        value = f"+{t.magnitude}%" if t.is_percent else f"+{t.magnitude}"
+        return f"{value} {effect}"
+    return ""
 
 
 def item_choices() -> List[Tuple[int, str]]:
@@ -1413,6 +1464,14 @@ def _nav_handler_for(kind: Optional[str]) -> Optional[Tuple[str, Callable[[int],
 _UNKNOWN_FIELDS: List[Tuple[QWidget, QWidget]] = []
 _unknown_visible: bool = False
 
+# Parallel registry for "advanced" IO widgets (e.g. BTCHR's raw tile-sheet
+# import/export) — hidden by default, flipped in bulk by a header-bar toggle.
+# Same lifecycle as the unknown-fields registry: register at build time, prune
+# Qt-deleted widgets on the next toggle pass. Nothing is ever deleted — the
+# feature just hides.
+_ADVANCED_IO_WIDGETS: List[QWidget] = []
+_advanced_io_visible: bool = False
+
 
 def register_unknown_field(label_widget: QWidget, field_widget: QWidget) -> None:
     """Tag a (label, field) pair as part of an editor's unknown-fields block.
@@ -1453,6 +1512,36 @@ def set_unknown_fields_visible(visible: bool) -> None:
 
 def unknown_fields_visible() -> bool:
     return _unknown_visible
+
+
+def register_advanced_io_widget(widget: QWidget) -> None:
+    """Tag a widget as 'advanced IO' — hidden unless the header-bar toggle is on.
+    Hides immediately when the toggle is currently off (Qt defaults to visible-
+    with-parent, so the on-case needs no action)."""
+    _ADVANCED_IO_WIDGETS.append(widget)
+    if not _advanced_io_visible:
+        try:
+            widget.setVisible(False)
+        except RuntimeError:
+            pass
+
+
+def set_advanced_io_visible(visible: bool) -> None:
+    """Flip every registered advanced-IO widget to the given visibility."""
+    global _advanced_io_visible
+    _advanced_io_visible = bool(visible)
+    alive: List[QWidget] = []
+    for widget in _ADVANCED_IO_WIDGETS:
+        try:
+            widget.setVisible(_advanced_io_visible)
+            alive.append(widget)
+        except RuntimeError:
+            continue
+    _ADVANCED_IO_WIDGETS[:] = alive
+
+
+def advanced_io_visible() -> bool:
+    return _advanced_io_visible
 
 
 def add_unknown_form_row(form: QFormLayout, label_text: str, widget: QWidget) -> None:

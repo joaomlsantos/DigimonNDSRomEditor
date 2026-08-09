@@ -17,18 +17,29 @@ Format (reverse-engineered; byte-faithful round-trip verified across all
 
 Each frame record is 7 × u16 = 14 bytes::
 
-    [p0, p1, p2, p3, flag, frame_index, duration]
+    [p0, p1, p2, p3, hflip, frame_index, duration]
 
 ``frame_index`` (field 5) indexes the sprite's MCHR_CHR frames and
 ``duration`` (field 6) is the on-screen tick count — both confirmed
 empirically (frame_index is < the sprite's frame count 98.5% of the time
-and alternates in walk cycles; duration is constant across a cycle). The
-leading ``p0..p3`` and ``flag`` are not yet identified (candidates: x/y
-offset + OAM attributes) — this codec preserves them **verbatim** so only
-the confirmed fields are ever touched.
+and alternates in walk cycles; duration is constant across a cycle).
 
-An overworld sprite carries ~16–23 animations (presumably facing ×
-state). Module surface mirrors :mod:`digimon_core.nanr`:
+``hflip`` (field 4) is a **horizontal-flip / facing bit** — inferred from
+data shape, not fabricated: across all 56 768 vanilla records it takes only
+the values 0 and 1; it is constant within an animation (18 296 anims vs 17
+that vary); and of the 614 entries that carry both flag values, **every one**
+has a flag=1 animation whose frame_index sequence exactly matches a flag=0
+animation's. That is the tile-sharing "left/right facing = same art mirrored"
+scheme: flag=0 is the base facing, flag=1 the horizontal mirror. (One bit ⇒
+one axis; overworld characters mirror left↔right, so horizontal — a vertical
+flip would render them upside-down.) The remaining ``p0..p3`` are still
+unidentified (candidates: x/y offset + other OAM attributes). This codec
+preserves all five leading fields **verbatim** so only the confirmed fields
+are ever touched.
+
+An overworld sprite carries ~16–23 animations (facing × state — some
+directions share art via the ``hflip`` mirror above). Module surface mirrors
+:mod:`digimon_core.nanr`:
 
 - :func:`parse_mchr_anm` / :func:`serialize_mchr_anm`
 - :func:`flatten_animation`
@@ -37,7 +48,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from .sprite import maybe_decompress
 
@@ -48,15 +59,48 @@ _SEP = b"\xff" * RECORD_SIZE        # 7 × u16 0xFFFF — animation separator
 _END = b"\xfe\xff" * 7              # 7 × u16 0xFFFE — entry terminator
 
 
+# NDS OAM (shape, size) → (width_tiles, height_tiles). The header's first u16
+# is (OAM_shape << 2) | OAM_size — shape 0=square/1=wide/2=tall, size 0..3 —
+# which fixes the sprite's tile grid exactly (resolving the wide/tall
+# ambiguity that :func:`digimon_core.mchr.pick_tile_grid` can only guess).
+_OAM_SHAPE_SIZE_TILES = {
+    (0, 0): (1, 1), (0, 1): (2, 2), (0, 2): (4, 4), (0, 3): (8, 8),  # square
+    (1, 0): (2, 1), (1, 1): (4, 1), (1, 2): (4, 2), (1, 3): (8, 4),  # wide
+    (2, 0): (1, 2), (2, 1): (1, 4), (2, 2): (2, 4), (2, 3): (4, 8),  # tall
+}
+
+
+def oam_grid_from_header(raw: bytes) -> Optional[Tuple[int, int]]:
+    """``(width_tiles, height_tiles)`` from a MCHR_ANM entry's OAM shape+size.
+
+    The entry header's first u16 encodes the sprite's NDS OAM cell shape as
+    ``(shape << 2) | size`` — the authoritative tile grid for every frame.
+    Returns ``None`` for an unrecognized shape/size code (a few outlier
+    entries), so callers fall back to :func:`digimon_core.mchr.pick_tile_grid`.
+    Accepts a raw (possibly compressed) entry.
+    """
+    raw = maybe_decompress(raw)
+    if len(raw) < 2:
+        return None
+    h0 = struct.unpack_from("<H", raw, 0)[0]
+    return _OAM_SHAPE_SIZE_TILES.get((h0 >> 2, h0 & 3))
+
+
 @dataclass
 class MchrAnimFrame:
     """One animation frame: show MCHR_CHR frame ``frame`` for ``duration``
     ticks. ``params`` holds the five leading u16s of the record
-    (``p0..p3`` + ``flag``) verbatim — semantics unconfirmed, so they're
-    carried through untouched on a round-trip."""
+    (``p0..p3`` + the ``hflip`` field) verbatim — ``p0..p3`` semantics are
+    unconfirmed, so all five are carried through untouched on a round-trip."""
     frame: int
     duration: int
     params: Tuple[int, int, int, int, int] = (0, 0, 0, 0, 0)
+
+    @property
+    def hflip(self) -> bool:
+        """Whether this frame is drawn horizontally mirrored (field 4 == 1) —
+        the overworld facing-mirror bit (see module docstring)."""
+        return bool(self.params[4] & 1)
 
 
 @dataclass

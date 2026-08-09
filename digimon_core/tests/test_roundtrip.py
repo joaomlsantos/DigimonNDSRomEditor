@@ -97,6 +97,14 @@ class RoundtripTestBase:
             obj.writeToRom(target)
         self._assert_region_equal(target, "QuestData")
 
+    def test_traits(self):
+        target = bytearray(self.vanilla)
+        objs = loaders.loadTraitData(self.VERSION, self.vanilla)
+        self.assertEqual(len(objs), 177, "expected 177 trait records")
+        for obj in objs:
+            obj.writeToRom(target)
+        self._assert_region_equal(target, "TraitData")
+
     def test_encounter_rewards(self):
         target = bytearray(self.vanilla)
         for obj in loaders.loadEncounterRewardData(self.VERSION, self.vanilla):

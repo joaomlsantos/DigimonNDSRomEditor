@@ -613,8 +613,12 @@ def apply_walkability_overlay(
             f"walkability bits ({len(bits)} B) too short for "
             f"{walk_width}x{walk_height} ({bytes_needed} B needed)"
         )
-    src = preview.rgba
-    out = bytearray(src)
+    # Vectorised with numpy: the walk tab re-tints the whole composite on
+    # every paint-move sample, and the old per-pixel Python loop cost ~100 ms
+    # per call on a 768×384 map — the dominant source of paint lag. numpy is
+    # imported lazily so headless map-codec paths don't pull it in.
+    import numpy as np
+
     tr, tg, tb = tint
     inv = 255 - alpha
     # Hatch line color: darker than the tint, fully opaque, so it
@@ -622,30 +626,36 @@ def apply_walkability_overlay(
     hr = max(0, tr - 120)
     hg = max(0, tg - 30) if tg else 0
     hb = max(0, tb - 30) if tb else 0
-    overlap_w = min(walk_width, preview.width)
-    overlap_h = min(walk_height, preview.height)
     pw = preview.width
-    for y in range(overlap_h):
-        walk_row = y * walk_width
-        comp_row = y * pw
-        for x in range(overlap_w):
-            bit_ix = walk_row + x
-            if not ((bits[bit_ix >> 3] >> (bit_ix & 7)) & 1):
-                continue
-            off = (comp_row + x) * 4
-            if (x + y) & 3 == 0:
-                # diagonal hatch — solid dark-red line
-                out[off] = hr
-                out[off + 1] = hg
-                out[off + 2] = hb
-                out[off + 3] = 255
-            else:
-                # alpha-over: out = src * (1 - a) + tint * a
-                out[off] = (src[off] * inv + tr * alpha) // 255
-                out[off + 1] = (src[off + 1] * inv + tg * alpha) // 255
-                out[off + 2] = (src[off + 2] * inv + tb * alpha) // 255
-                out[off + 3] = 255
-    return MapPreview(rgba=bytes(out), width=preview.width, height=preview.height)
+    ph = preview.height
+    overlap_w = min(walk_width, pw)
+    overlap_h = min(walk_height, ph)
+
+    src = np.frombuffer(bytes(preview.rgba), dtype=np.uint8).reshape(ph, pw, 4)
+    out = src.copy()
+    if overlap_w > 0 and overlap_h > 0:
+        bit_arr = np.unpackbits(
+            np.frombuffer(bytes(bits), dtype=np.uint8), bitorder="little",
+        )
+        ys = np.arange(overlap_h)
+        xs = np.arange(overlap_w)
+        # bit index = y*walk_width + x, read at the walkability's own stride.
+        flat_ix = (ys[:, None] * walk_width) + xs[None, :]
+        blocked = bit_arr[flat_ix].astype(bool)
+        hatch = blocked & (((ys[:, None] + xs[None, :]) & 3) == 0)
+        tinted = blocked & ~hatch
+
+        region = out[:overlap_h, :overlap_w, :]
+        src_rgb = src[:overlap_h, :overlap_w, :3].astype(np.uint16)
+        blended = (
+            (src_rgb * inv) + np.array([tr, tg, tb], dtype=np.uint16) * alpha
+        ) // 255
+        for ch, hval in enumerate((hr, hg, hb)):
+            chan = region[:, :, ch]
+            chan[tinted] = blended[:, :, ch][tinted].astype(np.uint8)
+            chan[hatch] = hval
+        region[:, :, 3][blocked] = 255
+    return MapPreview(rgba=out.tobytes(), width=pw, height=ph)
 
 
 def render_single_layer(

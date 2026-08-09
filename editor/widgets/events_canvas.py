@@ -166,6 +166,12 @@ class ExitZoneSpec:
     is_hitbox: bool = False
 
 
+# Module-wide toggle for the marker / zone text labels (the "entry 0499
+# @0xNNNN" / "E8" / "S0" tags). Flipped via ``EventsCanvas.set_labels_visible``
+# so the canvas can be de-cluttered; the markers/pixmaps themselves stay.
+_SHOW_LABELS = True
+
+
 class _EventMarkerItem(QGraphicsItem):
     """One overworld-sprite marker. Pixmap on top, hex id label
     underneath; draggable via ``ItemIsMovable``.
@@ -254,21 +260,22 @@ class _EventMarkerItem(QGraphicsItem):
         # override the default hex MCHR id with their source script
         # offset so the user can trace each marker back to its 0x0150
         # block — the default form is the Events-tab MCHR id.
-        label = spec.display_label or f"0x{spec.overworld_sprite_id:04x}"
-        font = QFont()
-        font.setPointSize(7)
-        painter.setFont(font)
-        metrics = painter.fontMetrics()
-        text_w = metrics.horizontalAdvance(label)
-        text_h = metrics.height()
-        top = -text_h - (_DISC_RADIUS + 2 if spec.pixmap is None else
-                         spec.pixmap.height() + 4 if spec.pixmap is not None else 0)
-        bg = QRectF(-text_w / 2 - 2, top, text_w + 4, text_h)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
-        painter.drawRoundedRect(bg, 2, 2)
-        painter.setPen(QPen(QColor(255, 255, 255), 1))
-        painter.drawText(bg, Qt.AlignCenter, label)
+        if _SHOW_LABELS:
+            label = spec.display_label or f"0x{spec.overworld_sprite_id:04x}"
+            font = QFont()
+            font.setPointSize(7)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            text_w = metrics.horizontalAdvance(label)
+            text_h = metrics.height()
+            top = -text_h - (_DISC_RADIUS + 2 if spec.pixmap is None else
+                             spec.pixmap.height() + 4 if spec.pixmap is not None else 0)
+            bg = QRectF(-text_w / 2 - 2, top, text_w + 4, text_h)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
+            painter.drawRoundedRect(bg, 2, 2)
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawText(bg, Qt.AlignCenter, label)
 
     def hoverEnterEvent(self, event) -> None:  # noqa: D401
         self.setZValue(_Z_MARKER_HOT)
@@ -437,20 +444,21 @@ class _ExitZoneItem(QGraphicsItem):
             label_origin = QPointF(2, 2)
         # Idx label with translucent backdrop so it reads on any
         # tilemap. Drawn last so the box outline doesn't cut into it.
-        font = QFont()
-        font.setPointSize(7)
-        painter.setFont(font)
-        metrics = painter.fontMetrics()
-        text_w = metrics.horizontalAdvance(label)
-        text_h = metrics.height()
-        bg = QRectF(
-            label_origin.x(), label_origin.y(), text_w + 6, text_h,
-        )
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
-        painter.drawRoundedRect(bg, 2, 2)
-        painter.setPen(QPen(QColor(255, 255, 255), 1))
-        painter.drawText(bg, Qt.AlignCenter, label)
+        if _SHOW_LABELS:
+            font = QFont()
+            font.setPointSize(7)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            text_w = metrics.horizontalAdvance(label)
+            text_h = metrics.height()
+            bg = QRectF(
+                label_origin.x(), label_origin.y(), text_w + 6, text_h,
+            )
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
+            painter.drawRoundedRect(bg, 2, 2)
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawText(bg, Qt.AlignCenter, label)
 
     def hoverEnterEvent(self, event) -> None:  # noqa: D401
         self.setZValue(_Z_EXIT_HOT)
@@ -565,6 +573,20 @@ class EventsCanvas(QGraphicsView):
     # through PySide signals.)
     markerSelected = Signal(int)
     exitSelected = Signal(int)
+
+    @staticmethod
+    def labels_visible() -> bool:
+        return _SHOW_LABELS
+
+    def set_labels_visible(self, visible: bool) -> None:
+        """Show/hide the marker + zone text labels (module-wide) and repaint.
+
+        The markers/pixmaps stay — only the ``entry 0499 @0xNNNN`` / ``E8`` /
+        ``S0`` tags toggle, so a busy map can be de-cluttered."""
+        global _SHOW_LABELS
+        _SHOW_LABELS = bool(visible)
+        if self.scene() is not None:
+            self.scene().update()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)

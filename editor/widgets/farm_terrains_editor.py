@@ -123,6 +123,7 @@ class FarmTerrainsEditor(QWidget):
         identity = QGroupBox("Identity")
         identity_form = make_form(identity)
         self._add_field(identity_form, "Terrain id", BoundSpinBox(first, "id", 2, self._undo_stack, read_only=True))
+        self._add_field(identity_form, "Secondary id (id-370)", BoundSpinBox(first, "secondary_id", 2, self._undo_stack))
         self._add_field(
             identity_form, "Farm digimon limit",
             BoundSpinBox(
@@ -131,6 +132,9 @@ class FarmTerrainsEditor(QWidget):
                 warn_message=_FARM_DIGIMON_LIMIT_MESSAGE,
             ),
         )
+        self._add_field(identity_form, "Farm item (decoration) limit", BoundSpinBox(first, "farm_item_limit", 2, self._undo_stack))
+        self._add_field(identity_form, "Anchor X", BoundSpinBox(first, "anchor_x", 2, self._undo_stack))
+        self._add_field(identity_form, "Anchor Y", BoundSpinBox(first, "anchor_y", 2, self._undo_stack))
 
         exp_box = QGroupBox("Per-Species Exp")
         exp_grid = _make_compact_grid(exp_box, cols=4)
@@ -140,13 +144,26 @@ class FarmTerrainsEditor(QWidget):
             exp_grid.addWidget(QLabel(label), ix // 4, (ix % 4) * 2)
             exp_grid.addWidget(spin, ix // 4, (ix % 4) * 2 + 1)
 
-        unknowns = QGroupBox("Unknown / Unmapped (raw 2-byte fields)")
-        register_unknown_container(unknowns)
-        unknowns_grid = _make_compact_grid(unknowns, cols=2)
-        for ix, (_offset, attr) in enumerate(model.FarmTerrain._UNKNOWN_FIELDS):
-            spin = BoundSpinBox(first, attr, 2, self._undo_stack)
-            self._all_widgets.append(spin)
-            add_unknown_grid_field(unknowns_grid, ix // 2, ix % 2, attr, spin)
+        # 8 digimon + 8 decoration placement coords. Only the first
+        # farm_digimon_limit / farm_item_limit slots are used in-game.
+        positions = QGroupBox("Placement Positions (X, Y)")
+        pos_grid = _make_compact_grid(positions, cols=6)
+        pos_grid.addWidget(QLabel("Farm digimon"), 0, 0, 1, 3)
+        pos_grid.addWidget(QLabel("Decoration items"), 0, 3, 1, 3)
+        for i in range(model.FarmTerrain.POSITION_COUNT):
+            dx = BoundSpinBox(first, f"digimon{i}_x", 2, self._undo_stack)
+            dy = BoundSpinBox(first, f"digimon{i}_y", 2, self._undo_stack)
+            itx = BoundSpinBox(first, f"item{i}_x", 2, self._undo_stack)
+            ity = BoundSpinBox(first, f"item{i}_y", 2, self._undo_stack)
+            for w in (dx, dy, itx, ity):
+                self._all_widgets.append(w)
+            row = i + 1
+            pos_grid.addWidget(QLabel(f"{i + 1}"), row, 0)
+            pos_grid.addWidget(dx, row, 1)
+            pos_grid.addWidget(dy, row, 2)
+            pos_grid.addWidget(QLabel(f"{i + 1}"), row, 3)
+            pos_grid.addWidget(itx, row, 4)
+            pos_grid.addWidget(ity, row, 5)
 
         content = QWidget()
         cl = QVBoxLayout(content)
@@ -157,7 +174,7 @@ class FarmTerrainsEditor(QWidget):
         cl.addWidget(self._title)
         cl.addWidget(identity)
         cl.addWidget(exp_box)
-        cl.addWidget(unknowns)
+        cl.addWidget(positions)
         cl.addStretch(1)
 
         return wrap_in_scroll(content)

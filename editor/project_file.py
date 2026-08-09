@@ -59,9 +59,15 @@ from digimon_core import qol as qol_module
 #      BGM slots, keyed by the SET_MUSIC sequential array id. Pure UI
 #      metadata; the ROM itself doesn't carry labels, so this channel
 #      never touches the byte diff or SDAT splice.
+# v11: adds wild_encounter_area_edits channel — full file bytes for
+#      wild-encounter areas (DAT/EC/E0XX.BIN) whose record count changed
+#      (add/remove slot). Keyed by area index; routed through the
+#      wild-encounter FAT splice on save. Project save runs with
+#      ``skip_wild_encounter_splice=True`` so a grown area doesn't shift
+#      every later FAT file into the (equal-length) byte diff.
 # Loader accepts every prior version; saver always writes the current version.
-FORMAT_VERSION = 10
-_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+FORMAT_VERSION = 11
+_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
 EDITOR_VERSION = "0.1.0"
 
 
@@ -76,6 +82,7 @@ BgmSwapEdit = Tuple[int, str, str, bytes, bytes, bytes]
 # (donor_label, donor_game_label, sseq_bytes, sbnk_bytes, swar_bytes)
 BgmAdditionEdit = Tuple[str, str, bytes, bytes, bytes]
 BgmLabelEdit = Tuple[int, str]  # (music_id / SET_MUSIC array id, label)
+WildEncounterAreaEdit = Tuple[int, bytes]  # (area_index, full_file_bytes)
 
 
 def vanilla_sha256(rom_bytes: bytes) -> str:
@@ -144,6 +151,7 @@ def save_project(
     bgm_swap_edits: List[BgmSwapEdit] = (),
     bgm_addition_edits: List[BgmAdditionEdit] = (),
     bgm_label_edits: List[BgmLabelEdit] = (),
+    wild_encounter_area_edits: List[WildEncounterAreaEdit] = (),
 ) -> None:
     """Write a .romproj at `path`.
 
@@ -268,6 +276,10 @@ def save_project(
             {"music_id": music_id, "label": label}
             for music_id, label in bgm_label_edits
         ],
+        "wild_encounter_area_edits": [
+            {"area_ix": area_ix, "bytes": base64.b64encode(data).decode("ascii")}
+            for area_ix, data in wild_encounter_area_edits
+        ],
     }
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -346,5 +358,9 @@ def load_project(path: str) -> dict:
     data["bgm_label_edits"] = [
         (int(entry["music_id"]) & 0xFFFF, entry["label"])
         for entry in data.get("bgm_label_edits", [])
+    ]
+    data["wild_encounter_area_edits"] = [
+        (entry["area_ix"], base64.b64decode(entry["bytes"]))
+        for entry in data.get("wild_encounter_area_edits", [])
     ]
     return data

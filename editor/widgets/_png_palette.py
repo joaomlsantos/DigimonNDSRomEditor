@@ -104,3 +104,52 @@ def nearest_idx_opaque(
             if d == 0:
                 break
     return best_idx
+
+
+def _luma(rgb: Rgb) -> float:
+    return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+
+
+def intensity_matched_palette(
+    own: List[Rgb],
+    source: List[Rgb],
+    source_counts: Optional[List[int]] = None,
+    dominance: float = 0.08,
+) -> List[Rgb]:
+    """A palette the size of ``own`` where each slot gets the ``source`` colour
+    of nearest brightness (luminance) to that slot's original colour.
+
+    Sprites map specific pixels to specific slots tuned to their *own* palette,
+    so a raw slot-for-slot copy of a foreign palette scrambles the shading. This
+    remaps by luminance instead — a slot that was dark gets a dark source
+    colour, a highlight gets a light one — so the borrowed palette reads
+    coherently on the sprite. Slot 0 (transparent) is preserved; source slot 0
+    is excluded. Handles differing palette sizes (the counts need not match).
+
+    ``source_counts`` (per-slot pixel usage of the *source sprite*) applies a
+    gentle bias toward the source's DOMINANT colours: among candidates of
+    similar brightness the more-used one wins, so the borrow reads as the
+    source's actual scheme instead of latching onto a brightness-coincident
+    rare/edge colour. It is only a tie-breaker — every source colour stays a
+    candidate, so the sprite's detail colours survive (a hard cutoff instead
+    flattens the sprite toward its few main colours). ``dominance`` is the bias
+    strength in normalized-luminance units: 0 = pure nearest-brightness, higher
+    = stronger lean on the main colours. Without ``source_counts`` it is pure
+    nearest-brightness over every source colour."""
+    if not source or len(source) < 2:
+        return list(own)
+    pool = [(i, source[i]) for i in range(1, len(source))]  # skip transparent
+    have_counts = source_counts is not None and len(source_counts) >= len(source)
+    max_c = max((source_counts[i] for i, _ in pool), default=0) if have_counts else 0
+    scored = [
+        (_luma(c), c, (source_counts[i] / max_c if (have_counts and max_c) else 0.0))
+        for i, c in pool
+    ]
+    out = list(own)
+    for k in range(1, len(own)):
+        target = _luma(own[k])
+        out[k] = min(
+            scored,
+            key=lambda t: abs(t[0] - target) / 255.0 - dominance * t[2],
+        )[1]
+    return out

@@ -85,6 +85,13 @@ class BattleLocation:
 CHRSIZE_PATH = "DAT/BTCHR/CHRSIZE.BIN"
 BTCHRSIZE_PATH = "DAT/BTCHR/BTCHRSIZE.BIN"
 
+# The wild-encounter roll (FUN_00058500) caps the summed enemy sprite
+# footprint at 0x5A0 = 1440 tiles — the VRAM-safe ceiling for the shared
+# engine-A OBJ pool. Scripted battles bypass that roll and load their
+# enemy set unchecked, so the same number is the crash threshold a
+# hand-authored fight must stay under. See project_wild_spawn_size_gate.
+BATTLE_SPRITE_TILE_BUDGET = 0x5A0
+
 
 @dataclass
 class RomSession:
@@ -101,12 +108,27 @@ class RomSession:
     base_digimon: Dict[int, model.BaseDataDigimon] = field(default_factory=dict)
     enemy_digimon: Dict[int, model.EnemyDataDigimon] = field(default_factory=dict)
     moves: List[model.MoveData] = field(default_factory=list)
+    traits: List[model.TraitData] = field(default_factory=list)
     quests: List[model.QuestData] = field(default_factory=list)
     encounter_rewards: List[model.EncounterRewardTable] = field(default_factory=list)
     standard_digivolutions: Dict[int, model.StandardDigivolution] = field(default_factory=dict)
     armor_digivolutions: List[model.ArmorDigivolution] = field(default_factory=list)
     dna_digivolutions: List[model.DNADigivolution] = field(default_factory=list)
     sprite_map: List[model.SpriteMapEntry] = field(default_factory=list)
+    # MCHR_CHR index -> canonical MCHR_PAL index (see
+    # loaders.loadMchrChrToPalMap). Empty when the ARM9 table can't be
+    # validated; mchr_pal_for_chr() then falls back to identity.
+    mchr_chr_to_pal: Dict[int, int] = field(default_factory=dict)
+    # Overworld-sprite id -> MCHR_CHR graphic index (see
+    # loaders.loadMchrOwToChrMap). Field-map / cutscene placements key sprites
+    # by ow-id, not CHR index; mchr_sprite_pixmap_by_ow_id() uses this.
+    mchr_ow_to_chr: Dict[int, int] = field(default_factory=dict)
+    # Overworld-sprite id -> palette index as stored in this ROM (the ARM9 ow
+    # table's f2). Vanilla is identity; ``mchr_ow_pal_overrides`` stages
+    # reassignments (spinner-driven, undoable), patched into f2 on save. The
+    # engine honours f2 — verified in-game (see memory).
+    mchr_ow_base_pal: Dict[int, int] = field(default_factory=dict)
+    mchr_ow_pal_overrides: Dict[int, int] = field(default_factory=dict)
     battle_strings: List[model.BattleStringEntry] = field(default_factory=list)
     habitats_worldmap: List[model.HabitatWorldmap] = field(default_factory=list)
     farm_terrains: List[model.FarmTerrain] = field(default_factory=list)
@@ -243,6 +265,13 @@ class RomSession:
     # mid-session.
     _battle_locations_cache: Optional[Dict[int, List[Any]]] = field(default=None)
 
+    # Lazy list of every scripted BATTLE block *position* — (entry_ix,
+    # block_offset, chain_ix, source_entry_ix, map_id). Positions are
+    # structural (same-length enemy edits never move a block), so this is
+    # built once; callers re-read the live enemies per query rather than
+    # caching them. Drives the validation footer's over-budget-battle check.
+    _scripted_battle_positions_cache: Optional[List[Any]] = field(default=None)
+
     # Lazy digimon_id → ascending list of wild-encounter area indices that
     # place the species (the reverse of ``WildEncounterArea.encounters``).
     # Unlike the BATTLE index above, wild encounters ARE editable, so the
@@ -307,6 +336,12 @@ class RomSession:
     # by ``invalidate_sprite_label_caches`` when the underlying pak changes.
     _spr_pixmap_cache: Dict[Tuple[int, int], object] = field(default_factory=dict)
     _mchr_pixmap_cache: Dict[Tuple[int, int], object] = field(default_factory=dict)
+    # Keyed by (ow_id, max_size, frame) — distinct from _mchr_pixmap_cache
+    # because two ow-ids can share a CHR graphic under different palettes.
+    _mchr_ow_pixmap_cache: Dict[Tuple[int, int, object], object] = field(default_factory=dict)
+    # CHR index -> authoritative width in tiles (from the MCHR_ANM OAM shape),
+    # or None when unavailable (caller falls back to pick_tile_grid).
+    _mchr_width_cache: Dict[int, object] = field(default_factory=dict)
 
     # Lazy label caches for the SPR / MCHR / BTCHR sprite pickers used by
     # SpriteMapRow (Display/Reskin section of base + enemy editors).
@@ -319,7 +354,21 @@ class RomSession:
     # change).
     _spr_labels_cache: Optional[List[str]] = None
     _mchr_labels_cache: Optional[List[str]] = None
+    # Overworld-sprite-id labels (906), keyed by ow-id, tagging each id with
+    # its resolved CHR graphic label. Distinct from _mchr_labels_cache (CHR
+    # space, 890). Feeds the field-map / cutscene sprite-id pickers.
+    _mchr_ow_labels_cache: Optional[List[str]] = None
     _btchr_group_labels_cache: Optional[List[str]] = None
+
+    # Lazy per-group BTCHR footprint (mini-header footprint_scale = the
+    # per-frame tile budget the engine loads into VRAM). Keyed by group;
+    # misses cache as None. Dropped alongside the battle-sprite pixmap
+    # cache whenever BTCHR.PAK bytes change (same trigger, same staleness).
+    _btchr_footprint_cache: Dict[int, object] = field(default_factory=dict)
+    # Reverse map CHRSIZE.BIN lo (digimon id) -> first group index, mirroring
+    # the engine's linear lo search (FUN_000581b0). Rebuilt lazily; dropped
+    # on any chrsize word edit or sidecar append (both can move a lo).
+    _chrsize_lo_map: Optional[Dict[int, int]] = None
 
     # Frozen sprite-idx → owning digimon_id snapshot. Captured from the
     # sprite_map at first access (during the eager label pre-warm in
@@ -499,6 +548,9 @@ class RomSession:
         session.armor_digivolutions = loaders.loadArmorDigivolutions(version, parse_data)
         session.dna_digivolutions, _ = loaders.loadDnaDigivolutions(version, parse_data)
         session.sprite_map = loaders.loadSpriteMapTable(version, parse_data)
+        session.mchr_chr_to_pal = loaders.loadMchrChrToPalMap(version, parse_data)
+        session.mchr_ow_to_chr = loaders.loadMchrOwToChrMap(version, parse_data)
+        session.mchr_ow_base_pal = loaders.loadMchrOwBasePal(version, parse_data)
         session.battle_strings = loaders.loadBattleStringTable(version, parse_data)
         session.habitats_worldmap = loaders.loadHabitatsWorldmap(version, parse_data)
         session.farm_terrains = loaders.loadFarmTerrains(version, parse_data)
@@ -507,6 +559,7 @@ class RomSession:
         session.map_encounter_table = loaders.loadMapEncounterTable(version, parse_data, file_table=file_table)
         session.equipment = loaders.loadEquipment(version, parse_data, file_table=file_table)
         session.consumables = loaders.loadConsumables(version, parse_data)
+        session.traits = loaders.loadTraitData(version, parse_data)
         session.farm_items = loaders.loadFarmItems(version, parse_data)
         session.farm_training_pens = loaders.loadFarmTrainingPens(version, parse_data)
         session.string_regions = loaders.loadAllStringRegions(version, parse_data, file_table=file_table)
@@ -562,6 +615,7 @@ class RomSession:
         skip_map_splice: bool = False,
         skip_overlay5_splice: bool = False,
         skip_sound_splice: bool = False,
+        skip_wild_encounter_splice: bool = False,
     ) -> bytearray:
         """Write every model back onto a copy of the original ROM bytes.
 
@@ -579,6 +633,8 @@ class RomSession:
         for obj in self.enemy_digimon.values():
             obj.writeToRom(out)
         for obj in self.moves:
+            obj.writeToRom(out)
+        for obj in self.traits:
             obj.writeToRom(out)
         for obj in self.quests:
             obj.writeToRom(out)
@@ -601,6 +657,11 @@ class RomSession:
         for obj in self.starters:
             obj.writeToRom(out)
         for area in self.wild_encounter_areas:
+            # Resized areas (add/remove slot) no longer fit their vanilla FAT
+            # slot — the in-place write would clobber the next file, so they're
+            # routed through ``_apply_wild_encounter_splice`` below instead.
+            if area.is_resized:
+                continue
             area.writeToRom(out)
         for entry in self.map_encounter_table:
             entry.writeToRom(out)
@@ -612,6 +673,18 @@ class RomSession:
             obj.writeToRom(out)
         for obj in self.farm_training_pens:
             obj.writeToRom(out)
+        # Overworld palette reassignments: patch the ARM9 ow-sprite table's pal
+        # field (f2) in place. Equal-length ARM9 byte edit — rides the same
+        # in-place + byte-diff channel as the ARM9 string regions.
+        if self.mchr_ow_pal_overrides:
+            spec = constants.MCHR_OW_SPRITE_TABLE_OFFSET.get(self.version)
+            if spec is not None:
+                table_start, count = spec
+                for ow_id, pal in self.mchr_ow_pal_overrides.items():
+                    if 0 <= ow_id < count:
+                        struct.pack_into(
+                            "<H", out, table_start + ow_id * 8 + 4, pal & 0xFFFF
+                        )
         for region_id, region_strings in self.string_regions.items():
             is_msgpak = region_id.startswith("msgpak_")
             for s in region_strings:
@@ -628,6 +701,15 @@ class RomSession:
                 if is_msgpak:
                     continue
                 s.writeToRom(out)
+        # Wild-encounter area resize (add/remove slot) runs FIRST among the
+        # splice phases: it resolves each grown/shrunk area against its
+        # vanilla file offset, which is only valid while nothing downstream
+        # has shifted yet. Later splices re-resolve against the current ROM,
+        # so their order relative to this one doesn't matter. Project save
+        # passes ``skip_wild_encounter_splice=True`` and routes the bytes
+        # through the ``wild_encounter_area_edits`` channel instead.
+        if not skip_wild_encounter_splice:
+            self._apply_wild_encounter_splice(out)
         # Sprite pak splice runs inside serialize_all (not just _with_qol)
         # so direct ROM saves include sprite edits. Project save passes
         # ``skip_sprite_splice=True`` and snapshots per-entry edits into
@@ -859,6 +941,52 @@ class RomSession:
             self._battle_locations_cache = out
         return self._battle_locations_cache
 
+    def scripted_battle_positions(self) -> List[Tuple[int, int, int, int, Optional[int]]]:
+        """Every scripted BATTLE block's position across overlay5:
+        ``(entry_ix, block_offset, chain_ix, source_entry_ix, map_id)``.
+
+        Positions are structural (a same-length enemy edit never relocates a
+        block), so this is built once and cached; callers re-read the live
+        enemies at each offset for up-to-date content. ``chain_ix`` is the
+        global index into ``cutscene_index().chains`` that navigates to the
+        block (``-1`` when no chain owns the region), and ``map_id`` is the
+        field map the player sees it on (``None`` if unmapped)."""
+        if self._scripted_battle_positions_cache is None:
+            from digimon_core import overlay5 as ov5
+            cindex = self.cutscene_index()
+            region_to_chain: Dict[Tuple[int, int], int] = {}
+            for chain_ix, chain in enumerate(cindex.chains):
+                for region_key in chain.path:
+                    region_to_chain.setdefault(region_key, chain_ix)
+            seen: set = set()
+            out: List[Tuple[int, int, int, int, Optional[int]]] = []
+            for (entry_ix, rel), region in cindex.regions.items():
+                entry_bytes = self.overlay5_entry_bytes(entry_ix)
+                events, _unknowns = ov5.iter_region_events_with_meta(
+                    entry_bytes, rel, region.end_rel,
+                )
+                for ev in events:
+                    if ev.kind != ov5.EVENT_KIND_BATTLE:
+                        continue
+                    key = (int(entry_ix), int(ev.rel))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    chain_ix = region_to_chain.get((entry_ix, rel), -1)
+                    source_entry_ix = (
+                        cindex.chains[chain_ix].source_entry_ix
+                        if chain_ix >= 0 else int(entry_ix)
+                    )
+                    out.append((
+                        key[0], key[1], int(chain_ix),
+                        int(source_entry_ix), ov5.map_id_for(source_entry_ix),
+                    ))
+            out.sort(key=lambda t: (
+                (t[4] if t[4] is not None else 10_000), t[0], t[1],
+            ))
+            self._scripted_battle_positions_cache = out
+        return self._scripted_battle_positions_cache
+
     def first_battle_location(
         self, digimon_id: int,
     ) -> Optional["BattleLocation"]:
@@ -1008,6 +1136,55 @@ class RomSession:
         many entries inside the pak were touched.
         """
         self._dirty_sprite_paks.add(pak_name)
+
+    def _apply_wild_encounter_splice(self, out: bytearray) -> None:
+        """Splice every resized wild-encounter area file back into the ROM.
+
+        Areas whose record count changed (add/remove slot) can't ride the
+        in-place ``writeToRom`` path — a grown area would overwrite the next
+        file. Each resized area is resolved against its vanilla file offset
+        (valid because this runs before any other splice shifts downstream
+        files) and spliced with the same ``fat`` machinery the sprite/btmap/
+        map paths use. Descending-offset order keeps lower areas' offsets
+        valid as higher ones grow. A one-record add grows the file by 0x18,
+        which rounds up to a single 0x200-aligned downstream shift.
+        """
+        resized = [a for a in self.wild_encounter_areas if a.is_resized]
+        if not resized:
+            return
+        for area in sorted(resized, key=lambda a: a.offset, reverse=True):
+            new_bytes = bytes(area.getByteArray())
+            idx, cs, ce = fat.find_container(out, area.offset, area.offset + 1)
+            content_delta = len(new_bytes) - (ce - cs)
+            aligned_shift = fat.splice_range(out, cs, ce, ce, new_bytes)
+            fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
+
+    def wild_encounter_area_edits(self) -> List[Tuple[int, bytes]]:
+        """Snapshot resized wild-encounter areas for the .romproj
+        ``wild_encounter_area_edits`` channel.
+
+        Project save passes ``skip_wild_encounter_splice=True`` (the byte
+        diff requires an equal-length ROM), so a grown/shrunk area's bytes
+        can't ride the diff. Each tuple is ``(area_index, full_file_bytes)``;
+        :meth:`apply_wild_encounter_area_edits` replays them on load.
+        """
+        return [
+            (ix, bytes(area.getByteArray()))
+            for ix, area in enumerate(self.wild_encounter_areas)
+            if area.is_resized
+        ]
+
+    def apply_wild_encounter_area_edits(
+        self, edits: List[Tuple[int, bytes]],
+    ) -> None:
+        """Replay resized-area overrides from a .romproj onto the parsed
+        models. Each tuple is ``(area_index, full_file_bytes)``; the bytes
+        replace the area's ``_raw`` so the next ``serialize_all`` splices the
+        restored records back in. Idempotent."""
+        for ix, data in edits:
+            if 0 <= ix < len(self.wild_encounter_areas):
+                self.wild_encounter_areas[ix].replace_raw(bytes(data))
+        self.invalidate_wild_area_index()
 
     def _apply_sprite_pak_splice(self, out: bytearray) -> None:
         """Rebuild every dirty sprite pak and splice it into the ROM.
@@ -1290,6 +1467,7 @@ class RomSession:
         to special-case "no edit" vs "edit equal to vanilla".
         """
         self._chrsize_edits[group] = word & 0xFFFFFFFF
+        self._chrsize_lo_map = None
 
     def set_btchrsize_value(self, group: int, value: int) -> None:
         """Record a u32 edit for ``group`` in BTCHR/BTCHRSIZE.BIN."""
@@ -1303,6 +1481,41 @@ class RomSession:
         start, end = ft.resolve(CHRSIZE_PATH)
         return (end - start) // 4
 
+    def btchr_group_count(self) -> int:
+        """Total live BTCHR groups = vanilla + in-memory appends."""
+        return self.vanilla_btchr_group_count() + len(self._btchr_appended_chrsize)
+
+    def chrsize_group_for_digimon(self, digimon_id: int) -> Optional[int]:
+        """Group index whose ``CHRSIZE.BIN`` lo == ``digimon_id``, or None.
+
+        CHRSIZE.BIN is a sorted, *sparse* array of ``{lo=digimon_id,
+        hi=fs}`` — the entry index is the BTCHR group, not the id, and ids
+        without a battle sprite are simply absent (the gaps at 0x1–0x40,
+        0x58–0x60, …). The engine's spawn-budget lookup (FUN_000581b0)
+        linear-searches the lo column for the enemy id; this mirrors it,
+        returning the first matching group (or None for a gap id).
+        """
+        if self._chrsize_lo_map is None:
+            self._chrsize_lo_map = self._build_chrsize_lo_map()
+        return self._chrsize_lo_map.get(digimon_id)
+
+    def _build_chrsize_lo_map(self) -> Dict[int, int]:
+        # Resolve + bulk-read CHRSIZE.BIN once, then overlay in-memory
+        # appends/edits — far cheaper than 415× current_chrsize_word (each
+        # of which re-parses the whole FAT).
+        ft = fnt.FileTable.from_rom(self.original_rom_data)
+        start, end = ft.resolve(CHRSIZE_PATH)
+        vanilla = (end - start) // 4
+        words = list(struct.unpack_from(f"<{vanilla}I", self.original_rom_data, start))
+        words.extend(self._btchr_appended_chrsize)
+        for g, w in self._chrsize_edits.items():
+            if 0 <= g < len(words):
+                words[g] = w
+        lo_map: Dict[int, int] = {}
+        for g, w in enumerate(words):
+            lo_map.setdefault(w & 0xFFFF, g)  # first match wins, like the engine
+        return lo_map
+
     def append_btchr_group_sidecars(
         self, chrsize_word: int, btchrsize_value: int,
     ) -> None:
@@ -1313,6 +1526,7 @@ class RomSession:
         u32s ride the sidecar resize on serialize so the engine sees a
         consistent (PAK count, chrsize length, btchrsize length) triple.
         """
+        self._chrsize_lo_map = None
         self._btchr_appended_chrsize.append(chrsize_word & 0xFFFFFFFF)
         self._btchr_appended_btchrsize.append(btchrsize_value & 0xFFFFFFFF)
 
@@ -1464,6 +1678,75 @@ class RomSession:
         append (count changes). Misses recomputed lazily on next preview.
         """
         self._battle_sprite_pixmap_cache.clear()
+        self._btchr_footprint_cache.clear()
+
+    def btchr_group_footprint(self, group: int) -> Optional[int]:
+        """Per-frame tile budget (mini-header ``footprint_scale``) of a group.
+
+        This is the ``fs`` the engine loads into VRAM for one frame of
+        BTCHR group ``group`` — the real cost of rendering that sprite,
+        independent of any chrsize entry. Cached; None on out-of-range /
+        parse failure. See :meth:`chrsize_footprint_mismatch`.
+        """
+        cached = self._btchr_footprint_cache.get(group)
+        if group in self._btchr_footprint_cache:
+            return cached  # type: ignore[return-value]
+        val = self._compute_btchr_group_footprint(group)
+        self._btchr_footprint_cache[group] = val
+        return val
+
+    def _compute_btchr_group_footprint(self, group: int) -> Optional[int]:
+        from digimon_core import btchr
+        try:
+            pak_file = self.sprite_pak("DAT/BTCHR.PAK")
+        except KeyError:
+            return None
+        if not (0 <= group * btchr.GROUP_SIZE + btchr.GROUP_SIZE <= pak_file.count):
+            return None
+        try:
+            return btchr.decode_digimon(pak_file, group).header.footprint_scale
+        except (ValueError, IndexError):
+            return None
+
+    def digimon_battle_footprint(self, digimon_id: int) -> Optional[int]:
+        """fs of the BTCHR sprite this digimon id shows in battle.
+
+        Resolves ``id -> sprite_map.main_sprite -> group footprint`` — the
+        per-frame tile cost the engine loads for this enemy. None when the
+        id has no sprite-map slot or its group can't be decoded. Used to
+        budget a scripted battle's enemy set against
+        :data:`BATTLE_SPRITE_TILE_BUDGET`.
+        """
+        if not (0 <= digimon_id < len(self.sprite_map)):
+            return None
+        return self.btchr_group_footprint(self.sprite_map[digimon_id].main_sprite)
+
+    def chrsize_footprint_mismatch(
+        self, digimon_id: int, main_sprite: int,
+    ) -> Optional[Tuple[int, int, int]]:
+        """Detect a spawn-budget / displayed-sprite footprint desync.
+
+        The wild-encounter roll budgets each enemy against
+        ``CHRSIZE.BIN[lo==digimon_id].hi`` (Σ fs ≤ 1440), but the sprite
+        that actually renders is BTCHR group ``main_sprite``. When those
+        disagree — the classic reskin desync — the roll mis-counts and can
+        over-spawn a big sprite past the VRAM pool, crashing even on a
+        natural encounter (project memory ``project_wild_spawn_size_gate``).
+
+        Returns ``(entry_group, budgeted_fs, real_fs)`` when they differ,
+        or ``None`` when in sync / not applicable (id absent from chrsize,
+        or the render group can't be decoded).
+        """
+        entry = self.chrsize_group_for_digimon(digimon_id)
+        if entry is None:
+            return None
+        real_fs = self.btchr_group_footprint(main_sprite)
+        if real_fs is None:
+            return None
+        budgeted_fs = (self.current_chrsize_word(entry) >> 16) & 0xFFFF
+        if budgeted_fs == real_fs:
+            return None
+        return (entry, budgeted_fs, real_fs)
 
     def invalidate_spr_pixmap_cache(self) -> None:
         """Drop the cached SPR_* preview pixmaps (portrait + battle-mini)."""
@@ -1472,6 +1755,7 @@ class RomSession:
     def invalidate_mchr_pixmap_cache(self) -> None:
         """Drop the cached MCHR preview pixmaps (overworld follower)."""
         self._mchr_pixmap_cache.clear()
+        self._mchr_ow_pixmap_cache.clear()
 
     def battle_sprite_pixmap(self, group_idx: int, max_size: int = 96):
         """Lazy QPixmap of BTCHR group ``group_idx``'s idle stance, or ``None``.
@@ -1548,9 +1832,9 @@ class RomSession:
         return pix
 
     def _build_spr_pixmap(self, spr_idx: int, max_size: int):
-        from digimon_core import ncer as ncer_mod, sprite
         from PySide6.QtCore import Qt
-        from PySide6.QtGui import QImage, QPixmap
+        from PySide6.QtGui import QPixmap
+        from .widgets import cell_png_io
 
         try:
             chr_pak = self.sprite_pak("DAT/SPR_CHR.PAK")
@@ -1558,41 +1842,17 @@ class RomSession:
             cel_pak = self.sprite_pak("DAT/SPR_CEL.PAK")
         except KeyError:
             return None
-        if not (0 <= spr_idx < min(chr_pak.count, pal_pak.count, cel_pak.count)):
-            return None
-        try:
-            chr_dec = sprite.maybe_decompress(chr_pak.entries[spr_idx])
-            tile_bytes, bit_depth, hint_w, _hint_h, is_bitmap = sprite.parse_ncgr(chr_dec)
-            palettes, _ = sprite.parse_nclr(sprite.maybe_decompress(pal_pak.entries[spr_idx]))
-            parsed_ncer = ncer_mod.parse_ncer(cel_pak.entries[spr_idx])
-        except (ValueError, IndexError):
-            return None
-        if not palettes:
-            return None
-        # Width heuristic mirrors _build_portrait_icon / SpriteBrowser.
-        if hint_w:
-            width_tiles = hint_w
-        else:
-            bbox_w, _ = ncer_mod.sprite_bbox(parsed_ncer)
-            if bbox_w <= 0:
-                width_tiles = 4
-            elif bbox_w <= 16:
-                width_tiles = 2
-            elif bbox_w < 64:
-                width_tiles = 4
-            else:
-                width_tiles = 8
-        if bit_depth == 4 and len(palettes[0]) == 16:
-            palette = [c for bank in palettes for c in bank]
-        else:
-            palette = palettes[0]
-        rgba, w, h = sprite.render_rgba(
-            tile_bytes, bit_depth, palette, width_tiles, is_bitmap,
+        # Render only the first cell: portrait / battle-mini entries pack a
+        # duplicate cell pair, and OAM-composited cell 0 is the true sprite —
+        # the old whole-tile-sheet render showed every cell side by side.
+        img = cell_png_io.render_spr_index_qimage(
+            chr_pak, pal_pak, cel_pak, spr_idx, first_cell_only=True,
         )
-        if w == 0 or h == 0:
+        if img is None:
             return None
-        img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888).copy()
         pix = QPixmap.fromImage(img)
+        if pix.isNull() or pix.width() == 0 or pix.height() == 0:
+            return None
         if pix.width() > max_size or pix.height() > max_size:
             pix = pix.scaled(
                 max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation,
@@ -1610,6 +1870,50 @@ class RomSession:
         if spr_idx is None:
             return None
         return self.spr_sprite_pixmap(spr_idx, max_size=max_size)
+
+    def mchr_ow_id_for_chr(self, chr_idx: int) -> int:
+        """Canonical overworld-sprite id for a CHR graphic — the lowest ow-id
+        whose record references it. Stable (built from the table's CHR fields,
+        which reassignment never touches); identity fallback. This is the record
+        whose palette the reassignment feature rewrites."""
+        cache = getattr(self, "_mchr_chr_to_ow_id", None)
+        if cache is None:
+            cache = {}
+            for ow_id in sorted(self.mchr_ow_to_chr):
+                cache.setdefault(self.mchr_ow_to_chr[ow_id], ow_id)
+            self._mchr_chr_to_ow_id = cache
+        return cache.get(chr_idx, chr_idx)
+
+    def mchr_effective_ow_pal(self, ow_id: int) -> int:
+        """Palette an overworld id resolves to *right now* — a staged
+        reassignment override if present, else this ROM's stored value."""
+        if ow_id in self.mchr_ow_pal_overrides:
+            return self.mchr_ow_pal_overrides[ow_id]
+        return self.mchr_ow_base_pal.get(ow_id, ow_id)
+
+    def set_mchr_ow_pal(self, ow_id: int, pal: int) -> None:
+        """Stage (or clear) an overworld palette reassignment. Setting it back
+        to the ROM's base value drops the override so save writes nothing."""
+        if pal == self.mchr_ow_base_pal.get(ow_id, ow_id):
+            self.mchr_ow_pal_overrides.pop(ow_id, None)
+        else:
+            self.mchr_ow_pal_overrides[ow_id] = int(pal)
+
+    def mchr_pal_for_chr(self, chr_idx: int) -> int:
+        """Canonical MCHR_PAL index for an MCHR_CHR (overworld) sprite index.
+
+        Resolves the CHR->PAL drift past id 0x0297 via the ARM9
+        overworld-sprite table (see :func:`loaders.loadMchrChrToPalMap`), so
+        e.g. the chest sprite (CHR 0x2ed) previews with PAL 0x2fb instead of
+        the wrong-coloured 0x2ed. Falls back to identity when the table is
+        unavailable. Clamped to the loaded MCHR_PAL entry count.
+        """
+        pal_idx = self.mchr_chr_to_pal.get(chr_idx, chr_idx)
+        try:
+            pal_count = self.sprite_pak("DAT/MCHR_PAL.PAK").count
+        except KeyError:
+            return pal_idx
+        return min(pal_idx, pal_count - 1)
 
     def mchr_sprite_pixmap(
         self, mchr_idx: int, max_size: int = 80, frame: Optional[int] = None,
@@ -1630,8 +1934,84 @@ class RomSession:
         self._mchr_pixmap_cache[cache_key] = pix
         return pix
 
+    def mchr_width_tiles_for_chr(self, chr_idx: int) -> Optional[int]:
+        """Authoritative sprite width (in tiles) for MCHR ``chr_idx``.
+
+        Read from the sprite's MCHR_ANM OAM shape+size — this fixes the
+        wide/tall ambiguity that ``mchr.pick_tile_grid`` can only guess (e.g.
+        the 41 genuinely-wide overworld sprites that would otherwise render
+        squished/tall). Returns ``None`` when unavailable or when the decoded
+        grid doesn't match the CHR tile count, so callers fall back to
+        ``pick_tile_grid``.
+        """
+        if chr_idx in self._mchr_width_cache:
+            return self._mchr_width_cache[chr_idx]
+        from digimon_core import mchr as mchr_mod, mchr_anm, sprite
+        width: Optional[int] = None
+        try:
+            anm_pak = self.sprite_pak("DAT/MCHR_ANM.PAK")
+            chr_pak = self.sprite_pak("DAT/MCHR_CHR.PAK")
+            if 0 <= chr_idx < anm_pak.count and 0 <= chr_idx < chr_pak.count:
+                grid = mchr_anm.oam_grid_from_header(anm_pak.entries[chr_idx])
+                if grid is not None:
+                    tiles = mchr_mod.parse_mchr_chr_entry(
+                        sprite.decompress_rle30(chr_pak.entries[chr_idx])
+                    ).tiles_per_frame
+                    if grid[0] * grid[1] == tiles:
+                        width = grid[0]
+        except (KeyError, ValueError, IndexError):
+            width = None
+        self._mchr_width_cache[chr_idx] = width
+        return width
+
+    def mchr_animations_for_ow(self, ow_id: int):
+        """Parsed MCHR_ANM animation list for the overworld sprite ``ow_id``.
+
+        The cutscene SET_SPRITE_ANIM opcode (0x64) indexes this list directly
+        — ``animations[anim_id]`` is the sequence that sprite plays (verified
+        against scene data). Returns ``[]`` when the sprite has no MCHR_ANM
+        entry or the paks are unavailable, so callers degrade to a raw id.
+        """
+        chr_idx = self.mchr_ow_to_chr.get(ow_id, ow_id)
+        try:
+            anm_pak = self.sprite_pak("DAT/MCHR_ANM.PAK")
+        except KeyError:
+            return []
+        if not (0 <= chr_idx < anm_pak.count):
+            return []
+        from digimon_core import mchr_anm
+        try:
+            return mchr_anm.parse_mchr_anm(anm_pak.entries[chr_idx]).animations
+        except (ValueError, IndexError):
+            return []
+
+    def mchr_sprite_pixmap_by_ow_id(
+        self, ow_id: int, max_size: int = 80, frame: Optional[int] = None,
+    ):
+        """QPixmap of the overworld object with overworld-sprite id ``ow_id``.
+
+        Field-map objects and cutscene placements reference sprites by ow-id
+        (the 906-entry space), which maps through the ARM9 table to a CHR
+        graphic (``mchr_ow_to_chr``) rendered under that id's own palette
+        (== the id). So ow-id 0x2fb renders the chest (CHR 0x2ed) under
+        palette 0x2fb, not the unrelated CHR-0x2fb graphic. Falls back to
+        treating ``ow_id`` as a CHR index when the table is unavailable.
+        """
+        cache_key = (ow_id, max_size, frame)
+        if cache_key in self._mchr_ow_pixmap_cache:
+            return self._mchr_ow_pixmap_cache[cache_key]
+        chr_idx = self.mchr_ow_to_chr.get(ow_id, ow_id)
+        # An ow-id's palette is the id itself (identity in the table); pass it
+        # explicitly so a shared-graphic recolor (e.g. 0x2fc) still uses its
+        # own palette rather than the canonical one.
+        pal_override = ow_id if self.mchr_ow_to_chr else None
+        pix = self._build_mchr_pixmap(chr_idx, max_size, frame, pal_idx=pal_override)
+        self._mchr_ow_pixmap_cache[cache_key] = pix
+        return pix
+
     def _build_mchr_pixmap(
         self, mchr_idx: int, max_size: int, frame: Optional[int] = None,
+        pal_idx: Optional[int] = None,
     ):
         from digimon_core import mchr as mchr_mod, sprite
         from PySide6.QtCore import Qt
@@ -1650,7 +2030,11 @@ class RomSession:
             return None
         if entry.frame_count == 0:
             return None
-        pal_idx = min(mchr_idx, pal_pak.count - 1)
+        # Explicit palette (ow-id path) vs. the CHR's canonical palette.
+        if pal_idx is None:
+            pal_idx = self.mchr_pal_for_chr(mchr_idx)
+        else:
+            pal_idx = min(pal_idx, pal_pak.count - 1)
         if pal_idx < 0:
             return None
         try:
@@ -1670,7 +2054,10 @@ class RomSession:
         else:
             frame_idx = max(0, min(int(frame), entry.frame_count - 1))
         try:
-            rgba, w, h = mchr_mod.render_frame_rgba(entry.frames[frame_idx], palette)
+            rgba, w, h = mchr_mod.render_frame_rgba(
+                entry.frames[frame_idx], palette,
+                width_tiles=self.mchr_width_tiles_for_chr(mchr_idx),
+            )
         except (ValueError, IndexError):
             return None
         if w == 0 or h == 0:
@@ -1760,9 +2147,9 @@ class RomSession:
         return icon
 
     def _build_portrait_icon(self, digimon_id: int):
-        from digimon_core import ncer as ncer_mod, sprite
         from PySide6.QtCore import Qt
-        from PySide6.QtGui import QIcon, QImage, QPixmap
+        from PySide6.QtGui import QIcon, QPixmap
+        from .widgets import cell_png_io
 
         if not (0 <= digimon_id < len(self.sprite_map)):
             return None
@@ -1773,45 +2160,17 @@ class RomSession:
             cel_pak = self.sprite_pak("DAT/SPR_CEL.PAK")
         except KeyError:
             return None
-        if not (0 <= spr_idx < min(chr_pak.count, pal_pak.count, cel_pak.count)):
-            return None
-        try:
-            chr_dec = sprite.maybe_decompress(chr_pak.entries[spr_idx])
-            tile_bytes, bit_depth, hint_w, _hint_h, is_bitmap = sprite.parse_ncgr(chr_dec)
-            palettes, _ = sprite.parse_nclr(sprite.maybe_decompress(pal_pak.entries[spr_idx]))
-            parsed_ncer = ncer_mod.parse_ncer(cel_pak.entries[spr_idx])
-        except (ValueError, IndexError):
-            return None
-        if not palettes:
-            return None
-        # Width heuristic mirrors SpriteBrowser._default_width_tiles_for_bbox.
-        if hint_w:
-            width_tiles = hint_w
-        else:
-            bbox_w, _ = ncer_mod.sprite_bbox(parsed_ncer)
-            if bbox_w <= 0:
-                width_tiles = 4
-            elif bbox_w <= 16:
-                width_tiles = 2
-            elif bbox_w < 64:
-                width_tiles = 4
-            else:
-                width_tiles = 8
-        # Engine concatenates 4bpp banks for an 8bpp NCGR; match it so
-        # portraits don't render with a wrong-bank palette.
-        if bit_depth == 4 and len(palettes[0]) == 16:
-            palette = [c for bank in palettes for c in bank]
-        else:
-            palette = palettes[0]
-        rgba, w, h = sprite.render_rgba(
-            tile_bytes, bit_depth, palette, width_tiles, is_bitmap,
+        # Portrait = first non-empty OAM cell (the pair's duplicate half is
+        # dropped); see _build_spr_pixmap.
+        img = cell_png_io.render_spr_index_qimage(
+            chr_pak, pal_pak, cel_pak, spr_idx, first_cell_only=True,
         )
-        if w == 0 or h == 0:
+        if img is None:
             return None
-        img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888).copy()
-        pix = QPixmap.fromImage(img).scaled(
-            32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation,
-        )
+        pix = QPixmap.fromImage(img)
+        if pix.isNull() or pix.width() == 0 or pix.height() == 0:
+            return None
+        pix = pix.scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         return QIcon(pix)
 
     def sprite_attribution(self) -> Dict[str, Dict[int, int]]:
@@ -1865,6 +2224,34 @@ class RomSession:
             self._mchr_labels_cache = compute_mchr_labels(self)
         return self._mchr_labels_cache
 
+    def get_mchr_ow_labels(self) -> List[str]:
+        """Overworld-sprite-id picker labels, indexed by ow-id (906).
+
+        Field-map / cutscene sprite fields store an *ow-id*, not a CHR index
+        (see mchr_ow_to_chr), so their pickers list ids in that space, each
+        tagged with the CHR graphic it resolves to. Non-identity ids show the
+        ``ow → chr`` arrow; the low-id identity region reuses the CHR label
+        verbatim. Falls back to the CHR labels when the table is unavailable
+        (mapping unresolved), so the picker still functions.
+        """
+        if self._mchr_ow_labels_cache is None:
+            chr_labels = self.get_mchr_labels()
+            ow_to_chr = self.mchr_ow_to_chr
+            if not ow_to_chr:
+                self._mchr_ow_labels_cache = list(chr_labels)
+            else:
+                out: List[str] = []
+                for ow_id in range(max(ow_to_chr) + 1):
+                    chr_idx = ow_to_chr.get(ow_id, ow_id)
+                    cl = (
+                        chr_labels[chr_idx]
+                        if 0 <= chr_idx < len(chr_labels)
+                        else f"0x{chr_idx:04x}"
+                    )
+                    out.append(cl if chr_idx == ow_id else f"0x{ow_id:04x} → {cl}")
+                self._mchr_ow_labels_cache = out
+        return self._mchr_ow_labels_cache
+
     def get_btchr_group_labels(self) -> List[str]:
         """Shared BTCHR group picker labels (main battle sprite)."""
         if self._btchr_group_labels_cache is None:
@@ -1883,8 +2270,9 @@ class RomSession:
         """
         self._spr_labels_cache = None
         self._mchr_labels_cache = None
+        self._mchr_ow_labels_cache = None
         self._btchr_group_labels_cache = None
-        for kind in ("spr", "mchr", "btchr"):
+        for kind in ("spr", "mchr", "mchr_ow", "btchr"):
             self.invalidate_picker_model(kind)
         self._relink_pooled_picker_models()
         self.invalidate_battle_sprite_pixmap_cache()
@@ -1973,6 +2361,10 @@ class RomSession:
             rows.extend(enumerate(self.get_spr_labels()))
         elif kind == "mchr":
             rows.extend(enumerate(self.get_mchr_labels()))
+        elif kind == "mchr_ow":
+            # ow-id space (row idx == ow-id == UserRole); labels resolve to the
+            # CHR graphic. For field-map / cutscene sprite pickers.
+            rows.extend(enumerate(self.get_mchr_ow_labels()))
         elif kind == "btchr":
             rows.extend(enumerate(self.get_btchr_group_labels()))
         elif kind == "digimon":

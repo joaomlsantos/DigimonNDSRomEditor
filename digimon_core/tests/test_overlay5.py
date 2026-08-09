@@ -154,6 +154,161 @@ class Overlay5IndexTest(unittest.TestCase):
         map_ids = [mid for mid, _, _ in rows]
         self.assertEqual(map_ids, list(range(overlay5.MAX_MAP_ID + 1)))
 
+    def test_replace_chest_item_round_trip(self):
+        # Map 71 (entry 306) Novice Cloak chest: ARG_1 (SET_VAR var 0x0005)
+        # holds item 0xb4 at rel 0x00e8. replace_chest_item flips just that
+        # u16 and leaves every other byte intact.
+        import struct
+        entry = self.idx.read_entry(306)
+        value_off = 0x00e8
+        op, var = struct.unpack_from("<HH", entry, value_off - 4)
+        self.assertEqual((op, var), overlay5.CHEST_ITEM_SETVAR_PREFIX)
+        self.assertEqual(struct.unpack_from("<H", entry, value_off)[0], 0xb4)
+
+        edited = overlay5.replace_chest_item(entry, value_off, 0x0057)
+        self.assertEqual(len(edited), len(entry))
+        self.assertEqual(struct.unpack_from("<H", edited, value_off)[0], 0x0057)
+        # Only the item u16 changed.
+        self.assertEqual(entry[:value_off], edited[:value_off])
+        self.assertEqual(entry[value_off + 2:], edited[value_off + 2:])
+
+    def test_replace_chest_item_rejects_bad_prefix(self):
+        # Pointing at an offset whose -4 prefix isn't SET_VAR ARG_1 must
+        # raise rather than corrupt the script stream.
+        entry = self.idx.read_entry(306)
+        with self.assertRaises(ValueError):
+            overlay5.replace_chest_item(entry, 0x0010, 0x0057)
+
+    def test_tier1_blocks_and_scalar_splice(self):
+        # Map 264 entry 0499 Julia scene: the walker emits wait / camera /
+        # sprite-anim events; each field round-trips through
+        # replace_scalar_field guarded by the opcode byte.
+        import struct
+        entry = self.idx.read_entry(499)
+        evs, _ = overlay5.iter_region_events_with_meta(entry, 0x5c98, 0x5d20)
+        kinds = {e.kind for e in evs}
+        self.assertTrue({"wait", "camera", "sprite_anim", "dialog"} <= kinds)
+
+        wait = next(e for e in evs if e.kind == "wait")
+        off = wait.payload.block_offset
+        edited = overlay5.replace_scalar_field(
+            entry, off, 2, 99, overlay5.WAIT_FRAMES_OPCODE,
+        )
+        self.assertEqual(len(edited), len(entry))
+        self.assertEqual(struct.unpack_from("<H", edited, off + 2)[0], 99)
+        self.assertEqual(entry[:off + 2], edited[:off + 2])
+        self.assertEqual(entry[off + 4:], edited[off + 4:])
+
+    def test_scalar_splice_rejects_wrong_opcode(self):
+        entry = self.idx.read_entry(499)
+        with self.assertRaises(ValueError):
+            overlay5.replace_scalar_field(
+                entry, 0x0000, 2, 5, overlay5.WAIT_FRAMES_OPCODE,
+            )
+
+    def test_move_begin_block_and_splice(self):
+        # Entry 0236 @0x06b4: MOVE_BEGIN(tgt=14, type=1, x=464, y=160,
+        # speed=0xFFFF). The walker surfaces it as a 'move' event and each
+        # u16 field round-trips through replace_scalar_field.
+        import struct
+        entry = self.idx.read_entry(236)
+        off = 0x06b4
+        blk = overlay5.MoveBeginBlock.from_bytes(entry, off)
+        self.assertEqual(
+            (blk.tgt, blk.move_type, blk.x, blk.y, blk.speed),
+            (14, 1, 464, 160, 0xFFFF),
+        )
+        evs, _ = overlay5.iter_region_events_with_meta(entry, off, off + 12)
+        self.assertTrue(
+            any(e.kind == overlay5.EVENT_KIND_MOVE and e.rel == off for e in evs)
+        )
+        # Splice the destination x (offset 6); neighbors untouched.
+        edited = overlay5.replace_scalar_field(
+            entry, off, 6, 321, overlay5.MOVE_BEGIN_OPCODE,
+        )
+        self.assertEqual(struct.unpack_from("<H", edited, off + 6)[0], 321)
+        self.assertEqual(entry[:off + 6], edited[:off + 6])
+        self.assertEqual(entry[off + 8:], edited[off + 8:])
+
+    def test_control_block_decode(self):
+        # Read-only flag/branch gating decode. 0x2A / 0x06 (both conditionals)
+        # / 0x15 / 0x0F are surfaced; 0x0E is excluded (never aligned in the
+        # structural walk).
+        import struct
+        self.assertEqual(
+            set(overlay5.CONTROL_OPCODE_SIZES), {0x2A, 0x06, 0x15, 0x0F},
+        )
+        # 0x06 IFEQ_LIT_BRANCH: arg1 is the compared literal.
+        b06 = overlay5.ControlBlock.from_bytes(
+            struct.pack("<HHH", 0x06, 0x0008, 0x8BD6), 0,
+        )
+        self.assertEqual(b06.category, "branch")
+        # arg2 shown raw after the middot so sibling NPC-dialogue rows differ.
+        self.assertEqual(b06.row_summary(), ("IF", "input == 0x8 · 0x8bd6"))
+        # CMP_BRANCH: 2a 00 [desc] [skip] — desc high nibble = op, low = var;
+        # the second u16 is a RELATIVE skip (gate_len), not an address, so it
+        # isn't shown in the description.
+        blk = overlay5.ControlBlock.from_bytes(
+            struct.pack("<HHH", 0x2A, 0x0009, 0x0016), 0,
+        )
+        self.assertEqual(blk.category, "branch")
+        self.assertEqual(blk.describe(), "if var 0x9 == value")
+        self.assertEqual(blk.gate_len, 0x16)
+        self.assertEqual(blk.row_summary(), ("IF", "var 0x9 == value"))
+        # SET_VAR: 15 00 [idx] [val]
+        blk = overlay5.ControlBlock.from_bytes(
+            struct.pack("<HHH", 0x15, 6, 576), 0,
+        )
+        self.assertEqual(blk.describe(), "set var 0x6 = 0x240")
+        self.assertEqual(blk.row_summary(), ("SET VAR", "0x6 = 0x240"))
+        self.assertEqual(
+            overlay5.ControlBlock.from_bytes(struct.pack("<HH", 0x0F, 16), 0).row_summary(),
+            ("FLAG", "set 0x10"),
+        )
+        # FLAG set (arg >= 0) and clear (arg < 0 → clear ~arg).
+        self.assertEqual(
+            overlay5.ControlBlock.from_bytes(struct.pack("<HH", 0x0F, 16), 0).describe(),
+            "set flag 0x10",
+        )
+        self.assertIn(
+            "clear flag",
+            overlay5.ControlBlock.from_bytes(struct.pack("<HH", 0x0F, 0xFFF0), 0).describe(),
+        )
+        with self.assertRaises(ValueError):
+            overlay5.ControlBlock.from_bytes(struct.pack("<H", 0x0064), 0)
+
+    def test_control_events_emitted_and_dialogs_intact(self):
+        # Emitting control events must NOT desync the walker: entry 264's Julia
+        # scene still yields its dialogs, plus at least one control event.
+        entry = self.idx.read_entry(499)
+        evs, _ = overlay5.iter_region_events_with_meta(entry, 0x5c98, 0x5d20)
+        kinds = {e.kind for e in evs}
+        self.assertIn(overlay5.EVENT_KIND_DIALOG, kinds)
+        # Somewhere in the game a control event surfaces; entry 236 has them.
+        e236 = self.idx.read_entry(236)
+        all_evs, _ = overlay5.iter_region_events_with_meta(e236, 4, len(e236))
+        self.assertTrue(
+            any(e.kind == overlay5.EVENT_KIND_CONTROL for e in all_evs)
+        )
+
+    def test_sprite_gate_conditions(self):
+        import struct
+        # Map 1 (entry 236): OWS @0x022a gated by IFEQ(0x06), flag 0x8bee.
+        entry = self.idx.read_entry(236)
+        gates = overlay5.sprite_gate_conditions(entry)
+        self.assertEqual(gates.get(0x022a), (0x0006, 0x8bee))
+        # Map 27 (entry 262): GreenDigiEgg @0x038c gated by HANDLER_META(0xA6)
+        # on flag 0x8bea — the same flag that gates its dialogue.
+        egg = self.idx.read_entry(262)
+        egg_gates = overlay5.sprite_gate_conditions(egg)
+        self.assertEqual(egg_gates.get(0x038c), (0x00A6, 0x8bea))
+        # Every gated offset must start an OVERWORLD_SPRITE block.
+        for off in gates:
+            self.assertEqual(
+                struct.unpack_from("<H", entry, off)[0],
+                overlay5.OVERWORLD_SPRITE_OPCODE,
+            )
+
     def test_overlay5_payload_starts_with_pointer_table(self):
         # Sanity check: u32 hdr_size at offset 0, then hdr_size-4 bytes
         # of u32 pointers. Pointers shouldn't run past the file.

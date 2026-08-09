@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional, Tuple
 
-from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -41,17 +41,31 @@ SourceProvider = Callable[[], PreviewSource]
 
 
 class TransparentColorPicker(QWidget):
-    """Hex field + swatch + eyedropper, with click capture on bound previews."""
+    """Hex field + swatch + eyedropper, with click capture on bound previews.
+
+    Owns the transparent-colour "Pick from image" eyedropper. A host may also
+    register a second, mutually-exclusive slot eyedropper via ``on_slot_picked``
+    + :meth:`set_slot_pick_mode` — the *button* for that lives in the host (e.g.
+    the palette sidebar), and ``slotPickModeChanged`` keeps it in sync.
+    """
+
+    slotPickModeChanged = Signal(bool)  # slot-eyedropper armed/disarmed
 
     def __init__(
         self,
         *,
         on_color_picked: Callable[[Tuple[int, int, int]], None],
+        on_slot_picked: Optional[Callable[[Tuple[int, int, int]], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._on_color_picked = on_color_picked
-        self._picking: bool = False
+        # Optional second eyedropper: same click→RGB capture, but the host maps
+        # the sampled colour to a palette slot instead of setting transparency.
+        # Mutually exclusive with the transparent picker (only one mode at once).
+        self._on_slot_picked = on_slot_picked
+        self._picking: bool = False        # transparent-colour mode
+        self._picking_slot: bool = False   # select-slot mode
         # label → source-provider callback. Each provider returns the live
         # native-size QImage + scaled pixmap size, refreshed on every render
         # by the host editor.
@@ -139,17 +153,36 @@ class TransparentColorPicker(QWidget):
             return
         self._on_color_picked(rgb)
 
+    def set_slot_pick_mode(self, on: bool) -> None:
+        """Arm/disarm the slot eyedropper (driven by the host's own button).
+        Turning it on cancels the transparent-colour pick; emits
+        ``slotPickModeChanged`` so the host button stays in sync."""
+        on = bool(on) and self._on_slot_picked is not None
+        if on == self._picking_slot:
+            return
+        self._picking_slot = on
+        if on and self._picking:
+            self._pick_btn.setChecked(False)  # → _on_pick_toggled(False)
+        self._update_cursor()
+        self.slotPickModeChanged.emit(on)
+
     def _on_pick_toggled(self, checked: bool) -> None:
         self._picking = checked
+        if checked and self._picking_slot:
+            self.set_slot_pick_mode(False)  # mutual exclusion
+        self._update_cursor()
+
+    def _update_cursor(self) -> None:
+        active = self._picking or self._picking_slot
         for label in self._sources:
-            if checked:
+            if active:
                 label.setCursor(Qt.CrossCursor)
             else:
                 label.unsetCursor()
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt convention)
         if (
-            self._picking
+            (self._picking or self._picking_slot)
             and event.type() == QEvent.MouseButtonPress
             and obj in self._sources
         ):
@@ -186,5 +219,9 @@ class TransparentColorPicker(QWidget):
         if color.alpha() == 0:
             return
         rgb = (color.red(), color.green(), color.blue())
-        self._pick_btn.setChecked(False)
-        self._on_color_picked(rgb)
+        if self._picking_slot and self._on_slot_picked is not None:
+            self.set_slot_pick_mode(False)  # one-shot; syncs the host button
+            self._on_slot_picked(rgb)
+        else:
+            self._pick_btn.setChecked(False)
+            self._on_color_picked(rgb)

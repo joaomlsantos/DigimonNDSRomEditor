@@ -365,6 +365,88 @@ def loadSpriteMapTable(version: str, rom_data: bytearray) -> List[model.SpriteMa
     return out
 
 
+def _readMchrOwSpriteRecords(
+    version: str, rom_data: bytearray
+) -> Optional[List[Tuple[int, int]]]:
+    """Raw overworld-sprite table: ``[(chr_index, pal_index)]`` per ow-id.
+
+    The engine addresses overworld sprites by a 906-entry id space (1:1 with
+    MCHR_PAL) through an ARM9 table of 8-byte records
+    ``{u16 chr, u16 chr, u16 pal (== id), u16}``
+    (:data:`constants.MCHR_OW_SPRITE_TABLE_OFFSET`). MCHR_CHR is a *compacted*
+    890-entry space: 13 sprites reuse one graphic under 2-3 palettes, so
+    ``chr == pal`` only up to id 0x296. Past id 0x0297 the palette index runs
+    ahead of the CHR index (by up to +16).
+
+    Returns ``None`` when the table can't be validated (unknown version /
+    relocated ROM), so callers fall back to an identity mapping instead of
+    trusting garbage bytes.
+    """
+    spec = constants.MCHR_OW_SPRITE_TABLE_OFFSET.get(version)
+    if spec is None:
+        return None
+    start, count = spec
+    records: List[Tuple[int, int]] = []
+    for i in range(count):
+        o = start + i * 8
+        chr_idx = int.from_bytes(rom_data[o:o + 2], "little")
+        pal_idx = int.from_bytes(rom_data[o + 4:o + 6], "little")
+        # Offset signature: the low records are identity (chr == id) in vanilla,
+        # and the CHR field is never edited (only the pal field, by the
+        # overworld-palette reassignment feature), so a chr mismatch here means
+        # the offset is wrong for this ROM. Validating chr (not pal) is what lets
+        # a ROM with a *reassigned* pal (pal != id) still load correctly.
+        if i < 16 and chr_idx != i:
+            return None
+        records.append((chr_idx, pal_idx))
+    return records
+
+
+def loadMchrChrToPalMap(version: str, rom_data: bytearray) -> Dict[int, int]:
+    """MCHR_CHR index -> canonical MCHR_PAL index for overworld sprites.
+
+    For each CHR graphic, the first (lowest-id) palette that references it —
+    the canonical recolor to preview by default in the CHR-indexed MCHR
+    browser; alternates stay reachable via its palette spinner. Empty dict
+    when the ARM9 table can't be validated (caller falls back to identity).
+    See :func:`_readMchrOwSpriteRecords`.
+    """
+    records = _readMchrOwSpriteRecords(version, rom_data)
+    if not records:
+        return {}
+    out: Dict[int, int] = {}
+    for chr_idx, pal_idx in records:
+        out.setdefault(chr_idx, pal_idx)  # first (lowest) id wins = canonical
+    return out
+
+
+def loadMchrOwToChrMap(version: str, rom_data: bytearray) -> Dict[int, int]:
+    """Overworld-sprite id -> MCHR_CHR graphic index (the table's ``f0``).
+
+    Field-map objects and cutscene placements reference sprites by *ow-id*
+    (the 906-entry space, e.g. overlay5 ``OVERWORLD_SPRITE.id``), NOT by CHR
+    index. An ow-id's palette is the id itself. So ow-id 0x2fb resolves to
+    CHR 0x2ed (the chest graphic) under palette 0x2fb — rendering it as
+    ``CHR[0x2fb]`` (a different graphic) is the bug this map fixes. Empty
+    dict when the table can't be validated (caller falls back to identity).
+    """
+    records = _readMchrOwSpriteRecords(version, rom_data)
+    if not records:
+        return {}
+    return {ow_id: chr_idx for ow_id, (chr_idx, _pal) in enumerate(records)}
+
+
+def loadMchrOwBasePal(version: str, rom_data: bytearray) -> Dict[int, int]:
+    """Overworld-sprite id -> its palette index as stored in this ROM (the
+    table's ``f2``). Vanilla identity (``pal == id``); a reassigned ROM carries
+    the edited value. Backs the overworld-palette reassignment: the editor
+    stages overrides against this base and patches ``f2`` on save."""
+    records = _readMchrOwSpriteRecords(version, rom_data)
+    if not records:
+        return {}
+    return {ow_id: pal for ow_id, (_chr, pal) in enumerate(records)}
+
+
 def loadBattleStringTable(version: str, rom_data: bytearray) -> List[model.BattleStringEntry]:
     offset_start, offset_end = constants.STRING_BATTLE_TABLE_OFFSET[version]
     out: List[model.BattleStringEntry] = []
@@ -568,6 +650,24 @@ def loadConsumables(version: str, rom_data: bytearray) -> List[model.Consumable]
     while seek < offset_end:
         out.append(model.Consumable(rom_data[seek:seek + model.Consumable.SIZE], seek))
         seek += model.Consumable.SIZE
+    return out
+
+
+def loadTraitData(version: str, rom_data: bytearray) -> List[model.TraitData]:
+    rng = constants.TRAIT_DATA_OFFSETS.get(version)
+    if rng is None:
+        return []
+    offset_start, offset_end = rng
+    out: List[model.TraitData] = []
+    seek = offset_start
+    while seek < offset_end:
+        out.append(model.TraitData(rom_data[seek:seek + model.TraitData.SIZE], seek))
+        seek += model.TraitData.SIZE
+    # Each record's `index` field equals its own position in vanilla; if the
+    # first few don't, the offset (e.g. the computed DAWN one) is wrong for this
+    # ROM — return nothing rather than edit garbage.
+    if [rec.index for rec in out[:3]] != [0, 1, 2]:
+        return []
     return out
 
 

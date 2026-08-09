@@ -7,6 +7,7 @@ of changing a single scalar field on a model object; more specialized commands
 """
 from __future__ import annotations
 
+import struct
 from typing import Any, Callable, List, Optional, Tuple
 
 from PySide6.QtGui import QUndoCommand
@@ -20,6 +21,7 @@ from digimon_core.sound.swap import BgmSwap
 # match. Effect: rapid edits to the same field collapse into one undo step,
 # while switching to a different field starts a fresh entry.
 SET_ATTR_COMMAND_ID = 0x5E7A  # "SETA"
+SET_MCHR_OW_PAL_COMMAND_ID = 0x5E7B  # consecutive spinner ticks merge to one
 
 
 class SetAttrCommand(QUndoCommand):
@@ -59,6 +61,59 @@ class SetAttrCommand(QUndoCommand):
 
     def undo(self) -> None:
         setattr(self._target, self._attr, self._old_value)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class SetMchrOwPalCommand(QUndoCommand):
+    """Reassign an overworld sprite's palette — stages the ARM9 ow-sprite table
+    ``f2`` override in the session (patched into the ROM on save), undoable.
+    Consecutive edits of the same ow-id merge so dragging the palette spinner
+    collapses to a single undo entry."""
+
+    def __init__(
+        self,
+        session: Any,
+        ow_id: int,
+        new_pal: int,
+        description: Optional[str] = None,
+        on_change: Optional[Callable[[], None]] = None,
+        mergeable: bool = True,
+    ):
+        super().__init__(
+            description or f"Set overworld palette for ow 0x{ow_id:04x}"
+        )
+        self._session = session
+        self._ow_id = int(ow_id)
+        self._new = int(new_pal)
+        self._had_prev = self._ow_id in session.mchr_ow_pal_overrides
+        self._prev = session.mchr_ow_pal_overrides.get(self._ow_id)
+        self._on_change = on_change
+        # Revert is a deliberate distinct step (id -1 → QUndoStack never merges
+        # it), so it doesn't collapse into a preceding spinner assignment.
+        self._mergeable = mergeable
+
+    def id(self) -> int:  # noqa: A003 — required Qt override name
+        return SET_MCHR_OW_PAL_COMMAND_ID if self._mergeable else -1
+
+    def mergeWith(self, other: QUndoCommand) -> bool:
+        if not isinstance(other, SetMchrOwPalCommand):
+            return False
+        if other._session is not self._session or other._ow_id != self._ow_id:
+            return False
+        self._new = other._new  # keep our original prev, absorb newer target
+        return True
+
+    def redo(self) -> None:
+        self._session.set_mchr_ow_pal(self._ow_id, self._new)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        if self._had_prev:
+            self._session.mchr_ow_pal_overrides[self._ow_id] = self._prev
+        else:
+            self._session.mchr_ow_pal_overrides.pop(self._ow_id, None)
         if self._on_change is not None:
             self._on_change()
 
@@ -530,6 +585,107 @@ class EditExitSpawnArgCommand(QUndoCommand):
         self._apply(self._old_arg)
 
 
+class EditChestItemCommand(QUndoCommand):
+    """Atomic edit of the item an overworld chest gives.
+
+    The chest's interaction script sets ARG_1 (SET_VAR var 0x0005) to the
+    item id just before ``CALL_SYS 0x126a``; this rewrites that one u16 in
+    place. ``overlay5.replace_chest_item`` validates the ``15 00 05 00``
+    prefix on every apply so a stale offset can't corrupt the script.
+    ``on_change(item_id)`` fires on redo/undo so the card can re-resolve
+    the item name.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        value_offset: int,
+        new_item_id: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = int(entry_ix)
+        self._value_offset = int(value_offset)
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        if value_offset < 4 or value_offset + 2 > len(entry):
+            raise ValueError(
+                f"chest item offset 0x{value_offset:04x} out of range "
+                f"in entry {entry_ix}"
+            )
+        self._old = struct.unpack_from("<H", entry, value_offset)[0]
+        self._new = int(new_item_id) & 0xFFFF
+
+    def _apply(self, item_id: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_chest_item(
+            entry, self._value_offset, item_id,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(item_id)
+
+    def redo(self) -> None:
+        self._apply(self._new)
+
+    def undo(self) -> None:
+        self._apply(self._old)
+
+
+class EditScriptFieldCommand(QUndoCommand):
+    """In-place u16 edit of one field inside a fixed-size overlay5 opcode.
+
+    Backs the Tier-1 Cutscenes cards (wait / sprite-anim / camera / item):
+    each rewrites a single u16 at ``block_offset + field_offset``,
+    validated against the opcode byte at ``block_offset`` via
+    ``overlay5.replace_scalar_field`` so a stale offset is a hard error,
+    not silent corruption. ``on_change(value)`` fires on redo/undo.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_ix: int,
+        block_offset: int,
+        field_offset: int,
+        new_value: int,
+        expected_opcode: int,
+        description: str,
+        on_change: Optional[Callable[[int], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._entry_ix = int(entry_ix)
+        self._block_offset = int(block_offset)
+        self._field_offset = int(field_offset)
+        self._expected_opcode = int(expected_opcode)
+        self._on_change = on_change
+        entry = session.overlay5_entry_bytes(entry_ix)
+        self._old = struct.unpack_from(
+            "<H", entry, self._block_offset + self._field_offset,
+        )[0]
+        self._new = int(new_value) & 0xFFFF
+
+    def _apply(self, value: int) -> None:
+        entry = self._session.overlay5_entry_bytes(self._entry_ix)
+        edited = overlay5_mod.replace_scalar_field(
+            entry, self._block_offset, self._field_offset,
+            value, self._expected_opcode,
+        )
+        self._session.replace_overlay5_entry_bytes(self._entry_ix, edited)
+        if self._on_change is not None:
+            self._on_change(value)
+
+    def redo(self) -> None:
+        self._apply(self._new)
+
+    def undo(self) -> None:
+        self._apply(self._old)
+
+
 class EditDialogFieldCommand(QUndoCommand):
     """Atomic edit of one u16 field (target / msg_id / portrait) inside
     a 12-byte DIALOG block.
@@ -882,6 +1038,83 @@ class PortBtchrSpriteCommand(QUndoCommand):
             self._on_change()
 
 
+class BatchCompressBtchrCommand(QUndoCommand):
+    """Apply many occupied-only OAM re-covers as a single undoable step.
+
+    Each ``(group, spr)`` port is delegated to a child
+    :class:`PortBtchrSpriteCommand`. The children are built up-front, before
+    any ``redo()``, against the pre-batch bytes — compressing group A never
+    touches group B's entries or sidecar words, so the snapshots don't
+    interfere. Only the batch fires ``on_change`` (once, after the whole run),
+    so the browser redecodes a single time instead of once per group.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        ports: List[Tuple[int, btchrspr.BtchrSprite]],
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._on_change = on_change
+        self._children = [
+            PortBtchrSpriteCommand(session, group, spr, description="", on_change=None)
+            for group, spr in ports
+        ]
+
+    def redo(self) -> None:
+        for child in self._children:
+            child.redo()
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        for child in reversed(self._children):
+            child.undo()
+        if self._on_change is not None:
+            self._on_change()
+
+
+class SyncChrsizeFootprintCommand(QUndoCommand):
+    """Rewrite one CHRSIZE.BIN slot's fs (hi u16) to match a displayed sprite.
+
+    The wild-encounter roll budgets each enemy against
+    ``CHRSIZE.BIN[lo==id].hi`` (Σ fs ≤ 1440), but the sprite that renders
+    is the id's ``main_sprite`` group. A reskin changes what renders
+    without touching that word, so the roll under-counts and can spawn a
+    big sprite past the VRAM pool — crashing even a natural encounter
+    (project memory ``project_wild_spawn_size_gate``). This syncs the fs
+    to the displayed sprite's real footprint, preserving the lo (digimon
+    id) half. Single-slot, fully reversible.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        entry_group: int,
+        new_fs: int,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._group = entry_group
+        self._on_change = on_change
+        self._old_word = session.current_chrsize_word(entry_group)
+        self._new_word = (self._old_word & 0xFFFF) | ((new_fs & 0xFFFF) << 16)
+
+    def redo(self) -> None:
+        self._session.set_chrsize_word(self._group, self._new_word)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        self._session.set_chrsize_word(self._group, self._old_word)
+        if self._on_change is not None:
+            self._on_change()
+
+
 class AppendBtchrGroupCommand(QUndoCommand):
     """Atomic append of a new BTCHR group cloned from an existing one.
 
@@ -1030,6 +1263,84 @@ class AppendPakEntriesCommand(QUndoCommand):
             pak_obj.flags.pop()
             pak_obj.count -= 1
             self._session.mark_sprite_pak_dirty(pak_name)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class AddWildEncounterCommand(QUndoCommand):
+    """Add a new encounter slot to a wild-encounter area.
+
+    The record count grows past the area's vanilla FAT slot, so
+    ``serialize_all`` routes it through the wild-encounter splice. On
+    redo-after-undo the *same* WildEncounter instance is re-inserted, so any
+    per-field edits the user layers on top (SetAttrCommands bound to that
+    instance) survive the round-trip. Undo removes the slot. Capped at the
+    16-encounter engine limit (``WildEncounterArea.MAX_ENCOUNTERS``).
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        area: Any,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._area = area
+        self._on_change = on_change
+        self._enc: Any = None
+        self._index: Optional[int] = None
+
+    def redo(self) -> None:
+        if self._enc is None:
+            self._enc = self._area.add_encounter()
+            self._index = self._area.encounters.index(self._enc)
+        else:
+            self._area.insert_encounter(self._index, self._enc)
+        self._session.invalidate_wild_area_index()
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        self._area.remove_encounter(self._index)
+        self._session.invalidate_wild_area_index()
+        if self._on_change is not None:
+            self._on_change()
+
+
+class RemoveWildEncounterCommand(QUndoCommand):
+    """Remove one encounter slot from a wild-encounter area.
+
+    Snapshots the removed WildEncounter instance so undo re-inserts the exact
+    same object at its original index — keeping any field-edit commands that
+    reference it valid across the round-trip.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        area: Any,
+        index: int,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._area = area
+        self._index = int(index)
+        self._on_change = on_change
+        self._enc: Any = None
+
+    def redo(self) -> None:
+        self._enc = self._area.remove_encounter(self._index)
+        self._session.invalidate_wild_area_index()
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        self._area.insert_encounter(self._index, self._enc)
+        self._session.invalidate_wild_area_index()
         if self._on_change is not None:
             self._on_change()
 

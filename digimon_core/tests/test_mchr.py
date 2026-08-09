@@ -26,7 +26,7 @@ PKG_PARENT = os.path.abspath(os.path.join(HERE, "..", ".."))
 if PKG_PARENT not in sys.path:
     sys.path.insert(0, PKG_PARENT)
 
-from digimon_core import fnt, mchr, pak, rom, sprite  # noqa: E402
+from digimon_core import fnt, loaders, mchr, mchr_anm, pak, rom, sprite  # noqa: E402
 
 
 ROM_DIR = r"C:\Workspace\digimon_stuffs\rom_files"
@@ -232,6 +232,8 @@ class _McharRomBase:
             raise unittest.SkipTest(f"ROM missing: {path}")
         cls.chr_pak = _load_pak_from_rom(path, "DAT/MCHR_CHR.PAK")
         cls.pal_pak = _load_pak_from_rom(path, "DAT/MCHR_PAL.PAK")
+        cls.anm_pak = _load_pak_from_rom(path, "DAT/MCHR_ANM.PAK")
+        cls.rom_data = bytes(rom.loadRom(path))
 
     def test_pak_entry_counts(self):
         # Both regions ship 890 CHR + 906 PAL — 16 extra palettes whose
@@ -294,6 +296,75 @@ class _McharRomBase:
                 odd.append((i, len(decompressed)))
         # The vanilla survey on Dusk found zero outliers — surface any.
         self.assertEqual(odd, [], f"non-32B palette banks: {odd[:10]}")
+
+    def test_chr_to_pal_map_resolves_drift(self):
+        # The ARM9 overworld-sprite table gives every CHR its canonical PAL.
+        m = loaders.loadMchrChrToPalMap(self.VERSION, self.rom_data)
+        self.assertTrue(m, "table failed to validate — offset likely wrong")
+        # Every CHR entry is covered, none maps outside MCHR_PAL.
+        self.assertEqual(sorted(m), list(range(self.chr_pak.count)))
+        self.assertTrue(all(0 <= p < self.pal_pak.count for p in m.values()))
+        # Identity holds through the 1:1 region.
+        for c in (0, 1, 100, 500, 0x296):
+            self.assertEqual(m[c], c)
+        # First divergence at 0x297, and the chest at 0x2ed -> 0x2fb (the
+        # bug this map fixes: naive chr==pal gave the wrong-coloured 0x2ed).
+        self.assertEqual(m[0x297], 0x298)
+        self.assertEqual(m[0x2ed], 0x2fb)
+        # Last CHR carries the full +16 accumulated palette offset.
+        self.assertEqual(m[self.chr_pak.count - 1], self.pal_pak.count - 1)
+        # Monotonic non-decreasing, matching the engine's ordering.
+        pals = [m[c] for c in range(self.chr_pak.count)]
+        self.assertEqual(pals, sorted(pals))
+
+    def test_ow_to_chr_map_resolves_graphic(self):
+        # Field-map / cutscene objects key by ow-id (906-space); resolve each
+        # to its CHR graphic (the table's f0).
+        m = loaders.loadMchrOwToChrMap(self.VERSION, self.rom_data)
+        self.assertTrue(m, "table failed to validate — offset likely wrong")
+        self.assertEqual(sorted(m), list(range(self.pal_pak.count)))  # 906 ow-ids
+        self.assertTrue(all(0 <= c < self.chr_pak.count for c in m.values()))
+        # Identity through the 1:1 region.
+        for i in (0, 1, 100, 0x296):
+            self.assertEqual(m[i], i)
+        # Chest object: ow-id 0x2fb -> CHR 0x2ed (the graphic this map fixes,
+        # vs. rendering the unrelated CHR-0x2fb pyramid). Its recolor sibling
+        # 0x2fc shares the same graphic.
+        self.assertEqual(m[0x2fb], 0x2ed)
+        self.assertEqual(m[0x2fc], 0x2ed)
+
+    def test_anm_oam_grid_fixes_sprite_width(self):
+        # The MCHR_ANM OAM shape+size gives each sprite's true tile grid,
+        # resolving the wide/tall ambiguity pick_tile_grid only guesses. It
+        # must agree with the CHR tile count for effectively every sprite,
+        # and it surfaces the genuinely-wide sprites pick_tile_grid misses.
+        matched = wide = 0
+        grid_2ca = None
+        for i in range(self.chr_pak.count):
+            tc = mchr.parse_mchr_chr_entry(
+                sprite.decompress_rle30(self.chr_pak.original_entry(i))
+            ).tiles_per_frame
+            grid = mchr_anm.oam_grid_from_header(self.anm_pak.original_entry(i))
+            if grid is None:
+                continue
+            if grid[0] * grid[1] == tc:
+                matched += 1
+                if grid[0] > grid[1]:
+                    wide += 1
+            if i == 0x2ca:
+                grid_2ca = grid
+        # 889/890 agree on vanilla Dusk+Dawn (one outlier ANM header).
+        self.assertGreaterEqual(matched, self.chr_pak.count - 2)
+        self.assertGreater(wide, 0)  # wide sprites exist and are detected
+        # The wide field object from the report: 8x4 tiles = 64x32, which
+        # pick_tile_grid(32) would wrongly render as 4x8 (tall/squished).
+        self.assertEqual(grid_2ca, (8, 4))
+        self.assertEqual(mchr.pick_tile_grid(32), (4, 8))
+
+    def test_unknown_version_returns_empty_maps(self):
+        # Callers treat empty as "fall back to identity" — never raise.
+        self.assertEqual(loaders.loadMchrChrToPalMap("NOPE", self.rom_data), {})
+        self.assertEqual(loaders.loadMchrOwToChrMap("NOPE", self.rom_data), {})
 
     def test_palette_round_trips_for_sample_indices(self):
         # Bit-exact round-trip on a handful of real palettes (running the

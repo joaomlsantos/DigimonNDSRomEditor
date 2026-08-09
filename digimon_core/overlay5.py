@@ -249,6 +249,85 @@ def first_per_sprite_id(
     return out
 
 
+def first_per_sprite_id_pos(
+    placements: List[OverworldSpritePlacement],
+) -> List[OverworldSpritePlacement]:
+    """Filter so each ``(overworld_sprite_id, x, y)`` appears once.
+
+    Unlike :func:`first_per_sprite_id` (id-only), this keeps the SAME sprite
+    graphic reused for two *different* NPCs at different map positions — e.g.
+    entry 262 (Dark Square) uses Tanemon (ow 0x0077) both as a digivolution
+    stage at (673,137) AND as the separate L-Mushroom quest NPC at (144,144);
+    id-only dedup dropped the quest NPC. Only exact same-position duplicates
+    (story-state variants of one slot) still collapse."""
+    seen: set = set()
+    out: List[OverworldSpritePlacement] = []
+    for p in placements:
+        key = (p.overworld_sprite_id, p.x, p.y)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+# Opcodes that gate a following OVERWORLD_SPRITE placement → the offset (from
+# the opcode start) of the u16 "flag" discriminator that selects whether the
+# sprite spawns:
+#   0x06 IFEQ          — arg2 (offset 4)
+#   0xA6 HANDLER_META  — the opaque hi word (offset 6); the DOMINANT gate,
+#                        and its flag matches the sprite's dialogue flag
+#                        (verified: GreenDigiEgg keys spawn AND dialog on 0x8bea)
+#   0x2A CMP_BRANCH    — the var descriptor (offset 2)
+_SPRITE_GATE_OPCODES = {0x0006: 4, 0x00A6: 6, 0x002A: 2}
+
+# A gate must sit within this many bytes of the placement it controls, so a
+# distant conditional (e.g. one gating a dialogue) doesn't leak onto a later
+# sprite. A gate right before a 26-byte placement is <0x20 away.
+_SPRITE_GATE_WINDOW = 0x20
+
+
+def sprite_gate_conditions(entry: bytes) -> Dict[int, Tuple[int, int]]:
+    """Map each OVERWORLD_SPRITE ``block_offset`` that is spawned conditionally
+    to ``(gate_opcode, flag)``.
+
+    A placement is conditional when a gate opcode (see
+    :data:`_SPRITE_GATE_OPCODES`) appears since the previous placement and
+    within :data:`_SPRITE_GATE_WINDOW` bytes; ``flag`` is the discriminator
+    that opcode carries — the same value that gates the sprite's dialogue
+    (e.g. GreenDigiEgg's spawn *and* dialog both key on ``0x8bea``). Sprites
+    sharing a flag group together in the editor's Objects list. The gate is
+    consumed by the placement it precedes, so a following placement needs its
+    own gate to count. Structural walk stays aligned via the opcode-size
+    table.
+
+    NOTE: ``0xA6`` is the dominant gate and most base-region sprites carry
+    one, so relatively few sprites are truly ungated ("always on map"). We
+    surface the raw gating structure; whether a given flag is effectively
+    always-true vs. story-dependent isn't decoded."""
+    gates: Dict[int, Tuple[int, int]] = {}
+    p = 0
+    n = len(entry)
+    last: Optional[Tuple[int, int, int]] = None  # (opcode, flag, pos)
+    while p + 2 <= n:
+        op = struct.unpack_from("<H", entry, p)[0]
+        disc_off = _SPRITE_GATE_OPCODES.get(op)
+        size = _DIALOG_SKIP_OPCODE_SIZES.get(op)
+        if disc_off is not None and size and p + size <= n:
+            flag = struct.unpack_from("<H", entry, p + disc_off)[0]
+            last = (op, flag, p)
+            p += size
+            continue
+        if op == OVERWORLD_SPRITE_OPCODE and p + OVERWORLD_SPRITE_BLOCK_SIZE <= n:
+            if last is not None and p - last[2] <= _SPRITE_GATE_WINDOW:
+                gates[p] = (last[0], last[1])
+            last = None
+            p += OVERWORLD_SPRITE_BLOCK_SIZE
+            continue
+        p += size if size else 2
+    return gates
+
+
 def replace_sprite_xy(
     entry: bytes, block_offset: int, x: int, y: int,
 ) -> bytes:
@@ -528,6 +607,48 @@ def replace_exit_handler_spawn_arg(
     return bytes(buf)
 
 
+# ---- overworld chest give-item -------------------------------------------
+#
+# An overworld chest is an OVERWORLD_SPRITE (id 0x02fb) whose interaction
+# script sets four SET_VAR args then calls the shared give-item routine:
+#
+#   15 00 04 00 <flag:u16>   SET_VAR ARG_0 = per-chest opened flag
+#   15 00 05 00 <item:u16>   SET_VAR ARG_1 = item id given
+#   15 00 06 00 <arg2:u16>   SET_VAR ARG_2 = (unconfirmed 0/1)
+#   15 00 07 00 <arg3:u16>   SET_VAR ARG_3 = (unconfirmed small int)
+#   02 00 <CHEST_GIVE_ROUTINE:u32>   CALL_SYS
+#
+# Verified across 163 chests (research_docs scan). The item id (ARG_1) is
+# the one field it's safe to edit in place — the flag is also referenced by
+# the 0x0006 load-time frame check, so editing it needs both sites rewritten
+# together and is intentionally left alone here.
+CHEST_GIVE_ROUTINE = 0x126A
+CHEST_ITEM_SETVAR_PREFIX = (0x0015, 0x0005)  # op SET_VAR, var ARG_1
+
+
+def replace_chest_item(entry: bytes, value_offset: int, item_id: int) -> bytes:
+    """Rewrite the u16 item id at ``value_offset`` (a chest's ARG_1
+    SET_VAR value).
+
+    Guards on the ``15 00 05 00`` SET_VAR-ARG_1 prefix 4 bytes before the
+    value so a stale offset can't silently corrupt the script stream —
+    same defensive posture as the exit-handler splices above.
+    """
+    if value_offset < 4 or value_offset + 2 > len(entry):
+        raise ValueError(
+            f"value_offset 0x{value_offset:04x} out of range (len={len(entry)})"
+        )
+    op, var = struct.unpack_from("<HH", entry, value_offset - 4)
+    if (op, var) != CHEST_ITEM_SETVAR_PREFIX:
+        raise ValueError(
+            f"no SET_VAR ARG_1 (item) at rel 0x{value_offset - 4:04x} "
+            f"(found op 0x{op:04x} var 0x{var:04x})"
+        )
+    buf = bytearray(entry)
+    struct.pack_into("<H", buf, value_offset, item_id & 0xFFFF)
+    return bytes(buf)
+
+
 # ---- dialog blocks -------------------------------------------------------
 
 # Dialog block layout — 12 bytes, three sentinel opcodes wrapping the
@@ -599,24 +720,45 @@ def _is_dialog_at(entry: bytes, off: int) -> bool:
 # (``overlay5_cutscenes._BODY_FIXED_OPCODE_SIZES``) which walks every
 # owner entry in overlay5 and produces a verified-consistent slice, so
 # borrowing its size table here is safe.
+# Strides = confirmed TOTAL byte length (opcode + args), from the ARM9
+# handlers (research_docs/claude_notes/overlay5_opcodes.md). Keeping this
+# accurate lets the walker step cleanly between the events it emits. The
+# events it *does* surface (dialog / battle / reaction, and the Tier-1
+# wait / sprite-anim / camera / item below) are handled by their own
+# branches before this table is consulted; the rest are skipped by size.
+# NB the compare/branch + task opcodes (0x2A=6, 0x156=10) read args inline
+# / after a branch, so their length is hand-set, not reader-derived.
 _DIALOG_SKIP_OPCODE_SIZES: Dict[int, int] = {
     0x0002: 6,    # CALL_SYS
     0x0004: 6,    # REGISTER_HANDLER (prologue, but may appear in body)
-    0x0005: 6,    # SET_VAR_ALT
-    0x0006: 6,
-    0x0009: 4,
+    0x0005: 4,    # WAIT_FRAMES (emitted; kept for stride safety)
+    0x0006: 6,    # IFEQ_LIT_BRANCH
+    0x0008: 4, 0x0009: 4, 0x000a: 4, 0x000b: 4, 0x000e: 4, 0x000f: 4,
+    0x0010: 4, 0x0011: 4,
     0x0015: 6,    # SET_VAR
+    0x001e: 16, 0x0023: 6, 0x0025: 2, 0x002a: 6,   # CMP_BRANCH 6, not 2
     0x0030: 6,    # CALL_SCRIPT_AT_OFFSET (mid-region call; the tail-call
                   # variant terminates the region before we reach it)
-    0x003C: 4,    # MOVE_BEGIN
-    0x003E: 4,    # MOVE_END
+    0x003C: 12,   # MOVE_BEGIN (was mis-sized 4)
+    0x003d: 4, 0x003E: 4,
+    0x0040: 6, 0x0042: 4, 0x004c: 10,
+    0x0060: 4, 0x0061: 4, 0x0062: 4, 0x0063: 6, 0x0064: 6,
     0x0076: 4,    # MOVE_OPEN
+    0x0077: 12, 0x0080: 6, 0x0082: 6, 0x0084: 6, 0x008a: 8,
+    0x008e: 2, 0x008f: 2, 0x0090: 2, 0x0092: 2, 0x0094: 10,
+    0x009f: 4,
     0x00a6: 10,
     0x00a7: 10,
+    0x00ae: 6,
+    0x00b4: 4,    # GIVE_ITEM (emitted)
     0x00BB: 4,    # OPEN_SHOP (re-identified by the cutscene decoder; was
                   # previously misread as a script-end marker, which made
                   # the walker bail just before shop NPCs' dialog tails)
     0x00C0: 6,    # REACTION_BALLOON
+    0x00c2: 8, 0x00c6: 2, 0x00c7: 4, 0x00dc: 2,
+    0x00e1: 8, 0x00e2: 6, 0x00e5: 2, 0x00e6: 6,
+    0x00f1: 4,    # REMOVE_ITEM (emitted)
+    0x0100: 4, 0x0117: 4,
     0x014b: 4,    # LOAD_TOP_SCREEN_MAP (DS dual-screen cutscenes)
     0x014c: 4,    # LOAD_BOTTOM_SCREEN_MAP (also the prologue header at
                   # offset 0 of every entry; body occurrences appear in
@@ -624,6 +766,7 @@ _DIALOG_SKIP_OPCODE_SIZES: Dict[int, int] = {
     0x014d: 10,
     0x0150: 26,   # OVERWORLD_SPRITE — appears inside handler regions
                   # that spawn cutscene NPCs (e.g. entry 0499 chains)
+    0x0156: 10,   # WARP_TRANSITION (reads 4 args after a branch)
     0x01a6: 2,
 }
 # Opcodes that terminate dialog collection. 0x0003 is END_SCRIPT — within
@@ -767,6 +910,23 @@ EVENT_KIND_DIALOG = "dialog"
 EVENT_KIND_SET_MUSIC = "set_music"
 EVENT_KIND_REACTION = "reaction"
 EVENT_KIND_BATTLE = "battle"
+EVENT_KIND_WAIT = "wait"            # WAIT_FRAMES 0x05
+EVENT_KIND_SPRITE_ANIM = "sprite_anim"  # SET_SPRITE_ANIM 0x64
+EVENT_KIND_CAMERA = "camera"        # CAMERA_PAN 0x40 / CAMERA_PAN_TO_XY 0xC2
+EVENT_KIND_ITEM = "item"            # GIVE_ITEM 0xB4 / REMOVE_ITEM 0xF1
+EVENT_KIND_MOVE = "move"            # MOVE_BEGIN 0x3C
+EVENT_KIND_CONTROL = "control"      # read-only flag/branch gating (0x2A/0x15/0x0F/…)
+
+# `0e 00` is NOT reliably a SET_MUSIC opcode. The linear walk mis-syncs and
+# lands on stray `0e 00` byte pairs sitting mid-instruction (slot ids,
+# y-coords, dialog trailers), so surfacing them as editable BGM cards
+# produced mostly-wrong edits — see entry 0322, where every SET_MUSIC but
+# the last is a false positive threaded through Barone's dialog. Until
+# `0e 00` can be distinguished from mid-instruction data, the walker
+# consumes the block to stay in sync but does NOT emit an editable event.
+# Flip this to re-enable the SET_MUSIC cards (`_MusicCard` in the Cutscenes
+# tab) once that detection exists.
+SURFACE_SET_MUSIC_EVENTS = False
 
 
 @dataclass
@@ -833,12 +993,16 @@ def iter_region_events_with_meta(
             continue
         opcode = struct.unpack_from("<H", entry, p)[0]
         if opcode == SET_MUSIC_OPCODE and p + SET_MUSIC_BLOCK_SIZE <= n:
-            events.append(RegionEvent(
-                rel=p,
-                kind=EVENT_KIND_SET_MUSIC,
-                payload=SetMusicBlock.from_bytes(entry, p),
-            ))
-            seen_offsets.add(p)
+            # Consume the block to keep the walk in sync with prior
+            # behaviour, but only surface an editable SET_MUSIC event when
+            # explicitly enabled — see SURFACE_SET_MUSIC_EVENTS.
+            if SURFACE_SET_MUSIC_EVENTS:
+                events.append(RegionEvent(
+                    rel=p,
+                    kind=EVENT_KIND_SET_MUSIC,
+                    payload=SetMusicBlock.from_bytes(entry, p),
+                ))
+                seen_offsets.add(p)
             p += SET_MUSIC_BLOCK_SIZE
             continue
         if opcode == REACTION_OPCODE and p + REACTION_BLOCK_SIZE <= n:
@@ -849,6 +1013,58 @@ def iter_region_events_with_meta(
             ))
             seen_offsets.add(p)
             p += REACTION_BLOCK_SIZE
+            continue
+        # Tier-1 editable scene opcodes (Cutscenes tab cards).
+        if opcode == WAIT_FRAMES_OPCODE and p + WAIT_FRAMES_BLOCK_SIZE <= n:
+            events.append(RegionEvent(
+                rel=p, kind=EVENT_KIND_WAIT,
+                payload=WaitFramesBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += WAIT_FRAMES_BLOCK_SIZE
+            continue
+        if opcode == SPRITE_ANIM_OPCODE and p + SPRITE_ANIM_BLOCK_SIZE <= n:
+            events.append(RegionEvent(
+                rel=p, kind=EVENT_KIND_SPRITE_ANIM,
+                payload=SpriteAnimBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += SPRITE_ANIM_BLOCK_SIZE
+            continue
+        if opcode in (CAMERA_TARGET_OPCODE, CAMERA_XY_OPCODE):
+            cam = CameraBlock.from_bytes(entry, p)
+            if p + cam.size <= n:
+                events.append(RegionEvent(
+                    rel=p, kind=EVENT_KIND_CAMERA, payload=cam,
+                ))
+                seen_offsets.add(p)
+                p += cam.size
+                continue
+        if (opcode in (GIVE_ITEM_OPCODE, REMOVE_ITEM_OPCODE)
+                and p + ITEM_BLOCK_SIZE <= n):
+            events.append(RegionEvent(
+                rel=p, kind=EVENT_KIND_ITEM,
+                payload=ItemBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += ITEM_BLOCK_SIZE
+            continue
+        if opcode == MOVE_BEGIN_OPCODE and p + MOVE_BEGIN_BLOCK_SIZE <= n:
+            events.append(RegionEvent(
+                rel=p, kind=EVENT_KIND_MOVE,
+                payload=MoveBeginBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += MOVE_BEGIN_BLOCK_SIZE
+            continue
+        ctrl_size = CONTROL_OPCODE_SIZES.get(opcode)
+        if ctrl_size is not None and p + ctrl_size <= n:
+            events.append(RegionEvent(
+                rel=p, kind=EVENT_KIND_CONTROL,
+                payload=ControlBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += ctrl_size
             continue
         if opcode in _DIALOG_TERMINATOR_OPCODES:
             if not bounded:
@@ -1035,6 +1251,285 @@ def replace_reaction_field(
         "<H", buf, block_offset + field_offsets[field],
         int(new_value) & 0xFFFF,
     )
+    return bytes(buf)
+
+
+# ---- Tier-1 editable scene opcodes (Cutscenes tab) -----------------------
+#
+# Small fixed-size action opcodes surfaced as editable event cards:
+#   05 00 [frames:u16]                 WAIT_FRAMES       (pacing pause)
+#   64 00 [sprite:u16] [anim:u16]      SET_SPRITE_ANIM   (pose / facing)
+#   40 00 [target:u16] [speed:u16]     CAMERA_PAN_TO_TARGET
+#   c2 00 [x:u16] [y:u16] [speed:u16]  CAMERA_PAN_TO_XY
+#   b4 00 [item:u16]                   GIVE_ITEM
+#   f1 00 [item:u16]                   REMOVE_ITEM
+# Behaviour decoded from the ARM9 handlers — see
+# research_docs/claude_notes/overlay5_opcodes.md. All edits are in-place
+# u16 rewrites guarded by the opcode byte (:func:`replace_scalar_field`).
+
+WAIT_FRAMES_OPCODE = 0x0005
+WAIT_FRAMES_BLOCK_SIZE = 4
+SPRITE_ANIM_OPCODE = 0x0064
+SPRITE_ANIM_BLOCK_SIZE = 6
+CAMERA_TARGET_OPCODE = 0x0040
+CAMERA_TARGET_BLOCK_SIZE = 6
+CAMERA_XY_OPCODE = 0x00C2
+CAMERA_XY_BLOCK_SIZE = 8
+GIVE_ITEM_OPCODE = 0x00B4
+REMOVE_ITEM_OPCODE = 0x00F1
+ITEM_BLOCK_SIZE = 4
+
+
+@dataclass
+class WaitFramesBlock:
+    """4-byte ``05 00 [frames:u16]`` — pauses the running actor N frames."""
+    block_offset: int
+    frames: int
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "WaitFramesBlock":
+        opcode, frames = struct.unpack_from("<HH", entry, off)
+        if opcode != WAIT_FRAMES_OPCODE:
+            raise ValueError(f"not a WAIT_FRAMES block at 0x{off:04x}")
+        return cls(block_offset=off, frames=frames)
+
+
+@dataclass
+class SpriteAnimBlock:
+    """6-byte ``64 00 [sprite:u16] [anim:u16]`` — set a sprite's pose/anim.
+
+    ``sprite`` is a slot id (same space as DIALOG.target); ``anim`` is a
+    pose/animation id (low values = 8-way facing, higher = named anims
+    like 0x18 head-nod).
+    """
+    block_offset: int
+    sprite: int
+    anim: int
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "SpriteAnimBlock":
+        opcode, sprite, anim = struct.unpack_from("<HHH", entry, off)
+        if opcode != SPRITE_ANIM_OPCODE:
+            raise ValueError(f"not a SET_SPRITE_ANIM block at 0x{off:04x}")
+        return cls(block_offset=off, sprite=sprite, anim=anim)
+
+
+@dataclass
+class CameraBlock:
+    """A camera pan — ``40 00 [target] [speed]`` (pan to a sprite) or
+    ``c2 00 [x] [y] [speed]`` (pan to a point). ``is_xy`` selects the
+    form; for the target form ``b`` is unused (0)."""
+    block_offset: int
+    opcode: int
+    a: int
+    b: int
+    speed: int
+
+    @property
+    def is_xy(self) -> bool:
+        return self.opcode == CAMERA_XY_OPCODE
+
+    @property
+    def size(self) -> int:
+        return CAMERA_XY_BLOCK_SIZE if self.is_xy else CAMERA_TARGET_BLOCK_SIZE
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "CameraBlock":
+        opcode = struct.unpack_from("<H", entry, off)[0]
+        if opcode == CAMERA_TARGET_OPCODE:
+            _, a, speed = struct.unpack_from("<HHH", entry, off)
+            return cls(block_offset=off, opcode=opcode, a=a, b=0, speed=speed)
+        if opcode == CAMERA_XY_OPCODE:
+            _, a, b, speed = struct.unpack_from("<HHHH", entry, off)
+            return cls(block_offset=off, opcode=opcode, a=a, b=b, speed=speed)
+        raise ValueError(f"not a CAMERA block at 0x{off:04x}")
+
+
+@dataclass
+class ItemBlock:
+    """4-byte ``b4 00 [item]`` (give) or ``f1 00 [item]`` (remove)."""
+    block_offset: int
+    opcode: int
+    item: int
+
+    @property
+    def is_remove(self) -> bool:
+        return self.opcode == REMOVE_ITEM_OPCODE
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "ItemBlock":
+        opcode, item = struct.unpack_from("<HH", entry, off)
+        if opcode not in (GIVE_ITEM_OPCODE, REMOVE_ITEM_OPCODE):
+            raise ValueError(f"not a GIVE/REMOVE_ITEM block at 0x{off:04x}")
+        return cls(block_offset=off, opcode=opcode, item=item)
+
+
+MOVE_BEGIN_OPCODE = 0x003C
+MOVE_BEGIN_BLOCK_SIZE = 12
+
+
+@dataclass
+class MoveBeginBlock:
+    """12-byte ``3C 00 [tgt] [type] [x] [y] [speed]`` — start moving a sprite.
+
+    ``tgt`` is a scene slot (same space as DIALOG.target / SET_SPRITE_ANIM).
+    For the common walk type (``move_type == 1``) ``x``/``y`` are the
+    **destination position** — data-confirmed: they carry map-pixel
+    coordinates matching the sprite's OVERWORLD_SPRITE x/y, and ``0xFFFF``
+    means "leave that axis unchanged". ``speed`` ``0xFFFF`` snaps the sprite
+    there instantly. ``move_type`` is a small mode enum (0/1/8/0xc/0xe seen);
+    its non-1 meanings aren't decoded, so it's exposed raw rather than named.
+    """
+    block_offset: int
+    tgt: int
+    move_type: int
+    x: int
+    y: int
+    speed: int
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "MoveBeginBlock":
+        opcode, tgt, move_type, x, y, speed = struct.unpack_from("<6H", entry, off)
+        if opcode != MOVE_BEGIN_OPCODE:
+            raise ValueError(f"not a MOVE_BEGIN block at 0x{off:04x}")
+        return cls(
+            block_offset=off, tgt=tgt, move_type=move_type,
+            x=x, y=y, speed=speed,
+        )
+
+
+# ---- read-only flag / branch "control" opcodes ---------------------------
+#
+# These decide WHEN a scene runs and what story state it sets — the gating the
+# cutscene editor surfaces read-only (not editable yet). Sizes match
+# _DIALOG_SKIP_OPCODE_SIZES so emitting them keeps the walk in sync.
+#
+# 0x2A CMP_BRANCH and 0x06 IFEQ_LIT_BRANCH are BOTH conditionals — different
+# NPCs use different ones (0x2A resolves a script var via 0x20497C8; 0x06 is
+# the dominant one, 1545× vs 202×, resolving a value via the gate at
+# 0x0202EB04 and comparing it against arg1's literal). 0x06's arg1 is the
+# compared literal; its 2nd u16 (arg2) is control-flow data whose exact role
+# isn't reversed, so it's not shown. 0x0E CALL_IF_EQ is still excluded: a
+# structural walk finds ZERO aligned occurrences (the ``0e 00`` in linear
+# dumps is mid-instruction misalignment, same class as the old SET_MUSIC
+# mislabel).
+CONTROL_OPCODE_SIZES: Dict[int, int] = {
+    0x002A: 6,   # CMP_BRANCH        — IF (script var vs global-table value)
+    0x0006: 6,   # IFEQ_LIT_BRANCH   — IF (resolved value == arg1 literal)
+    0x0015: 6,   # SET_VAR
+    0x000F: 4,   # FLAG_SET_OR_CLEAR
+}
+
+# CMP_BRANCH operator from the descriptor's high nibble. Data check: every
+# vanilla descriptor uses op 0 (==); the rest are decoded for completeness.
+_CMP_OPS = {0: "==", 1: ">", 2: "<", 3: ">=", 4: "<=", 5: "!="}
+
+
+@dataclass
+class ControlBlock:
+    """A flag/branch control opcode, decoded for read-only display.
+
+    ``a``/``b`` are the raw u16 args (``b`` is 0 for the 4-byte ops). The
+    :meth:`describe` string is what the cutscene panel shows; the RHS of a
+    CMP_BRANCH comes from a global table the script indexes, so we surface the
+    variable + jump target rather than inventing the compared value."""
+    block_offset: int
+    opcode: int
+    a: int
+    b: int
+
+    @property
+    def category(self) -> str:
+        if self.opcode in (0x002A, 0x0006):
+            return "branch"
+        if self.opcode == 0x0015:
+            return "set_var"
+        return "flag"
+
+    @property
+    def gate_len(self) -> int:
+        """For a CMP_BRANCH, the relative forward skip (``b``) the FALSE case
+        takes — i.e. the byte length of the gated block. Data-verified:
+        ``block_offset + gate_len`` lands at the next branch. 0 for non-branch
+        ops. Used to indent the events a branch gates."""
+        return int(self.b) if self.opcode == 0x002A else 0
+
+    def row_summary(self) -> Tuple[str, str]:
+        """``(ACTION LABEL, detail)`` for a compact events-browser row — the
+        label carries the action word so the detail needn't repeat it
+        (``IF`` / ``var 0x9 == value``)."""
+        op = self.opcode
+        if op == 0x002A:
+            operator = _CMP_OPS.get(self.a >> 12, "?")
+            return ("IF", f"var 0x{self.a & 0x0FFF:x} {operator} value")
+        if op == 0x0006:
+            return ("IF", f"input == 0x{self.a:x} · 0x{self.b:04x}")
+        if op == 0x0015:
+            return ("SET VAR", f"0x{self.a:x} = 0x{self.b:x}")
+        if self.a >= 0x8000:
+            return ("FLAG", f"clear 0x{(~self.a) & 0xFFFF:x}")
+        return ("FLAG", f"set 0x{self.a:x}")
+
+    def describe(self) -> str:
+        op = self.opcode
+        if op == 0x002A:
+            operator = _CMP_OPS.get(self.a >> 12, "?")
+            var = self.a & 0x0FFF
+            # ``b`` is a relative skip length (see gate_len), not an address,
+            # and the compared RHS comes from a global table we don't resolve
+            # — so surface only the variable + operator.
+            return f"if var 0x{var:x} {operator} value"
+        if op == 0x0006:
+            # arg1 is the compared literal (per the 0x0203EEF8 handler); arg2's
+            # exact role isn't reversed but it's the per-line discriminator, so
+            # it's shown raw after the middot so sibling rows stay distinct.
+            return f"if input == 0x{self.a:x} · 0x{self.b:04x}"
+        if op == 0x0015:
+            return f"set var 0x{self.a:x} = 0x{self.b:x}"
+        if op == 0x000F:
+            if self.a >= 0x8000:
+                return f"clear flag 0x{(~self.a) & 0xFFFF:x}"
+            return f"set flag 0x{self.a:x}"
+        return f"op 0x{op:02x}"
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "ControlBlock":
+        opcode = struct.unpack_from("<H", entry, off)[0]
+        size = CONTROL_OPCODE_SIZES.get(opcode)
+        if size is None:
+            raise ValueError(f"not a control opcode at 0x{off:04x}")
+        if size == 6:
+            _, a, b = struct.unpack_from("<HHH", entry, off)
+        else:
+            _, a = struct.unpack_from("<HH", entry, off)
+            b = 0
+        return cls(block_offset=off, opcode=opcode, a=a, b=b)
+
+
+def replace_scalar_field(
+    entry: bytes, block_offset: int, field_offset: int,
+    value: int, expected_opcode: int,
+) -> bytes:
+    """In-place u16 rewrite at ``block_offset + field_offset``, guarded by
+    the opcode at ``block_offset``.
+
+    Shared by the Tier-1 editable scene opcodes (wait / sprite-anim /
+    camera / item). Validating the leading opcode makes a stale offset a
+    hard error instead of silent script corruption — same posture as the
+    dialog / chest splices.
+    """
+    if block_offset < 0 or block_offset + field_offset + 2 > len(entry):
+        raise ValueError(
+            f"field at 0x{block_offset:04x}+{field_offset} out of range"
+        )
+    op = struct.unpack_from("<H", entry, block_offset)[0]
+    if op != expected_opcode:
+        raise ValueError(
+            f"expected opcode 0x{expected_opcode:04x} at 0x{block_offset:04x}, "
+            f"found 0x{op:04x}"
+        )
+    buf = bytearray(entry)
+    struct.pack_into("<H", buf, block_offset + field_offset, int(value) & 0xFFFF)
     return bytes(buf)
 
 

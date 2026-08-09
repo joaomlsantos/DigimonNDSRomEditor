@@ -77,6 +77,9 @@ from .record_list_panel import RecordListPanel
 
 
 _BRUSH_SIZES = (1, 4, 8, 16, 32)
+# Tile-paint brush footprints: N×N tiles stamped/picked at once (1, 4, 9, 16
+# tiles). Distinct from the walkability pixel brush above.
+_TILE_BRUSH_SIZES = (1, 2, 3, 4)
 _TOOL_BLOCK = "block"
 _TOOL_WALKABLE = "walkable"
 _TOOL_PICKER = "picker"
@@ -89,6 +92,9 @@ _TILE_TOOL_PICK = "pick"
 
 _PICKER_TILES_PER_ROW = 8
 _PICKER_SCALE = 4
+# Per-cell display size (px) for the N×N brush composer preview — big enough
+# that individual sub-cells are comfortably clickable at a 4×4 brush.
+_BRUSH_CELL_PX = 30
 
 # Selected-tile preview lives above the picker grid. 48 px = 8 px tile
 # scaled 6× — big enough to read the pixel art without dominating the
@@ -176,6 +182,17 @@ class _LayerPaintState:
     hflip: bool = False
     vflip: bool = False
     tool: str = _TILE_TOOL_PAINT
+    # N×N tile-brush footprint (1..4). Painting stamps this many tiles
+    # anchored top-left at the clicked cell; color-picking captures this
+    # many into ``brush_entries``.
+    brush_size: int = 1
+    # N×N brush pattern (row-major, length brush_size²). ``None`` only in
+    # 1×1 mode, where the footprint is just the toolbar tile. For N>1 it's
+    # always populated so each cell can be composed independently in the
+    # sidebar; a map color-pick overwrites the whole pattern.
+    brush_entries: Optional[List[int]] = None
+    # Active sub-cell (0..brush_size²-1) the sidebar composer edits.
+    brush_sel: int = 0
     # Snapshot of entries[] at stroke start, captured the first time
     # _on_tile_painted fires after a press — drives undo by giving the
     # command a stable "old bytes" view to revert to.
@@ -228,6 +245,20 @@ class _LayerPaintState:
         e |= (self.selected_bank & 0xF) << 12
         return e
 
+    def brush_cell(self, i: int, j: int) -> int:
+        """Tilemap entry for footprint position ``(i, j)`` (0-based, i=col).
+
+        Single-tile mode (``brush_entries is None``) repeats the toolbar
+        tile; captured mode indexes the row-major pattern, falling back to
+        the toolbar tile if the index is somehow out of range.
+        """
+        if self.brush_entries is None:
+            return self.entry_value()
+        idx = j * self.brush_size + i
+        if 0 <= idx < len(self.brush_entries):
+            return self.brush_entries[idx]
+        return self.entry_value()
+
 
 @dataclass
 class _ExitFormData:
@@ -268,6 +299,60 @@ class _ExitFormData:
     # sidebar: the editor doesn't fully understand the handler shape
     # so a destination/spawn-arg edit could silently break the script.
     is_hitbox: bool = False
+
+
+class _BrushPreview(QLabel):
+    """Clickable N×N brush preview.
+
+    Shows the rendered brush footprint; for N>1 it overlays grid lines and
+    a highlight on the active cell and emits ``cellClicked(flat_index)`` when
+    a sub-cell is clicked, so the brush can be composed tile-by-tile in the
+    sidebar. For 1×1 it's an inert preview.
+    """
+
+    cellClicked = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._n = 1
+        self._sel = 0
+
+    def set_grid(self, n: int, sel: int) -> None:
+        self._n = max(1, int(n))
+        self._sel = int(sel)
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton or self._n <= 1:
+            super().mousePressEvent(event)
+            return
+        w = max(1, self.width())
+        h = max(1, self.height())
+        col = min(self._n - 1, max(0, int(event.position().x()) * self._n // w))
+        row = min(self._n - 1, max(0, int(event.position().y()) * self._n // h))
+        self.cellClicked.emit(row * self._n + col)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)  # draws the pixmap
+        if self._n <= 1:
+            return
+        painter = QPainter(self)
+        w = self.width()
+        h = self.height()
+        cw = w / self._n
+        ch = h / self._n
+        painter.setPen(QPen(QColor(0, 0, 0, 130), 1))
+        for k in range(1, self._n):
+            painter.drawLine(round(k * cw), 0, round(k * cw), h)
+            painter.drawLine(0, round(k * ch), w, round(k * ch))
+        if 0 <= self._sel < self._n * self._n:
+            sr, sc = divmod(self._sel, self._n)
+            painter.setPen(QPen(QColor(255, 230, 0, 240), 2))
+            painter.drawRect(
+                round(sc * cw) + 1, round(sr * ch) + 1,
+                round(cw) - 2, round(ch) - 2,
+            )
+        painter.end()
 
 
 class MapBrowser(QWidget):
@@ -327,6 +412,11 @@ class MapBrowser(QWidget):
         # Hover/stroke previews paint a brush rect onto a copy each tick.
         self._walk_scaled_base_pixmap: Optional[QPixmap] = None
         self._walk_current_preview: Optional[mapmod.MapPreview] = None
+        # (map_id, w, h) cache for the walkability grid dims — constant for a
+        # map, but was being re-parsed from the FAT on every hover/paint
+        # sample (the paint brush called it per Bresenham step). Keyed by
+        # map id so it self-invalidates on selection change.
+        self._walk_dims_cache: Optional[Tuple[int, int, int]] = None
         self._walk_zoom: int = 1
         # Cursor in image-space px (None when off-canvas). Drives both
         # the hover preview and the live stroke indicator.
@@ -373,9 +463,15 @@ class MapBrowser(QWidget):
         self._tabs.addTab(self._build_layer_paint_tab("b"), "Layer B")
         self._tabs.addTab(self._build_walk_tab(), "Walkability")
         self._tabs.addTab(self._build_events_tab(), "Events")
-        self._tabs.addTab(self._build_cutscenes_tab(), "Cutscenes")
+        self._tabs.addTab(self._build_cutscenes_tab(), "Events/Cutscenes")
         self._tabs.addTab(self._build_encounter_tab(), "Encounters")
         self._tabs.addTab(self._build_preview_tab("composite"), "Composite")
+        # The Events tab is superseded by the Events/Cutscenes tab (its
+        # objects/dialogs are all reachable there). Hide the tab button but
+        # keep the widget built + wired — dormant, not deleted — so the code
+        # path stays live and can be re-surfaced if needed.
+        if hasattr(self._tabs, "setTabVisible"):
+            self._tabs.setTabVisible(self._TAB_EVENTS, False)
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         # Metadata block — compact, left-aligned under the tabs.
@@ -545,30 +641,55 @@ class MapBrowser(QWidget):
             )
         )
 
-        # Selected-tile row: preview on the left; "Selected tile: N" label
-        # and H/V flip checkboxes stacked vertically on the right. Stacking
-        # the flips under the label keeps the row narrow so the right
-        # column (and therefore the picker) can be dragged smaller.
-        preview_row = QHBoxLayout()
+        # Brush size: stamp / pick an N×N block instead of a single tile.
+        brush_combo = QComboBox()
+        for n in _TILE_BRUSH_SIZES:
+            brush_combo.addItem(f"{n}×{n}  ({n * n} tiles)", n)
+        brush_combo.setToolTip(
+            "Tiles painted (and color-picked) at once, anchored top-left at "
+            "the clicked cell. Pick from the map with a large brush to copy a "
+            "block; pick a single tile from the picker to fill the block solid."
+        )
+        brush_combo.currentIndexChanged.connect(
+            lambda _ix, l=layer, c=brush_combo: self._on_tile_brush_size_changed(
+                l, c.currentData(),
+            )
+        )
+
+        # Brush preview + caption + flips, stacked vertically: the preview
+        # grows with the brush size (up to 4×4), so keeping the caption and
+        # flip row below it — not beside it — stops them colliding in the
+        # narrow right column.
+        preview_row = QVBoxLayout()
         preview_row.setContentsMargins(0, 0, 0, 0)
-        preview_lbl = QLabel()
+        preview_lbl = _BrushPreview()
         preview_lbl.setFixedSize(_PREVIEW_PX, _PREVIEW_PX)
         preview_lbl.setAlignment(Qt.AlignCenter)
         preview_lbl.setStyleSheet(
             "background: #1d1d1d; border: 1px solid #555;"
         )
-        preview_row.addWidget(preview_lbl)
+        preview_lbl.setToolTip(
+            "Brush preview. With a 2×2–4×4 brush, click a cell to select it, "
+            "then pick a tile / toggle flips to set just that cell."
+        )
+        preview_lbl.cellClicked.connect(
+            lambda idx, l=layer: self._on_brush_cell_clicked(l, idx)
+        )
+        preview_row.addWidget(preview_lbl, 0, Qt.AlignLeft)
 
         sel_block = QVBoxLayout()
         sel_block.setContentsMargins(0, 0, 0, 0)
         sel_lbl = QLabel("Selected tile: \u2014")
         sel_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        sel_lbl.setWordWrap(True)
         sel_block.addWidget(sel_lbl)
         flip_row = QHBoxLayout()
         flip_row.setContentsMargins(0, 0, 0, 0)
         hflip_chk = QCheckBox("H-flip")
         hflip_chk.setToolTip(
-            "Mirror the selected tile horizontally before painting."
+            "1×1 brush: mirror the selected tile horizontally.\n"
+            "N×N brush: mirror the whole selection — every tile flips and "
+            "swaps to its opposing column (a full horizontal flip)."
         )
         hflip_chk.toggled.connect(
             lambda v, l=layer: self._on_flip_toggled(l, "h", v)
@@ -576,7 +697,9 @@ class MapBrowser(QWidget):
         flip_row.addWidget(hflip_chk)
         vflip_chk = QCheckBox("V-flip")
         vflip_chk.setToolTip(
-            "Mirror the selected tile vertically before painting."
+            "1×1 brush: mirror the selected tile vertically.\n"
+            "N×N brush: mirror the whole selection — every tile flips and "
+            "swaps to its opposing row (a full vertical flip)."
         )
         vflip_chk.toggled.connect(
             lambda v, l=layer: self._on_flip_toggled(l, "v", v)
@@ -584,7 +707,7 @@ class MapBrowser(QWidget):
         flip_row.addWidget(vflip_chk)
         flip_row.addStretch(1)
         sel_block.addLayout(flip_row)
-        preview_row.addLayout(sel_block, 1)
+        preview_row.addLayout(sel_block)
 
         # Filter block — default shows only (tile, bank) pairs actually
         # used in the layer, grouped by bank. "Show all tiles" exposes
@@ -628,6 +751,12 @@ class MapBrowser(QWidget):
         bank_row.addWidget(bank_spin)
         bank_row.addStretch(1)
 
+        brush_row = QHBoxLayout()
+        brush_row.setContentsMargins(0, 0, 0, 0)
+        brush_row.addWidget(QLabel("Brush:"))
+        brush_row.addWidget(brush_combo)
+        brush_row.addStretch(1)
+
         color_pick_row = QHBoxLayout()
         color_pick_row.setContentsMargins(0, 0, 0, 0)
         color_pick_row.addWidget(color_pick_btn)
@@ -644,6 +773,7 @@ class MapBrowser(QWidget):
         right_col_layout.addLayout(preview_row)
         right_col_layout.addWidget(show_all_chk)
         right_col_layout.addLayout(bank_row)
+        right_col_layout.addLayout(brush_row)
         right_col_layout.addLayout(color_pick_row)
         right_col_layout.addWidget(picker_scroll, 1)
 
@@ -698,6 +828,7 @@ class MapBrowser(QWidget):
         setattr(self, f"_layer_{layer}_hflip_chk", hflip_chk)
         setattr(self, f"_layer_{layer}_vflip_chk", vflip_chk)
         setattr(self, f"_layer_{layer}_color_pick_btn", color_pick_btn)
+        setattr(self, f"_layer_{layer}_brush_combo", brush_combo)
         setattr(self, f"_layer_{layer}_sel_lbl", sel_lbl)
         setattr(self, f"_layer_{layer}_preview_lbl", preview_lbl)
         setattr(self, f"_layer_{layer}_show_all_chk", show_all_chk)
@@ -844,7 +975,10 @@ class MapBrowser(QWidget):
             QComboBox.AdjustToMinimumContentsLengthWithIcon,
         )
         self._events_field_id.setMinimumContentsLength(14)
-        _mchr_model = self._session.picker_model("mchr")
+        # ow-id space (UserRole == overworld_sprite_id), NOT CHR index — the
+        # placement field is an ow-id, so selecting/assigning here must round
+        # -trip through the same space the marker renders from.
+        _mchr_model = self._session.picker_model("mchr_ow")
         if _mchr_model is not None:
             self._events_field_id.setModel(_mchr_model)
         _events_id_completer = QCompleter(self._events_field_id)
@@ -1402,13 +1536,22 @@ class MapBrowser(QWidget):
         In vanilla Dusk, map 88's walkability is 768×384 vs a 752×384
         composite — striding by composite width would corrupt the bit
         indexing in both the paint brush and the overlay.
+
+        Cached per map id: the dims are constant for a selection, but this
+        is called on every hover/paint sample (the brush hits it per
+        Bresenham step), and re-parsing the file each time was the walk
+        tab's main source of lag.
         """
         if self._current_id is None:
             return (0, 0)
+        cache = self._walk_dims_cache
+        if cache is not None and cache[0] == self._current_id:
+            return cache[1], cache[2]
         files = mapmod.MapFiles(self._current_id)
         w, h, _ = mapmod.parse_walkability(
             self._session.map_file_bytes(files.walkability)
         )
+        self._walk_dims_cache = (self._current_id, w, h)
         return w, h
 
     def _refresh_walk_overlay_live(self) -> None:
@@ -1890,7 +2033,12 @@ class MapBrowser(QWidget):
             tx, ty = state.hover_cell
             if 0 <= tx < state.n_tiles_x and 0 <= ty < state.n_tiles_y:
                 cell = 8 * state.scale
-                rect = QRect(tx * cell, ty * cell, cell, cell)
+                # Footprint is the N×N brush anchored top-left at the hover
+                # cell, clipped to the map so the preview matches the stamp.
+                n = max(1, state.brush_size)
+                w = min(n, state.n_tiles_x - tx)
+                h = min(n, state.n_tiles_y - ty)
+                rect = QRect(tx * cell, ty * cell, w * cell, h * cell)
                 painter = QPainter(pixmap)
                 # Translucent yellow fill + outline — visible against
                 # both light and dark tilesets without obscuring the
@@ -1911,27 +2059,42 @@ class MapBrowser(QWidget):
         state = self._layer_state.get(layer)
         if state is None:
             return
-        preview_lbl: QLabel = getattr(self, f"_layer_{layer}_preview_lbl")
+        preview_lbl: _BrushPreview = getattr(self, f"_layer_{layer}_preview_lbl")
         sel_lbl: QLabel = getattr(self, f"_layer_{layer}_sel_lbl")
         if not state.tiles:
             preview_lbl.clear()
             sel_lbl.setText("Selected tile: \u2014")
             return
-        # 8x8 RGBA buffer just big enough for one tile; paint_tile_into_rgba
-        # writes the picked entry (tile + bank + flips) into (0, 0).
-        buf = bytearray(8 * 8 * 4)
-        mapmod.paint_tile_into_rgba(
-            buf, 8, 0, 0, state.entry_value(),
-            state.tiles, state.palettes, backdrop_opaque=True,
-        )
+        # Render the whole N\u00d7N brush footprint so the preview shows exactly
+        # what a stamp lays down (a solid block in single-tile mode, or the
+        # captured pattern after a map color-pick).
+        n = max(1, state.brush_size)
+        side = 8 * n
+        buf = bytearray(side * side * 4)
+        for j in range(n):
+            for i in range(n):
+                mapmod.paint_tile_into_rgba(
+                    buf, side, i, j, state.brush_cell(i, j),
+                    state.tiles, state.palettes, backdrop_opaque=True,
+                )
         backing = bytes(buf)
-        image = QImage(backing, 8, 8, 8 * 4, QImage.Format_RGBA8888)
+        image = QImage(backing, side, side, side * 4, QImage.Format_RGBA8888)
+        # Grow the preview for multi-tile brushes so each sub-cell is a
+        # comfortable click target for the composer.
+        disp = _PREVIEW_PX if n == 1 else _BRUSH_CELL_PX * n
+        preview_lbl.setFixedSize(disp, disp)
         pixmap = QPixmap.fromImage(image).scaled(
-            _PREVIEW_PX, _PREVIEW_PX,
-            Qt.KeepAspectRatio, Qt.FastTransformation,
+            disp, disp, Qt.KeepAspectRatio, Qt.FastTransformation,
         )
         preview_lbl.setPixmap(pixmap)
-        sel_lbl.setText(f"Selected tile: {state.selected_tile_ix}")
+        preview_lbl.set_grid(n, state.brush_sel)
+        if n > 1:
+            sel_lbl.setText(
+                f"Brush {n}\u00d7{n} \u00b7 editing cell {state.brush_sel} "
+                f"\u00b7 tile {state.selected_tile_ix}"
+            )
+        else:
+            sel_lbl.setText(f"Selected tile: {state.selected_tile_ix}")
 
     def _on_picker_painted(self, layer: str, x: int, y: int) -> None:
         """Hit-test (x, y) against the cached picker cell rects. Each
@@ -1954,6 +2117,9 @@ class MapBrowser(QWidget):
                     bank_spin.blockSignals(True)
                     bank_spin.setValue(min(bank_ix, bank_spin.maximum()))
                     bank_spin.blockSignals(False)
+                # Write the picked tile into the brush's active cell (N×N),
+                # so the tileset picker composes the brush cell-by-cell.
+                self._write_current_to_brush_cell(layer)
                 self._refresh_selected_tile_preview(layer)
                 self._refresh_picker_overlay(layer)
                 return
@@ -1977,7 +2143,7 @@ class MapBrowser(QWidget):
             state.snapshot_entries = list(state.entries)
             state.last_cell = None
         if state.last_cell is None:
-            self._paint_cell(layer, tx, ty)
+            self._stamp_brush(layer, tx, ty)
         else:
             # Bresenham in tile-space — fast drags across multiple cells
             # otherwise leave a dotted trail of single-tile stamps.
@@ -2151,9 +2317,10 @@ class MapBrowser(QWidget):
         if self._tabs.currentIndex() == tab_ix:
             self._refresh_active_tab()
 
-    def _paint_cell(self, layer: str, tx: int, ty: int) -> None:
+    def _paint_cell(self, layer: str, tx: int, ty: int, entry: int) -> None:
         state = self._layer_state[layer]
-        entry = state.entry_value()
+        if not (0 <= tx < state.n_tiles_x and 0 <= ty < state.n_tiles_y):
+            return
         cell_ix = ty * state.n_tiles_x + tx
         if state.entries[cell_ix] == entry:
             return
@@ -2163,11 +2330,24 @@ class MapBrowser(QWidget):
             state.tiles, state.palettes, backdrop_opaque=True,
         )
 
+    def _stamp_brush(self, layer: str, tx: int, ty: int) -> None:
+        """Stamp the N×N brush footprint with its top-left at ``(tx, ty)``.
+
+        A 1×1 brush reduces to a single tile; larger brushes fill the block
+        with the captured pattern (or the repeated toolbar tile). Cells past
+        the map edge are skipped so a brush near the border clips cleanly.
+        """
+        state = self._layer_state[layer]
+        n = max(1, state.brush_size)
+        for j in range(n):
+            for i in range(n):
+                self._paint_cell(layer, tx + i, ty + j, state.brush_cell(i, j))
+
     def _paint_tile_line(
         self, layer: str, p0: Tuple[int, int], p1: Tuple[int, int],
     ) -> None:
         """Bresenham in tile-cell coords. Avoids dotted strokes on fast
-        drags by stamping every cell the cursor crossed."""
+        drags by stamping the brush at every cell the cursor crossed."""
         x0, y0 = p0
         x1, y1 = p1
         dx = abs(x1 - x0)
@@ -2176,7 +2356,7 @@ class MapBrowser(QWidget):
         sy = 1 if y0 < y1 else -1
         err = dx + dy
         while True:
-            self._paint_cell(layer, x0, y0)
+            self._stamp_brush(layer, x0, y0)
             if x0 == x1 and y0 == y1:
                 return
             e2 = 2 * err
@@ -2189,8 +2369,26 @@ class MapBrowser(QWidget):
 
     def _pick_cell(self, layer: str, tx: int, ty: int) -> None:
         """Pull an entry's tile_ix / bank / flips into the toolbar so the
-        next paint stroke reuses them — Porymap's eyedropper idiom."""
+        next paint stroke reuses them — Porymap's eyedropper idiom.
+
+        With an N×N brush, also capture the N×N block anchored at the
+        clicked cell into ``brush_entries`` so the next stamp replays that
+        exact pattern; the toolbar single-tile fields track the top-left."""
         state = self._layer_state[layer]
+        n = max(1, state.brush_size)
+        if n > 1:
+            captured: List[int] = []
+            for j in range(n):
+                for i in range(n):
+                    cx, cy = tx + i, ty + j
+                    if 0 <= cx < state.n_tiles_x and 0 <= cy < state.n_tiles_y:
+                        captured.append(state.entries[cy * state.n_tiles_x + cx])
+                    else:
+                        captured.append(0)  # off-map cell → tile 0
+            state.brush_entries = captured
+        else:
+            state.brush_entries = None
+        state.brush_sel = 0
         cell_ix = ty * state.n_tiles_x + tx
         entry = state.entries[cell_ix]
         state.selected_tile_ix = entry & 0x3FF
@@ -2233,11 +2431,78 @@ class MapBrowser(QWidget):
         if state is not None:
             state.tool = tool_id
 
+    def _write_current_to_brush_cell(self, layer: str) -> None:
+        """Store the toolbar's current tile into the brush's active cell.
+
+        No-op in 1×1 mode (the footprint is just the toolbar tile). Lets the
+        tileset picker / flip / bank controls compose an N×N brush one cell
+        at a time — the cell chosen in the sidebar composer."""
+        state = self._layer_state.get(layer)
+        if state is None or state.brush_size <= 1 or state.brush_entries is None:
+            return
+        if 0 <= state.brush_sel < len(state.brush_entries):
+            state.brush_entries[state.brush_sel] = state.entry_value()
+
+    def _load_entry_into_toolbar(self, layer: str, entry: int) -> None:
+        """Load a brush cell's tile + bank into the toolbar (for the N×N
+        composer) without firing change handlers.
+
+        The flip boxes are deliberately left *clear*: for an N×N brush they
+        act on the whole selection, not one cell, so a per-cell flip bit
+        isn't mirrored onto them. The cell keeps its own flip in
+        ``brush_entries``; picking a fresh tile for it lands unflipped."""
+        state = self._layer_state[layer]
+        state.selected_tile_ix = entry & 0x3FF
+        state.hflip = False
+        state.vflip = False
+        state.selected_bank = (entry >> 12) & 0xF
+        bank_spin: QSpinBox = getattr(self, f"_layer_{layer}_bank_spin")
+        bank_spin.blockSignals(True)
+        bank_spin.setValue(min(state.selected_bank, bank_spin.maximum()))
+        bank_spin.blockSignals(False)
+        for chk_name in (f"_layer_{layer}_hflip_chk", f"_layer_{layer}_vflip_chk"):
+            chk: QCheckBox = getattr(self, chk_name)
+            chk.blockSignals(True)
+            chk.setChecked(False)
+            chk.blockSignals(False)
+
+    def _on_brush_cell_clicked(self, layer: str, idx: int) -> None:
+        """Select sub-cell ``idx`` of the N×N brush as the edit target and
+        load its tile into the toolbar, so the next pick/flip/bank edits
+        that cell."""
+        state = self._layer_state.get(layer)
+        if state is None:
+            return
+        n = max(1, state.brush_size)
+        if not (0 <= idx < n * n):
+            return
+        state.brush_sel = idx
+        if state.brush_entries is not None and idx < len(state.brush_entries):
+            self._load_entry_into_toolbar(layer, state.brush_entries[idx])
+        self._refresh_selected_tile_preview(layer)
+        self._refresh_picker_overlay(layer)
+
+    def _on_tile_brush_size_changed(self, layer: str, size: int) -> None:
+        state = self._layer_state.get(layer)
+        if state is None:
+            return
+        n = max(1, int(size))
+        state.brush_size = n
+        state.brush_sel = 0
+        # Seed an N×N brush with the current tile in every cell (an editable
+        # solid block); 1×1 just tracks the toolbar tile. Either way an old
+        # captured pattern is dropped since it no longer fits the footprint.
+        state.brush_entries = [state.entry_value()] * (n * n) if n > 1 else None
+        self._refresh_selected_tile_preview(layer)
+        # Repaint so the hover footprint outline tracks the new size.
+        self._refresh_layer_canvas(layer)
+
     def _on_bank_changed(self, layer: str, value: int) -> None:
         state = self._layer_state.get(layer)
         if state is None:
             return
         state.selected_bank = int(value)
+        self._write_current_to_brush_cell(layer)  # apply to the active cell
         # The picker only re-renders when the bank actually drives its
         # layout — i.e. show-all + filter-by-bank. In other modes the
         # selected_bank is decided by which cell the user picks, and the
@@ -2280,10 +2545,42 @@ class MapBrowser(QWidget):
         state = self._layer_state.get(layer)
         if state is None:
             return
+        if state.brush_size > 1 and state.brush_entries is not None:
+            # N×N brush: the flip mirrors the *whole* selection. Momentary —
+            # apply on toggle-on, then reset the box so it reads as a button.
+            if value:
+                self._mirror_brush(layer, axis)
+                chk: QCheckBox = getattr(
+                    self, f"_layer_{layer}_{'hflip' if axis == 'h' else 'vflip'}_chk",
+                )
+                chk.blockSignals(True)
+                chk.setChecked(False)
+                chk.blockSignals(False)
+            return
         if axis == "h":
             state.hflip = bool(value)
         else:
             state.vflip = bool(value)
+        self._write_current_to_brush_cell(layer)  # apply to the active cell
+        self._refresh_selected_tile_preview(layer)
+
+    def _mirror_brush(self, layer: str, axis: str) -> None:
+        """Mirror the whole N×N brush along ``axis`` ('h'/'v'): each tile
+        swaps to its opposing column/row and its own flip bit toggles, so the
+        stamp is a true horizontal/vertical flip of the selection."""
+        state = self._layer_state.get(layer)
+        if state is None or state.brush_size <= 1 or state.brush_entries is None:
+            return
+        n = state.brush_size
+        be = state.brush_entries
+        new = [0] * (n * n)
+        for j in range(n):
+            for i in range(n):
+                if axis == "h":
+                    new[j * n + i] = be[j * n + (n - 1 - i)] ^ 0x400
+                else:
+                    new[j * n + i] = be[(n - 1 - j) * n + i] ^ 0x800
+        state.brush_entries = new
         self._refresh_selected_tile_preview(layer)
 
     def _on_tile_hovered(self, layer: str, x: int, y: int) -> None:
@@ -2508,7 +2805,10 @@ class MapBrowser(QWidget):
         the Cutscenes tab can ignore it.
         """
         scan_bytes = overlay5_mod.script_prologue_bytes(entry_ix, entry_bytes)
-        placements = overlay5_mod.first_per_sprite_id(
+        # Dedup by (sprite, position) not sprite alone, so a graphic reused
+        # for two different NPCs at different spots (e.g. entry 262's two
+        # Tanemon) both appear; only same-position story-state duplicates fold.
+        placements = overlay5_mod.first_per_sprite_id_pos(
             overlay5_mod.iter_overworld_sprites(scan_bytes)
         )
         exit_zones = overlay5_mod.iter_exit_zones(scan_bytes)
@@ -2648,6 +2948,11 @@ class MapBrowser(QWidget):
         self._cutscenes_tab = CutscenesTab(
             self._session, parent=self, undo_stack=self._undo_stack,
         )
+        # Let the tab's cross-map Index jump to any scene: flip the map cursor
+        # + select the chain via the existing navigation entry point. The
+        # reload cb restores the real map after a standalone shared-scene view.
+        self._cutscenes_tab.set_navigate_cb(self.navigate_to_cutscene_chain)
+        self._cutscenes_tab.set_reload_cb(self._refresh_cutscenes_tab)
         return self._cutscenes_tab
 
     def _build_encounter_tab(self) -> QWidget:
@@ -2729,7 +3034,7 @@ class MapBrowser(QWidget):
             return
         try:
             entry_bytes = self._session.overlay5_entry_bytes(entry_ix)
-            specs, exit_canvas_specs, _exit_form_data = (
+            specs, exit_canvas_specs, exit_form_data = (
                 self._build_event_canvas_specs(entry_ix, entry_bytes)
             )
         except (ValueError, KeyError):
@@ -2755,6 +3060,7 @@ class MapBrowser(QWidget):
         bg_pixmap = QPixmap.fromImage(bg_image)
         self._cutscenes_tab.set_map(
             map_id, entry_ix, bg_pixmap, specs, exit_canvas_specs,
+            exit_form_data=exit_form_data,
         )
 
     def _populate_events_list(
@@ -4256,7 +4562,13 @@ class MapBrowser(QWidget):
         doesn't appear in sprite_map (genuinely unmapped sprites like
         prop discs, or table gaps).
         """
-        base_id = mchr_to_base.get(int(overworld_sprite_id))
+        # sprite_map is keyed by CHR index; resolve the ow-id through the
+        # ARM9 table first so followers/NPCs still name-match (scene props
+        # like the chest have no base id and fall through to the hex label).
+        chr_idx = self._session.mchr_ow_to_chr.get(
+            int(overworld_sprite_id), int(overworld_sprite_id)
+        )
+        base_id = mchr_to_base.get(chr_idx)
         if base_id is None:
             return f"<mchr 0x{overworld_sprite_id:04x}>"
         try:
@@ -4270,10 +4582,13 @@ class MapBrowser(QWidget):
     ) -> Optional[QPixmap]:
         """MCHR sprite render for ``overworld_sprite_id``, or ``None``.
 
-        The script field IS the MCHR index, so the lookup is direct —
-        no detour through sprite_map.unknown_0x4. Pass a max_size large
-        enough that mchr_sprite_pixmap's downscale branch never fires —
-        we want the native frame, matching the in-game pixel scale.
+        The script field is an *ow-id* (the 906-entry overworld-sprite space),
+        not a CHR index — it resolves through the ARM9 table to a CHR graphic
+        under that id's palette (see session.mchr_sprite_pixmap_by_ow_id), so
+        e.g. object 0x2fb renders the chest (CHR 0x2ed) rather than the
+        unrelated CHR-0x2fb graphic. Pass a max_size large enough that the
+        downscale branch never fires — we want the native frame, matching the
+        in-game pixel scale.
 
         ``behavior`` is the placement's u16 frame index; passing it lets
         the marker render the in-game pose instead of the canonical
@@ -4283,7 +4598,7 @@ class MapBrowser(QWidget):
         if overworld_sprite_id <= 0:
             return None
         try:
-            return self._session.mchr_sprite_pixmap(
+            return self._session.mchr_sprite_pixmap_by_ow_id(
                 int(overworld_sprite_id), max_size=512,
                 frame=behavior if behavior is None else int(behavior),
             )

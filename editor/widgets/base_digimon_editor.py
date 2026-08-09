@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from digimon_core import constants, model
+from digimon_core import constants, damage, model
 from digimon_core.stat_progression import (
     PROGRESSION_STATS,
     ProgressionMode,
@@ -26,6 +26,7 @@ from .._perf import span
 from .digimon_list_panel import DigimonListPanel
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
+    BoundBitCheckBox,
     BoundCheckBox,
     BoundEnumCombo,
     BoundIdCombo,
@@ -36,6 +37,7 @@ from .form_helpers import (
     wrap_in_scroll,
     move_choices,
     trait_choices,
+    trait_effect_summary,
 )
 from .sprite_map_row import SpriteMapRow, displayed_as_name, displayed_as_suffix
 
@@ -108,9 +110,17 @@ _MOVE_FIELDS: List[Tuple[str, str]] = [
 _MISC_FIELDS: List[Tuple[str, str, int, bool, Optional[int], str]] = [
     ("dex_habitat", "Dex Habitat", 1, False, None, ""),
     ("exp_curve", "Exp Curve", 4, False, _EXP_CURVE_MAX, _CAP_MESSAGE_EXP_CURVE),
-    ("unknown_0x26", "Unknown 0x26", 2, True, None, ""),
+    ("unknown_0x27", "Unknown 0x27", 1, True, None, ""),
     ("unknown_0x38", "Unknown 0x38", 1, True, None, ""),
     ("unknown_0x3A", "Unknown 0x3A", 1, True, None, ""),
+]
+
+# Element-affinity mask (+0x26): one bit per element, same order as the
+# resistance columns so bit N lines up under the matching resistance.
+# A set bit grants STAB (×1.15 damage) to the attacker's moves of that
+# element — see research_docs/claude_notes/ov2_damage_formula.md.
+_AFFINITY_FIELDS: List[Tuple[int, str]] = [
+    (ix, label) for ix, (_attr, label) in enumerate(_RES_FIELDS)
 ]
 
 
@@ -279,11 +289,15 @@ class BaseDigimonEditor(QWidget):
         self._res_widgets: Dict[str, BoundSpinBox] = {}
         res_box = self._build_resistances_box(first)
 
+        self._affinity_checks: Dict[int, BoundBitCheckBox] = {}
+        affinity_box = self._build_affinity_box(first)
+
         # Sentinel values for "no trait" / "no move" slots — all-bits-set for
         # the field's byte width. Base digimon trait fields are 1 byte → 0xFF;
         # move fields are 2 bytes → 0xFFFF.
         with span("trait_combos"):
             self._trait_rows: Dict[str, BoundIdCombo] = {}
+            self._trait_effect_labels: Dict[str, QLabel] = {}
             traits_box = QGroupBox("Traits")
             traits_form = make_form(traits_box)
             for attr, label in _TRAIT_FIELDS:
@@ -293,7 +307,7 @@ class BaseDigimonEditor(QWidget):
                     shared_kind="traits_byte",
                 )
                 self._trait_rows[attr] = combo
-                traits_form.addRow(label, combo)
+                traits_form.addRow(label, self._trait_row_cell(attr, combo))
 
         with span("move_combos"):
             # Pooled at the session level — see RomSession._build_combo_pools.
@@ -340,6 +354,7 @@ class BaseDigimonEditor(QWidget):
         content_layout.addWidget(self._sprite_row.widget)
         content_layout.addWidget(stats_box)
         content_layout.addWidget(res_box)
+        content_layout.addWidget(affinity_box)
         content_layout.addLayout(trait_move_row)
         content_layout.addWidget(misc_box)
         content_layout.addStretch(1)
@@ -520,17 +535,90 @@ class BaseDigimonEditor(QWidget):
             header.setStyleSheet("font-weight: bold;")
             table.addWidget(header, 0, ix)
 
+        self._res_mult_labels: Dict[str, QLabel] = {}
         for ix, (attr, label) in enumerate(_RES_FIELDS):
             spin = BoundSpinBox(first, attr, 2, self._undo_stack)
             spin.setAlignment(Qt.AlignCenter)
             self._res_widgets[attr] = spin
+            spin.valueChanged.connect(self._refresh_res_multipliers)
             table.addWidget(spin, 1, ix)
+            mult = QLabel("")
+            mult.setAlignment(Qt.AlignCenter)
+            mult.setStyleSheet("color: palette(mid);")
+            mult.setToolTip("Damage multiplier vs this element (500 = ×1.00, 1000 = ×0.50).")
+            self._res_mult_labels[attr] = mult
+            table.addWidget(mult, 2, ix)
 
         table.setColumnStretch(len(_RES_FIELDS), 1)
         outer.addLayout(table)
         return box
 
+    def _refresh_res_multipliers(self, *_):
+        for attr, spin in self._res_widgets.items():
+            lbl = self._res_mult_labels.get(attr)
+            if lbl is not None:
+                lbl.setText(f"×{damage.resist_multiplier(spin.value()):.2f}")
+
+    def _build_affinity_box(self, first: model.BaseDataDigimon) -> QWidget:
+        """Element-affinity (STAB) mask — one checkbox per element.
+
+        Columns line up with the resistance grid above. A checked element
+        means the digimon's own moves of that element get the ×1.15 STAB
+        bonus (battle code reads this byte at record+0x26). Independent of
+        the resistances, which govern incoming damage.
+        """
+        box = QGroupBox("Element Affinity — STAB")
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(4)
+
+        table = QGridLayout()
+        table.setContentsMargins(0, 0, 0, 0)
+        table.setHorizontalSpacing(8)
+        table.setVerticalSpacing(2)
+
+        for bit, label in _AFFINITY_FIELDS:
+            header = QLabel(label)
+            header.setAlignment(Qt.AlignCenter)
+            header.setStyleSheet("font-weight: bold;")
+            table.addWidget(header, 0, bit)
+
+        for bit, label in _AFFINITY_FIELDS:
+            check = BoundBitCheckBox(first, "element_affinity", bit, self._undo_stack)
+            self._affinity_checks[bit] = check
+            table.addWidget(check, 1, bit, Qt.AlignCenter)
+
+        table.setColumnStretch(len(_AFFINITY_FIELDS), 1)
+        outer.addLayout(table)
+        return box
+
     # ---- selection / refresh --------------------------------------------
+
+    def _trait_row_cell(self, attr: str, combo) -> QWidget:
+        """Wrap a trait combo with a leading `+<Value> <Effect>` label."""
+        eff = QLabel("")
+        eff.setStyleSheet("color: palette(mid);")
+        eff.setMinimumWidth(96)
+        self._trait_effect_labels[attr] = eff
+        combo.currentIndexChanged.connect(lambda _i, a=attr: self._update_trait_effect(a))
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(combo, 1)
+        row.addWidget(eff)
+        cell = QWidget()
+        cell.setLayout(row)
+        return cell
+
+    def _update_trait_effect(self, attr: str) -> None:
+        combo = self._trait_rows.get(attr)
+        if combo is not None:
+            self._trait_effect_labels[attr].setText(
+                trait_effect_summary(self._session, combo.currentData()))
+
+    def _refresh_trait_effects(self) -> None:
+        for attr in self._trait_rows:
+            self._update_trait_effect(attr)
 
     def _on_selection(self, digimon_id: int) -> None:
         target = self._entries.get(digimon_id)
@@ -548,8 +636,12 @@ class BaseDigimonEditor(QWidget):
             spin.rebind(target)
         for spin in self._res_widgets.values():
             spin.rebind(target)
+        self._refresh_res_multipliers()
+        for check in self._affinity_checks.values():
+            check.rebind(target)
         for row in self._trait_rows.values():
             row.rebind(target)
+        self._refresh_trait_effects()
         for row in self._move_rows.values():
             row.rebind(target)
         for spin in self._misc_widgets.values():
@@ -572,8 +664,12 @@ class BaseDigimonEditor(QWidget):
             spin.refresh()
         for spin in self._res_widgets.values():
             spin.refresh()
+        self._refresh_res_multipliers()
+        for check in self._affinity_checks.values():
+            check.refresh()
         for row in self._trait_rows.values():
             row.refresh()
+        self._refresh_trait_effects()
         for row in self._move_rows.values():
             row.refresh()
         for spin in self._misc_widgets.values():

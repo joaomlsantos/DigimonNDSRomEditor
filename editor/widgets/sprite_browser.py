@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -59,7 +60,11 @@ from PySide6.QtWidgets import (
 from digimon_core import nanr, ncer as ncer_mod, pak, sprite
 
 from ..commands import AppendPakEntriesCommand, ReplaceSpriteCommand
-from ._png_palette import build_palette_from_png
+from ._png_palette import build_palette_from_png, intensity_matched_palette
+from .palette_batch_adjuster import PaletteBatchAdjuster
+from .palette_editor import PaletteEditor
+from .palette_grid import PaletteGrid
+from .palette_toolkit import DEFAULT_SCROLL_MAX_H, PaletteToolkit
 from .cell_export_policy import (
     allow_shared_tile_exports,
     register_change_callback as _register_cell_policy_callback,
@@ -198,6 +203,8 @@ class SpriteBrowser(QWidget):
         self._current_idx: Optional[int] = None
         self._current_palette_bank: int = 0
         self._current_width_tiles: int = 4
+        # entry -> per-slot pixel histogram (for dominant-colour borrow match)
+        self._src_counts_cache: dict[int, Optional[List[int]]] = {}
         # Per-sprite width overrides. Lives in memory only — switching
         # away from a sprite and back uses the user's last width pick
         # instead of resnapping to the heuristic. Cleared on re-load.
@@ -266,6 +273,12 @@ class SpriteBrowser(QWidget):
         # entry. Done eagerly so the filter box can match on bpp / size /
         # cell-count tokens from the moment the browser opens.
         self._labels: List[str] = self._build_index_labels()
+
+        # Non-None while the batch adjuster drags: a preview palette override
+        # the render paths consult. `_picking_slot` is the eyedropper mode
+        # (mutually exclusive with the transparent-colour pick).
+        self._preview_palette: Optional[List[Tuple[int, int, int]]] = None
+        self._picking_slot: bool = False
 
         self._build_ui()
         remembered = self._session.recall_selection(self._CURSOR_KEY)
@@ -468,11 +481,37 @@ class SpriteBrowser(QWidget):
         ))
         self._oam_overlay_check.toggled.connect(self._on_oam_overlay_toggled)
 
+        # Editable swatch grid for the displayed palette bank. Clicking a
+        # swatch recolors that slot (write-back is 5-bit BGR555-quantized in
+        # _apply_palette_color); slot 0 is the engine's transparent index.
+        # Palette editor widgets — grid + inline single-slot editor + batch
+        # H/S/L adjuster + eyedropper, all wired by PaletteToolkit (built in
+        # _build_ui once the scroll exists). Click a swatch to edit one colour;
+        # shift-click / drag a box to select several and shift them together.
+        self._palette_grid = PaletteGrid()
+        self._palette_grid.setToolTip(wrap_tooltip(
+            "The current palette bank. Click a swatch to edit it, or shift-click "
+            "a range / drag a box to select several and shift them together with "
+            "the H/S/L sliders. Colors quantize to NDS 5-bit BGR555 on save. "
+            "Slot 0 (diagonal mark) is transparent."
+        ))
+        self._palette_editor = PaletteEditor()
+        self._palette_adjuster = PaletteBatchAdjuster()
+        self._eyedropper_btn = QPushButton("Eyedropper")
+        self._eyedropper_btn.setCheckable(True)
+        self._eyedropper_btn.setToolTip(
+            "Then click a pixel on the sprite preview to select its palette slot."
+        )
+        self._eyedropper_btn.toggled.connect(self._on_slot_pick_toggled)
+
         controls = QFormLayout()
         controls.addRow("Width (tiles)", self._width_spin)
         controls.addRow("Palette bank", self._palette_combo)
         controls.addRow("Cell", self._cell_view_spin)
         controls.addRow("Transparent color", transparent_widget)
+        # The swatch grid lives in its own right-hand sidebar (built below),
+        # not inline here — an 8bpp 256-color palette is 16×16 and would
+        # dwarf the form.
         # controls.addRow("OAM gaps", self._oam_overlay_check)
 
         # Metadata panel — one row per field, read-only.
@@ -562,23 +601,61 @@ class SpriteBrowser(QWidget):
         self._import_cells_png_btn.clicked.connect(self._on_import_cells_png)
         self._import_per_cell_btn = QPushButton("Import per-cell PNGs…")
         self._import_per_cell_btn.clicked.connect(self._on_import_per_cell_pngs)
-        for btn in (
-            self._export_png_btn, self._export_native_btn,
-            self._replace_png_btn, self._replace_native_btn,
-            self._duplicate_entry_btn,
+
+        # "Export…" / "Import…" dropdowns front every PNG mode + the native
+        # NCGR+NCLR pair, mirroring Battle Sprites. The individual buttons stay
+        # in code (nothing deleted) — they just back the menu rows and aren't
+        # laid out. The cell rows are kept as QActions so the shared-tile export
+        # policy can gate them (see _refresh_cell_export_button_states).
+        self._export_menu = QMenu(self)
+        self._act_export_cells = self._export_menu.addAction(
+            "Sprite sheet (all frames, one PNG)…", self._on_export_cells_png)
+        self._act_export_per_cell = self._export_menu.addAction(
+            "Individual frames (one PNG each)…", self._on_export_per_cell_pngs)
+        self._export_menu.addSeparator()
+        self._export_menu.addAction(
+            "Tile sheet (raw 8×8 tiles)…", self._on_export_png)
+        self._export_menu.addSeparator()
+        self._export_menu.addAction(
+            "Source files (NCGR + NCLR)…", self._on_export_native)
+        self._export_as_btn = QPushButton("Export…")
+        self._export_as_btn.setMenu(self._export_menu)
+
+        self._import_menu = QMenu(self)
+        self._act_import_cells = self._import_menu.addAction(
+            "Sprite sheet (all frames, one PNG)…", self._on_import_cells_png)
+        self._act_import_per_cell = self._import_menu.addAction(
+            "Individual frames (one PNG each)…", self._on_import_per_cell_pngs)
+        self._import_menu.addSeparator()
+        self._import_menu.addAction(
+            "Tile sheet (raw 8×8 tiles)…", self._on_replace_png_dispatch)
+        self._import_menu.addSeparator()
+        self._import_menu.addAction(
+            "Source files (NCGR + NCLR)…", self._on_replace_native)
+        self._import_as_btn = QPushButton("Import…")
+        self._import_as_btn.setMenu(self._import_menu)
+
+        for _superseded in (
+            self._export_png_btn, self._replace_png_btn,
+            self._export_native_btn, self._replace_native_btn,
             self._export_cells_png_btn, self._export_per_cell_btn,
             self._import_cells_png_btn, self._import_per_cell_btn,
         ):
+            _superseded.setParent(self)
+            _superseded.setVisible(False)
+
+        for btn in (
+            self._export_as_btn, self._import_as_btn,
+            self._duplicate_entry_btn,
+        ):
             btn.setEnabled(False)
-        # Replace requires an undo stack to push onto; without one the
-        # widget runs in read-only mode (e.g. embedded in a viewer).
+        # Import requires an undo stack to push onto; without one the widget
+        # runs in read-only mode (e.g. embedded in a viewer) — hide the Import
+        # dropdown + mutating actions, keep Export.
         if self._undo_stack is None:
-            self._replace_png_btn.setVisible(False)
+            self._import_as_btn.setVisible(False)
             self._import_pal_with_sheet_cb.setVisible(False)
-            self._replace_native_btn.setVisible(False)
             self._duplicate_entry_btn.setVisible(False)
-            self._import_cells_png_btn.setVisible(False)
-            self._import_per_cell_btn.setVisible(False)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -638,39 +715,36 @@ class SpriteBrowser(QWidget):
         self._preview_tabs.setTabEnabled(self._anim_tab_index, False)
         self._preview_tabs.currentChanged.connect(self._on_preview_tab_changed)
         right_layout.addWidget(self._preview_tabs, 1)
-        # Action buttons grouped by target format: PNG column (lossy via
-        # the engine's palette quantization) on the left, NCGR+NCLR
-        # column (lossless engine-native) on the right. Stacking within
-        # a column lets buttons share a width — Qt sizes each column to
-        # its widest button, so the labels line up flush left/right.
-        png_col = QVBoxLayout()
-        png_col.setSpacing(4)
-        png_col.addWidget(self._export_png_btn)
-        png_col.addWidget(self._replace_png_btn)
-        png_col.addWidget(self._import_pal_with_sheet_cb)
-        png_col.addStretch(1)
-        cells_col = QVBoxLayout()
-        cells_col.setSpacing(4)
-        cells_col.addWidget(self._export_cells_png_btn)
-        cells_col.addWidget(self._export_per_cell_btn)
-        cells_col.addWidget(self._import_cells_png_btn)
-        cells_col.addWidget(self._import_per_cell_btn)
-        cells_col.addStretch(1)
-        native_col = QVBoxLayout()
-        native_col.setSpacing(4)
-        native_col.addWidget(self._export_native_btn)
-        native_col.addWidget(self._replace_native_btn)
-        native_col.addWidget(self._duplicate_entry_btn)
-        native_col.addWidget(self._add_cell_btn)
-        native_col.addStretch(1)
+        # Import/Export dropdowns (every PNG mode + native NCGR+NCLR live
+        # inside), then the standalone structural actions. All pinned to one
+        # width so they read as an aligned group.
+        io_btns = (
+            self._import_as_btn, self._export_as_btn,
+            self._duplicate_entry_btn, self._add_cell_btn,
+        )
+        max_io_w = max(
+            w.sizeHint().width()
+            for w in (*io_btns, self._import_pal_with_sheet_cb)
+        )
+        for b in io_btns:
+            b.setFixedWidth(max_io_w)
+        io_col = QVBoxLayout()
+        io_col.setSpacing(4)
+        io_col.addWidget(self._import_as_btn)
+        io_col.addWidget(self._export_as_btn)
+        io_col.addWidget(self._import_pal_with_sheet_cb)
+        io_col.addStretch(1)
+        actions_col = QVBoxLayout()
+        actions_col.setSpacing(4)
+        actions_col.addWidget(self._duplicate_entry_btn)
+        actions_col.addWidget(self._add_cell_btn)
+        actions_col.addStretch(1)
         controls_row = QHBoxLayout()
         controls_row.addLayout(controls)
         controls_row.addSpacing(16)
-        controls_row.addLayout(png_col)
-        controls_row.addSpacing(8)
-        controls_row.addLayout(cells_col)
-        controls_row.addSpacing(8)
-        controls_row.addLayout(native_col)
+        controls_row.addLayout(io_col)
+        controls_row.addSpacing(12)
+        controls_row.addLayout(actions_col)
         controls_row.addStretch(1)
         controls_row.addLayout(meta_form)
         right_layout.addLayout(controls_row)
@@ -696,12 +770,58 @@ class SpriteBrowser(QWidget):
         list_col_layout.addWidget(self._list)
         list_col_layout.addWidget(self._add_entry_btn)
 
+        # Palette sidebar — its own pane so a 256-color 8bpp palette (16×16
+        # swatches) has room and scrolls instead of stretching the form.
+        palette_col = QWidget()
+        palette_col_layout = QVBoxLayout(palette_col)
+        palette_col_layout.setContentsMargins(4, 4, 4, 4)
+        palette_col_layout.setSpacing(6)
+        pal_header = QHBoxLayout()
+        palette_title = QLabel("Palette")
+        palette_title.setStyleSheet("font-weight: bold;")
+        pal_header.addWidget(palette_title)
+        pal_header.addStretch(1)
+        pal_header.addWidget(self._eyedropper_btn)
+        palette_col_layout.addLayout(pal_header)
+        self._palette_scroll = QScrollArea()
+        self._palette_scroll.setWidget(self._palette_grid)
+        self._palette_scroll.setWidgetResizable(False)
+        self._palette_scroll.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self._palette_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._palette_scroll.setMinimumWidth(self._palette_grid.width() + 20)
+        self._palette_scroll.setFixedHeight(
+            min(self._palette_grid.height() + 2, DEFAULT_SCROLL_MAX_H)
+        )
+        palette_col_layout.addWidget(self._palette_scroll)
+        palette_col_layout.addWidget(self._palette_editor)
+        palette_col_layout.addWidget(self._palette_adjuster)
+        palette_col_layout.addLayout(self._build_borrow_palette_section())
+        palette_col_layout.addStretch(1)
+
+        # Toolkit wires grid ↔ editor ↔ adjuster + the live preview; the
+        # eyedropper button is wired manually (SPR uses its own click-capture,
+        # not the shared TransparentColorPicker), so picker=None here.
+        self._palette_toolkit = PaletteToolkit(
+            self, self._palette_grid, self._palette_editor, self._palette_adjuster,
+            get_palette=self._palette_get,
+            write_palette=self._apply_palette_colors,
+            set_preview_palette=self._palette_set_preview,
+            refresh_preview=self._refresh_live_preview,
+            scroll=self._palette_scroll,
+        )
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(list_col)
         splitter.addWidget(right)
+        splitter.addWidget(palette_col)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([220, 800])
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([220, 760, 260])
+        # Collapsible so the user can reclaim the width when they don't need
+        # the palette open.
+        splitter.setCollapsible(2, True)
+        splitter.splitterMoved.connect(lambda *_: self._palette_toolkit.reflow())
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -718,15 +838,14 @@ class SpriteBrowser(QWidget):
     def _on_index_selected(self, ix: int) -> None:
         self._current_idx = ix
         self._session.remember_selection(self._CURSOR_KEY, ix)
-        self._export_png_btn.setEnabled(True)
-        self._export_native_btn.setEnabled(True)
+        self._export_as_btn.setEnabled(True)
         if self._undo_stack is not None:
-            self._replace_png_btn.setEnabled(True)
-            self._replace_native_btn.setEnabled(True)
+            self._import_as_btn.setEnabled(True)
             self._duplicate_entry_btn.setEnabled(True)
             self._add_cell_btn.setEnabled(True)
         self._refresh_palette_combo()
         self._refresh_meta_and_preview()
+        self._reset_borrow()
         # A new sprite has different cells/sequences — blindly continuing
         # playback would render against the wrong tile bank. Stop first
         # (after _refresh_meta_and_preview so the grid restore reads the
@@ -797,7 +916,7 @@ class SpriteBrowser(QWidget):
         if self._current_idx is None:
             self._cells_label.setText("Select a sprite to preview.")
             return
-        ctx = self._cell_ctx()
+        ctx = self._cell_ctx(for_preview=True)
         layout = self._cell_layout()
         if ctx is None or layout is None:
             self._cells_label.setText("(no cells)")
@@ -925,11 +1044,13 @@ class SpriteBrowser(QWidget):
             and not allow_shared_tile_exports()
         )
         import_ok = has_selection and not blocked_by_conflicts
-        self._export_cells_png_btn.setEnabled(has_selection)
-        self._export_per_cell_btn.setEnabled(has_selection)
+        # Gate the Export/Import dropdown's cell rows (the individual buttons
+        # they replaced are hidden; the menu QActions carry the gating now).
+        self._act_export_cells.setEnabled(has_selection)
+        self._act_export_per_cell.setEnabled(has_selection)
         if self._undo_stack is not None:
-            self._import_cells_png_btn.setEnabled(import_ok)
-            self._import_per_cell_btn.setEnabled(import_ok)
+            self._act_import_cells.setEnabled(import_ok)
+            self._act_import_per_cell.setEnabled(import_ok)
 
     def _on_cell_policy_changed(self, _enabled: bool) -> None:
         """Menu fired — re-evaluate button gating + warning text.
@@ -1057,7 +1178,7 @@ class SpriteBrowser(QWidget):
         self._cell_view_spin.blockSignals(False)
         self._refresh_preview_only()
 
-    def _refresh_preview_only(self) -> None:
+    def _refresh_preview_only(self, sync_palette: bool = True) -> None:
         cached = getattr(self, "_cached", None)
         if cached is None:
             return
@@ -1074,6 +1195,9 @@ class SpriteBrowser(QWidget):
         else:
             bank = min(self._current_palette_bank, len(palettes) - 1)
             palette = palettes[bank]
+        # While the batch adjuster drags, render the previewed colours.
+        if self._preview_palette is not None:
+            palette = self._preview_palette
         rgba, w, h = sprite.render_rgba(
             tile_bytes,
             bit_depth,
@@ -1102,6 +1226,10 @@ class SpriteBrowser(QWidget):
         self._preview_src_size = (w, h)
         self._preview_pixmap_size = (pix.width(), pix.height())
         self._sync_transparent_field()
+        # Skip re-syncing the grid/adjuster during a live batch-adjust drag —
+        # that would reset the pending selection mid-recolour.
+        if sync_palette:
+            self._sync_palette_grid()
 
     # ---- OAM overlay ----------------------------------------------------
 
@@ -1246,6 +1374,128 @@ class SpriteBrowser(QWidget):
             return (v * 31 + 127) // 255 * 255 // 31
         return (s(rgb[0]), s(rgb[1]), s(rgb[2]))
 
+    def _sync_palette_grid(self) -> None:
+        """Feed the swatch grid + inline editor + batch adjuster the palette the
+        preview is currently using (concatenated flat for 8bpp, else the
+        selected 4bpp bank). Called after every render so bank switches and
+        undo/redo of palette edits reflect immediately."""
+        toolkit = getattr(self, "_palette_toolkit", None)
+        if toolkit is not None:
+            toolkit.sync()
+
+    def _palette_get(self) -> List[Tuple[int, int, int]]:
+        cached = getattr(self, "_cached", None)
+        if cached is None:
+            return []
+        _tb, bit_depth, palettes, _ib = cached
+        palette, _ = self._current_effective_palette(palettes, bit_depth)
+        return [tuple(c) for c in palette]
+
+    def _palette_set_preview(self, pal) -> None:
+        self._preview_palette = pal
+
+    def _apply_palette_colors(self, mapping) -> None:
+        """Recolour N palette slots in one undo step (the batch adjuster's
+        Apply). Groups slots by bank the same way :meth:`_apply_palette_color`
+        splits a single slot, then does one NCLR rebuild."""
+        if self._current_idx is None or self._undo_stack is None:
+            return
+        ix = self._current_idx
+        cached = getattr(self, "_cached", None)
+        if cached is None:
+            return
+        _tb, bit_depth, palettes, _ib = cached
+        if not palettes:
+            return
+        chr_8bpp = (bit_depth == 4)
+        banks_are_16 = len(palettes[0]) == 16
+        replacements: dict = {}
+        changed = 0
+        for slot, rgb in mapping.items():
+            if chr_8bpp and banks_are_16:
+                bank_idx, slot_in_bank = divmod(int(slot), 16)
+            else:
+                bank_idx = min(self._current_palette_bank, len(palettes) - 1)
+                slot_in_bank = int(slot)
+            if not (0 <= bank_idx < len(palettes)):
+                continue
+            if not (0 <= slot_in_bank < len(palettes[bank_idx])):
+                continue
+            new = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            if self._snap5(palettes[bank_idx][slot_in_bank]) == self._snap5(new):
+                continue
+            replacements.setdefault(bank_idx, list(palettes[bank_idx]))
+            replacements[bank_idx][slot_in_bank] = new
+            changed += 1
+        if changed == 0:
+            return
+        try:
+            new_nclr = sprite.build_nclr_from_template(
+                self._pal_pak.entries[ix], replacements,
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Build failed", f"NCLR rewrite: {exc}")
+            return
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(SPR_PAL, ix, sprite.compress_rle30(new_nclr))],
+            description=f"Recolor {changed} palette slots for sprite 0x{ix:04x}",
+            on_change=self._reload_current_entry,
+        )
+        self._undo_stack.push(cmd)
+
+    def _apply_palette_color(self, slot: int, rgb: Tuple[int, int, int]) -> None:
+        """Recolor one palette slot and push a ReplaceSpriteCommand.
+
+        ``slot`` indexes the *displayed* palette: the flat concatenated
+        palette for 8bpp sprites (slot → bank ``slot // 16``, entry
+        ``slot % 16``) or the selected bank for 4bpp. Only the NCLR changes
+        — recoloring a slot doesn't remap which pixels reference it, so the
+        CHR is untouched (unlike the transparent-slot path)."""
+        if self._current_idx is None or self._undo_stack is None:
+            return
+        ix = self._current_idx
+        cached = getattr(self, "_cached", None)
+        if cached is None:
+            return
+        _tb, bit_depth, palettes, _ib = cached
+        if not palettes:
+            return
+        chr_8bpp = (bit_depth == 4)
+        banks_are_16 = len(palettes[0]) == 16
+        if chr_8bpp and banks_are_16:
+            bank_idx, slot_in_bank = divmod(slot, 16)
+        else:
+            bank_idx = min(self._current_palette_bank, len(palettes) - 1)
+            slot_in_bank = slot
+        if not (0 <= bank_idx < len(palettes)):
+            return
+        if not (0 <= slot_in_bank < len(palettes[bank_idx])):
+            return
+        # No-op if the color is unchanged once snapped to the 5-bit grid the
+        # NCLR actually stores — avoids a redundant undo entry.
+        if self._snap5(palettes[bank_idx][slot_in_bank]) == self._snap5(rgb):
+            return
+        replacements = {bank_idx: list(palettes[bank_idx])}
+        replacements[bank_idx][slot_in_bank] = rgb
+        try:
+            new_nclr = sprite.build_nclr_from_template(
+                self._pal_pak.entries[ix], replacements,
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Build failed", f"NCLR rewrite: {exc}")
+            return
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(SPR_PAL, ix, sprite.compress_rle30(new_nclr))],
+            description=(
+                f"Recolor palette bank {bank_idx} slot {slot_in_bank} "
+                f"for sprite 0x{ix:04x}"
+            ),
+            on_change=self._reload_current_entry,
+        )
+        self._undo_stack.push(cmd)
+
     def _apply_transparent_color(
         self, bank_idx: int, rgb: Tuple[int, int, int],
     ) -> None:
@@ -1384,7 +1634,18 @@ class SpriteBrowser(QWidget):
 
     def _on_pick_toggled(self, checked: bool) -> None:
         self._picking_transparent = checked
-        if checked:
+        if checked and self._eyedropper_btn.isChecked():
+            self._eyedropper_btn.setChecked(False)  # mutually exclusive
+        self._update_pick_cursor()
+
+    def _on_slot_pick_toggled(self, checked: bool) -> None:
+        self._picking_slot = checked
+        if checked and self._pick_transparent_btn.isChecked():
+            self._pick_transparent_btn.setChecked(False)  # mutually exclusive
+        self._update_pick_cursor()
+
+    def _update_pick_cursor(self) -> None:
+        if self._picking_transparent or self._picking_slot:
             self._image_label.setCursor(Qt.CrossCursor)
         else:
             self._image_label.unsetCursor()
@@ -1392,7 +1653,7 @@ class SpriteBrowser(QWidget):
     def eventFilter(self, obj, event) -> bool:
         if (
             obj is self._image_label
-            and self._picking_transparent
+            and (self._picking_transparent or self._picking_slot)
             and event.type() == QEvent.MouseButtonPress
         ):
             self._sample_preview_pixel(event.position().x(), event.position().y())
@@ -1422,9 +1683,15 @@ class SpriteBrowser(QWidget):
         if img is None:
             return
         color = img.pixelColor(sx, sy)
+        if color.alpha() == 0:
+            return  # clicked through the sprite, not on it
         rgb = (color.red(), color.green(), color.blue())
-        # Turn off picking mode after a successful sample — picking is a
-        # one-shot action; users that want another can re-toggle the button.
+        # Eyedropper mode → select the clicked pixel's palette slot; otherwise
+        # the transparent-colour pick. Both are one-shot (button un-toggles).
+        if self._picking_slot:
+            self._eyedropper_btn.setChecked(False)
+            self._palette_toolkit.pick_slot_from_rgb(rgb)
+            return
         self._pick_transparent_btn.setChecked(False)
         bank_idx = self._transparent_target_bank()
         if bank_idx is None:
@@ -1972,7 +2239,7 @@ class SpriteBrowser(QWidget):
 
     # ---- cell-mode PNG IO ----------------------------------------------
 
-    def _cell_ctx(self) -> Optional[CellPngContext]:
+    def _cell_ctx(self, for_preview: bool = False) -> Optional[CellPngContext]:
         """Build a CellPngContext over the current SPR_* sprite.
 
         Picks the effective palette the same way the preview does
@@ -1989,6 +2256,10 @@ class SpriteBrowser(QWidget):
         if not palettes:
             return None
         palette, chr_8bpp = self._current_effective_palette(palettes, bit_depth)
+        # Preview renders honour a live palette override (batch adjust / borrow);
+        # export/import must NOT — they re-index against the committed palette.
+        if for_preview and self._preview_palette is not None:
+            palette = self._preview_palette
         bytes_per_tile = 64 if chr_8bpp else 32
         n_tiles = len(tile_bytes) // bytes_per_tile
         return CellPngContext(
@@ -3109,6 +3380,166 @@ class SpriteBrowser(QWidget):
         deferred tick can't fire against a half-torn-down browser."""
         if self._anim_timer.isActive():
             self._anim_timer.stop()
+
+    # ---- borrow palette (scroll another entry's palette, preview, then copy) --
+
+    def _build_borrow_palette_section(self) -> QVBoxLayout:
+        box = QVBoxLayout()
+        box.setSpacing(3)
+        title = QLabel("Borrow palette")
+        title.setStyleSheet("font-weight: bold;")
+        box.addWidget(title)
+        hint = QLabel("Scroll another sprite's palette onto this one, then apply.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 10px;")
+        box.addWidget(hint)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(QLabel("From #"))
+        self._borrow_spin = QSpinBox()
+        self._borrow_spin.setRange(0, max(0, self._count - 1))
+        self._borrow_spin.setToolTip(
+            "Preview this sprite under another entry's palette (non-destructive). "
+            "\"Use this palette\" copies it in as one undo step."
+        )
+        self._borrow_spin.valueChanged.connect(self._on_borrow_changed)
+        row.addWidget(self._borrow_spin, 1)
+        box.addLayout(row)
+        # Off by default — icons/portraits carry foreign palettes well; on
+        # remaps each slot to the source colour of nearest brightness.
+        self._borrow_match_cb = QCheckBox("Match by brightness")
+        self._borrow_match_cb.setChecked(False)
+        self._borrow_match_cb.setToolTip(
+            "Remap each slot to the source colour of nearest brightness so the "
+            "shading survives. Off = raw slot-for-slot copy."
+        )
+        self._borrow_match_cb.toggled.connect(
+            lambda _=False: self._on_borrow_changed(self._borrow_spin.value())
+        )
+        box.addWidget(self._borrow_match_cb)
+        self._borrow_name = QLabel("")
+        self._borrow_name.setWordWrap(True)
+        self._borrow_name.setStyleSheet("font-size: 10px;")
+        box.addWidget(self._borrow_name)
+        self._borrow_apply_btn = QPushButton("Use this palette")
+        self._borrow_apply_btn.setEnabled(False)
+        self._borrow_apply_btn.clicked.connect(self._on_borrow_apply)
+        box.addWidget(self._borrow_apply_btn)
+        return box
+
+    def _refresh_live_preview(self) -> None:
+        """Re-render whichever preview tab is showing under the current
+        ``_preview_palette`` override (batch adjust / borrow). Doesn't touch the
+        grid or adjuster selection."""
+        if self._preview_tabs.currentIndex() == 1:  # Cells tab
+            self._cells_dirty = False
+            self._refresh_cells_preview()
+        else:
+            self._refresh_preview_only(sync_palette=False)
+
+    def _source_palette(self, ix: int) -> Optional[List[Tuple[int, int, int]]]:
+        """Displayed palette of entry ``ix`` (flat-256 for 8bpp, else bank 0)."""
+        if not (0 <= ix < self._count):
+            return None
+        try:
+            _tb, bit_depth, *_ = sprite.parse_ncgr(
+                sprite.maybe_decompress(self._chr_pak.entries[ix])
+            )
+            palettes, _ = sprite.parse_nclr(
+                sprite.maybe_decompress(self._pal_pak.entries[ix])
+            )
+        except (ValueError, IndexError):
+            return None
+        if not palettes:
+            return None
+        if bit_depth == 4 and len(palettes[0]) == 16:
+            return [tuple(c) for bank in palettes for c in bank]
+        return [tuple(c) for c in palettes[0]]
+
+    def _source_pixel_counts(self, ix: int) -> Optional[List[int]]:
+        """Per-slot pixel usage of entry ``ix``'s sprite, indexed to match
+        ``_source_palette`` (0..255 for 8bpp, 0..15 nibbles for 4bpp). Weights
+        the borrow match toward the source's dominant colours. Cached."""
+        if not (0 <= ix < self._count):
+            return None
+        if ix in self._src_counts_cache:
+            return self._src_counts_cache[ix]
+        counts: Optional[List[int]] = None
+        try:
+            tile_bytes, bit_depth, *_ = sprite.parse_ncgr(
+                sprite.maybe_decompress(self._chr_pak.entries[ix])
+            )
+            if bit_depth == 4:  # 8bpp: one byte per pixel
+                counts = [0] * 256
+                for b in tile_bytes:
+                    counts[b] += 1
+            else:               # 4bpp: two nibble pixels per byte
+                counts = [0] * 16
+                for b in tile_bytes:
+                    counts[b & 0xF] += 1
+                    counts[(b >> 4) & 0xF] += 1
+        except (ValueError, IndexError):
+            counts = None
+        self._src_counts_cache[ix] = counts
+        return counts
+
+    def _reset_borrow(self) -> None:
+        if self._current_idx is None:
+            return
+        self._borrow_spin.blockSignals(True)
+        self._borrow_spin.setValue(self._current_idx)
+        self._borrow_spin.blockSignals(False)
+        self._borrow_name.setText("")
+        self._borrow_apply_btn.setEnabled(False)
+
+    def _borrowed_palette(self, ix: int) -> Optional[List[Tuple[int, int, int]]]:
+        """Entry ``ix``'s palette as it would land on THIS sprite (sized to the
+        current displayed palette) — brightness-matched when the toggle is on,
+        else a raw slot-for-slot copy."""
+        src = self._source_palette(ix)
+        cur = self._palette_get()
+        if src is None or not cur:
+            return None
+        if self._borrow_match_cb.isChecked():
+            return intensity_matched_palette(
+                cur, src, source_counts=self._source_pixel_counts(ix),
+            )
+        preview = list(cur)
+        for i in range(min(len(src), len(preview))):
+            preview[i] = src[i]
+        return preview
+
+    def _on_borrow_changed(self, ix: int) -> None:
+        """Live-preview the current sprite under entry ``ix``'s palette (copying
+        into the current sprite's displayed slots). Selecting self clears it."""
+        if self._current_idx is None:
+            return
+        if ix == self._current_idx:
+            self._preview_palette = None
+            self._borrow_name.setText("")
+            self._borrow_apply_btn.setEnabled(False)
+        else:
+            preview = self._borrowed_palette(ix)
+            if preview is None:
+                return
+            self._preview_palette = preview
+            self._borrow_name.setText(f"0x{ix:04x}")
+            self._borrow_apply_btn.setEnabled(True)
+        self._refresh_live_preview()
+
+    def _on_borrow_apply(self) -> None:
+        """Copy the previewed entry's palette into this sprite's NCLR — one undo
+        step (bank-aware, via the batch write)."""
+        if self._current_idx is None:
+            return
+        ix = self._borrow_spin.value()
+        if ix == self._current_idx:
+            return
+        pal = self._borrowed_palette(ix)
+        if pal is None:
+            return
+        self._apply_palette_colors({i: c for i, c in enumerate(pal)})
+        self._reset_borrow()
 
     def _reload_current_entry(self) -> None:
         """on_change hook fired from :class:`ReplaceSpriteCommand` after a

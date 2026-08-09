@@ -352,6 +352,47 @@ def oam_coverage_mask(
     return bytes(mask)
 
 
+def referenced_tile_indices(
+    cells: List[ncer_mod.Cell], boundary_bytes: int, n_tiles: int,
+) -> set:
+    """Set of linear NCGR tile indices any OAM (across every cell) references.
+
+    Same slot→linear mapping as :func:`render_cell_rgba`
+    (``first = slot*boundary // bytes_per_tile``, then ``w/8 * h/8`` tiles).
+    Flips don't change which tiles are read, only their orientation."""
+    refs = set()
+    for cell in cells:
+        for o in cell.oams:
+            first = (o.tile * boundary_bytes) // BYTES_PER_TILE_8BPP
+            for i in range((o.w // 8) * (o.h // 8)):
+                idx = first + i
+                if 0 <= idx < n_tiles:
+                    refs.add(idx)
+    return refs
+
+
+def count_orphaned_opaque_pixels(
+    tile_bytes: bytes, cells: List[ncer_mod.Cell], boundary_bytes: int,
+) -> int:
+    """Non-transparent pixels living in NCGR tiles no OAM references.
+
+    Such tiles never render — they're art stranded in the bank when an
+    OAM layout stops pointing at them (typically left over from OAM
+    re-cover experiments). A clean re-cover (Compress OAM) drops them, so
+    a non-zero count here is exactly the "content not covered by the OAM"
+    condition the browser flags. Zero for all but one vanilla sprite (the
+    slack tiles inside each cell's fs budget are zero-filled)."""
+    n_tiles = len(tile_bytes) // BYTES_PER_TILE_8BPP
+    refs = referenced_tile_indices(cells, boundary_bytes, n_tiles)
+    total = 0
+    for idx in range(n_tiles):
+        if idx in refs:
+            continue
+        off = idx * BYTES_PER_TILE_8BPP
+        total += sum(1 for b in tile_bytes[off:off + BYTES_PER_TILE_8BPP] if b)
+    return total
+
+
 def render_cell_rgba(
     cell: ncer_mod.Cell,
     tile_bytes: bytes,
@@ -415,6 +456,74 @@ def render_cell_rgba(
                         buf[po + 2] = bb
                         buf[po + 3] = 255
     return bytes(buf), w, h
+
+
+def cells_union_canvas(cells: List["ncer_mod.Cell"]) -> Tuple[int, int, int, int]:
+    """Return ``(x_origin, y_origin, width, height)`` of an 8-aligned canvas
+    covering the OAM union of every cell, so all cells can be rendered onto
+    one aligned grid (required by the shared-layout re-cover). Returns
+    ``(0, 0, 8, 8)`` if no cell has OAMs."""
+    boxes = [cell_bbox(c) for c in cells if c.oams]
+    if not boxes:
+        return (0, 0, 8, 8)
+    xo = (min(b[0] for b in boxes) // 8) * 8
+    yo = (min(b[1] for b in boxes) // 8) * 8
+    w = ((max(b[2] for b in boxes) - xo + 7) // 8) * 8
+    h = ((max(b[3] for b in boxes) - yo + 7) // 8) * 8
+    return (xo, yo, max(8, w), max(8, h))
+
+
+def render_cell_indexed(
+    cell: ncer_mod.Cell,
+    tile_bytes: bytes,
+    w: int,
+    h: int,
+    x_origin: int,
+    y_origin: int,
+    boundary_bytes: int = NCER_BOUNDARY_BYTES_DEFAULT,
+) -> bytes:
+    """Indexed twin of :func:`render_cell_rgba`: composite one cell into a
+    ``w*h`` one-byte-per-pixel buffer where each byte is the palette index
+    (0 = transparent, never written). Output pixel ``(0,0)`` is OAM coord
+    ``(x_origin, y_origin)`` — pass a **shared** canvas (see
+    :func:`cells_union_canvas`) across all cells so their pixels align.
+
+    Feeds a sprite's own pixels back through the occupied-only re-cover
+    (:func:`ncer.generate_masked_multicell`) so its OAM/tile footprint
+    shrinks to just the character — no art change.
+    """
+    buf = bytearray(w * h)
+    if w <= 0 or h <= 0:
+        return bytes(buf)
+    n_tiles = len(tile_bytes) // BYTES_PER_TILE_8BPP
+    for o in cell.oams:
+        first_tile = (o.tile * boundary_bytes) // BYTES_PER_TILE_8BPP
+        ox = o.x - x_origin
+        oy = o.y - y_origin
+        ntw = o.w // 8
+        nth = o.h // 8
+        for ty in range(nth):
+            for tx in range(ntw):
+                idx = first_tile + ty * ntw + tx
+                if idx >= n_tiles:
+                    continue
+                toff = idx * BYTES_PER_TILE_8BPP
+                for r in range(8):
+                    sr = (7 - r) if o.vflip else r
+                    srow = toff + sr * 8
+                    dy = oy + ty * 8 + r
+                    if not (0 <= dy < h):
+                        continue
+                    drow = dy * w
+                    for c in range(8):
+                        sc = (7 - c) if o.hflip else c
+                        pi = tile_bytes[srow + sc]
+                        if pi == 0:
+                            continue
+                        dx = ox + tx * 8 + c
+                        if 0 <= dx < w:
+                            buf[drow + dx] = pi
+    return bytes(buf)
 
 
 def flatten_anim_track(track: List[AnimStep]) -> List[Tuple[int, int]]:

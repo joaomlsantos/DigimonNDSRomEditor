@@ -449,16 +449,26 @@ class MoveEditor(QWidget):
         targeting_form.addRow("Range", self._range_combo)
         targeting_form.addRow("Is Consumable Item", self._consumable_check)
 
-        self._unk_0xe_spin = BoundSpinBox(first, "unknown_0xe", 2, self._undo_stack, hex_display=True)
-        self._unk_0x14_spin = BoundSpinBox(first, "unknown_0x14", 2, self._undo_stack, hex_display=True)
-        self._unk_0x16_spin = BoundSpinBox(first, "unknown_0x16", 2, self._undo_stack, hex_display=True)
+        # Confirmed in the ov2 battle executor FUN_0017cdbc. The damage power is
+        # "Primary Value" (+8) above; +0x15 is the separate to-hit term (feeds a
+        # rand(1000) accuracy gate, not the damage).
+        self._accuracy_spin = BoundSpinBox(first, "accuracy", 1, self._undo_stack)
+        self._crit_rate_spin = BoundSpinBox(first, "crit_rate", 1, self._undo_stack)
+        self._flinch_chance_spin = BoundSpinBox(first, "flinch_chance", 1, self._undo_stack)
+        self._status_strength_spin = BoundSpinBox(first, "status_strength", 1, self._undo_stack)
 
+        combat_box = QGroupBox("Combat")
+        combat_form = make_form(combat_box)
+        combat_form.addRow("Accuracy / to-hit (+0x15)", self._accuracy_spin)
+        combat_form.addRow("Crit Rate % (+0x16)", self._crit_rate_spin)
+        combat_form.addRow("Flinch/Skip Chance % (+0x17)", self._flinch_chance_spin)
+        combat_form.addRow("Status Strength (+0x14)", self._status_strength_spin)
+
+        self._unk_0xe_spin = BoundSpinBox(first, "unknown_0xe", 2, self._undo_stack, hex_display=True)
         misc_box = QGroupBox("Misc / Unknown")
         register_unknown_container(misc_box)
         misc_form = make_form(misc_box)
         add_unknown_form_row(misc_form, "Unknown 0x0e", self._unk_0xe_spin)
-        add_unknown_form_row(misc_form, "Unknown 0x14", self._unk_0x14_spin)
-        add_unknown_form_row(misc_form, "Unknown 0x16", self._unk_0x16_spin)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -468,6 +478,7 @@ class MoveEditor(QWidget):
         content_layout.addWidget(identity_box)
         content_layout.addWidget(effects_box)
         content_layout.addWidget(targeting_box)
+        content_layout.addWidget(combat_box)
         content_layout.addWidget(misc_box)
         content_layout.addStretch(1)
 
@@ -482,7 +493,9 @@ class MoveEditor(QWidget):
             self._primary_combo, self._primary_value_spin,
             self._secondary_combo, self._secondary_value_spin,
             self._num_hits_spin, self._range_combo, self._consumable_check,
-            self._unk_0xe_spin, self._unk_0x14_spin, self._unk_0x16_spin,
+            self._accuracy_spin, self._crit_rate_spin,
+            self._flinch_chance_spin, self._status_strength_spin,
+            self._unk_0xe_spin,
         ]
 
     def _on_selection(self, ix: int) -> None:

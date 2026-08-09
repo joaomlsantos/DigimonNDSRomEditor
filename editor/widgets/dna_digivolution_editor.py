@@ -38,10 +38,12 @@ DIGIMON_VALUED_CONDITIONS = {0x15, 0x16}
 
 
 def _record_columns(ix: int, rec: model.DNADigivolution):
-    # Result first — it's the field users scan the list by (which pairs
-    # fuse into what), with the two parents trailing.
+    # "ID" is the result's numeric digimon id, "Result" its name — two
+    # columns so the header row sorts by *either* result id (numeric) or
+    # result name (alphabetical). The two parents trail as names.
     return (
         f"{ix:03d}",
+        str(rec.dna_evolution_id),
         digimon_name(rec.dna_evolution_id),
         digimon_name(rec.digimon_1_id),
         digimon_name(rec.digimon_2_id),
@@ -108,7 +110,7 @@ class DNADigivolutionEditor(QWidget):
         self._list_panel = RecordListPanel(
             records, dirty_aware=True,
             columns_for=_record_columns,
-            headers=("#", "Result", "Digimon 1", "Digimon 2"),
+            headers=("#", "ID", "Result", "Digimon 1", "Digimon 2"),
         )
         self._list_panel.indexSelected.connect(self._on_selection)
 

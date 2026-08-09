@@ -3,9 +3,9 @@
 Left pane: every wild-encounter area, labelled by the location it lives in
 (derived via `loaders.getCurrentLocation`). Right pane: the area's header
 (encounter count, rate lower/upper) and a scrollable list of editable
-encounter rows (digimon id + reward-slot index). The 22 opaque bytes inside
-each encounter (filler 0x0C80s, the 0x12 field that crashes the game when set
-to unknown values, the trailing 0xFFFF terminator) are preserved verbatim.
+encounter rows (digimon id + appearance chance + reward-slot index). The
+remaining interior bytes (placement coords / 0x0C80 wildcards, the trailing
+0xFFFF terminator) are preserved verbatim.
 """
 from __future__ import annotations
 
@@ -16,12 +16,15 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
+    QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from digimon_core import loaders, map_labels, model
+
+from ..commands import AddWildEncounterCommand, RemoveWildEncounterCommand
 
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
@@ -43,7 +46,7 @@ def _build_area_labels(version: str, areas: List[model.WildEncounterArea]) -> Li
 
 
 class _EncounterRow:
-    """One encounter — digimon-id picker + reward-slot spin."""
+    """One encounter — digimon-id picker + appearance-chance + reward-slot spin."""
 
     def __init__(self, target: model.WildEncounter, undo_stack: QUndoStack):
         self._target = target
@@ -52,6 +55,17 @@ class _EncounterRow:
             include_level=True,
             nav_kind="enemy_digimon",
             shared_kind="digimon",
+        )
+        # spawn_chance (record +0x12) is a percentage rolled against rand(100)
+        # each battle by arm9 FUN_00058500 — higher = more likely this slot
+        # appears. Vanilla stays in 10..100; >100 just means "always eligible".
+        self.chance_spin = BoundSpinBox(
+            target, "spawn_chance", 2, undo_stack,
+            warn_above=100,
+            warn_message=(
+                "Appearance chance is a percentage rolled vs rand(100); values "
+                "above 100 make the slot always eligible (no extra effect)."
+            ),
         )
         # reward_slot indexes into encounter_rewards; anything past the table
         # length points at nothing and the game won't drop a reward. Warn the
@@ -202,11 +216,7 @@ class WildEncountersEditor(QWidget):
         self._clear_layout(self._enc_layout)
         self._encounter_rows = []
 
-        if not area.encounters:
-            self._enc_layout.addWidget(QLabel("(no encounters in this area)"), 0, 0)
-            return
-
-        for col, text in enumerate(["#", "Digimon", "Reward slot", "Offset"]):
+        for col, text in enumerate(["#", "Digimon", "Chance %", "Reward slot", "Offset", ""]):
             lbl = QLabel(text)
             f = lbl.font()
             f.setBold(True)
@@ -218,9 +228,34 @@ class WildEncountersEditor(QWidget):
             self._encounter_rows.append(row)
             self._enc_layout.addWidget(QLabel(f"{row_ix + 1:02d}"), row_ix + 1, 0)
             self._enc_layout.addWidget(row.id_combo, row_ix + 1, 1)
-            self._enc_layout.addWidget(row.reward_widget, row_ix + 1, 2)
-            self._enc_layout.addWidget(QLabel(f"0x{enc.offset:08x}"), row_ix + 1, 3)
+            self._enc_layout.addWidget(row.chance_spin, row_ix + 1, 2)
+            self._enc_layout.addWidget(row.reward_widget, row_ix + 1, 3)
+            self._enc_layout.addWidget(QLabel(f"0x{enc.offset:08x}"), row_ix + 1, 4)
+            remove_btn = QPushButton("✕")
+            remove_btn.setFixedWidth(28)
+            remove_btn.setToolTip("Remove this encounter slot")
+            remove_btn.clicked.connect(
+                lambda _checked=False, e=enc: self._remove_encounter(e)
+            )
+            self._enc_layout.addWidget(remove_btn, row_ix + 1, 5)
         self._enc_layout.setColumnStretch(1, 1)
+
+        # add-slot control row
+        add_row = len(area.encounters) + 1
+        cap = model.WildEncounterArea.MAX_ENCOUNTERS
+        at_cap = not area.can_add_encounter()
+        add_btn = QPushButton("＋ Add encounter")
+        add_btn.setEnabled(not at_cap)
+        add_btn.setToolTip(
+            f"The engine caps an area at {cap} encounters — this area is full."
+            if at_cap
+            else f"Add a random-encounter slot, then pick its digimon ({len(area.encounters)}/{cap})."
+        )
+        add_btn.clicked.connect(self._add_encounter)
+        self._enc_layout.addWidget(add_btn, add_row, 0, 1, 3)
+        count_lbl = QLabel(f"{len(area.encounters)} / {cap} slots")
+        count_lbl.setStyleSheet("color:#888;")
+        self._enc_layout.addWidget(count_lbl, add_row, 3, 1, 3)
 
     def _on_undo_redo(self, _index: int) -> None:
         # An edit here may have reassigned an encounter's digimon_id, so the
@@ -235,7 +270,43 @@ class WildEncountersEditor(QWidget):
             self._rate_hi_spin.refresh()
         for row in self._encounter_rows:
             row.id_combo.refresh()
+            row.chance_spin.refresh()
             row.reward_spin.refresh()
+
+    def _reload_current(self) -> None:
+        """Rebuild the detail pane for the current area (after a slot add/
+        remove changed the encounter list)."""
+        if 0 <= self._current_ix < len(self._areas):
+            self._on_selection(self._current_ix)
+            # keep the left-pane "Encounters" count column in sync
+            self._list_panel.refresh_label(self._current_ix)
+            self._list_panel.refresh_dirty_state()
+
+    def _add_encounter(self) -> None:
+        if not (0 <= self._current_ix < len(self._areas)):
+            return
+        area = self._areas[self._current_ix]
+        if not area.can_add_encounter():
+            return
+        self._undo_stack.push(AddWildEncounterCommand(
+            self._session, area,
+            f"Add encounter to {self._labels[self._current_ix]}",
+            on_change=self._reload_current,
+        ))
+
+    def _remove_encounter(self, enc: model.WildEncounter) -> None:
+        if not (0 <= self._current_ix < len(self._areas)):
+            return
+        area = self._areas[self._current_ix]
+        try:
+            index = area.encounters.index(enc)
+        except ValueError:
+            return
+        self._undo_stack.push(RemoveWildEncounterCommand(
+            self._session, area, index,
+            f"Remove encounter from {self._labels[self._current_ix]}",
+            on_change=self._reload_current,
+        ))
 
     def _refresh_used_by(self, area_index: int) -> None:
         """Fill the 'Used by maps' group with clickable field-map links.

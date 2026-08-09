@@ -31,17 +31,20 @@ from __future__ import annotations
 import html
 import struct
 from dataclasses import dataclass, field, replace as _dc_replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from PySide6.QtCore import QPoint, QRect, QSignalBlocker, QSize, Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
     QComboBox,
     QCompleter,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLayout,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPlainTextEdit,
@@ -49,11 +52,17 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from digimon_core import overlay5 as overlay5_mod
+from digimon_core.constants import ITEM_ID_TO_STR
+from digimon_core.map_labels import area_name
 from digimon_core.overlay5_cutscenes import (
     CutsceneChain,
     TriggerKind,
@@ -63,14 +72,19 @@ from ..commands import (
     EditBattleBgCommand,
     EditBattleEnemyCommand,
     EditBattleMusicCommand,
+    EditChestItemCommand,
     EditDialogFieldCommand,
+    EditExitDestinationCommand,
     EditOverworldSpriteIdCommand,
     EditReactionFieldCommand,
+    EditScriptFieldCommand,
     MoveOverworldSpriteCommand,
     SetAttrCommand,
     SetMusicIdCommand,
 )
+from ..session import BATTLE_SPRITE_TILE_BUDGET
 from .events_canvas import EventMarkerSpec, EventsCanvas, ExitZoneSpec
+from .validation import ValidationIssue
 
 
 # Color dot per trigger kind. Matches the legend in the mock at
@@ -180,25 +194,36 @@ def _populate_music_combo(combo, session) -> None:
 # Kind → header-fragment table. Order matches display priority so the
 # section header reads "3 dialogs · 1 battle · 1 music".
 _EVENT_KIND_HEADER_LABEL = {
-    "dialog":    ("dialog", "dialogs"),
-    "battle":    ("battle", "battles"),
-    "reaction":  ("reaction", "reactions"),
-    "set_music": ("music cue", "music cues"),
+    "dialog":      ("dialog", "dialogs"),
+    "battle":      ("battle", "battles"),
+    "reaction":    ("reaction", "reactions"),
+    "set_music":   ("music cue", "music cues"),
+    "wait":        ("wait", "waits"),
+    "sprite_anim": ("anim", "anims"),
+    "camera":      ("camera", "cameras"),
+    "item":        ("item", "items"),
+    "move":        ("move", "moves"),
+    "control":     ("flag/branch", "flags/branches"),
 }
 
 
 # Row-preview text for the events browser list — matches the icons
 # each card class uses in its own header so the list and the active
 # card read as the same thing at different zoom levels.
-def _event_row_preview(session, event) -> Tuple[str, str]:
+def _event_row_preview(session, event, slot_labels=None) -> Tuple[str, str]:
     """Return ``(icon_char, one_line_preview)`` for the events browser.
 
     Kept independent of the card widgets so the list can render even
     before the card is built (or when the underlying widget model isn't
     attached yet). Truncates long dialog bodies to ~50 chars so the row
-    stays scannable at typical list widths.
+    stays scannable at typical list widths. ``slot_labels`` (slot → name)
+    lets slot-addressed events (anim / camera) name their actor.
     """
     payload = event.payload
+
+    def _who(slot):
+        name = (slot_labels or {}).get(int(slot) & 0xFFFF)
+        return name if name else f"slot {int(slot) & 0xFFFF}"
     if event.kind == overlay5_mod.EVENT_KIND_DIALOG:
         portrait = int(payload.portrait) & 0xFFFF
         msg_id = int(payload.msg_id) & 0xFFFF
@@ -221,15 +246,15 @@ def _event_row_preview(session, event) -> Tuple[str, str]:
         # at a word boundary.
         if len(text) > 50:
             text = text[:47].rstrip() + "…"
-        return ("💬", f"{name}: “{text}”")
+        return ("💬", f"DIALOGUE - {name}: “{text}”")
     if event.kind == overlay5_mod.EVENT_KIND_SET_MUSIC:
         mid = int(payload.music_id) & 0xFFFF
-        return ("♪", f"SET_MUSIC — {session.bgm_label(mid)} (0x{mid:04x})")
+        return ("♪", f"MUSIC - {session.bgm_label(mid)} (0x{mid:04x})")
     if event.kind == overlay5_mod.EVENT_KIND_REACTION:
         rid = int(payload.reaction) & 0xFFFF
         rname = overlay5_mod.REACTION_NAMES.get(rid, f"0x{rid:04x}")
         tgt = int(payload.target) & 0xFFFF
-        return ("💭", f"REACTION — {rname} over slot {tgt}")
+        return ("💭", f"REACTION - {rname} over {_who(tgt)}")
     if event.kind == overlay5_mod.EVENT_KIND_BATTLE:
         enemies = [
             e for e in payload.enemies
@@ -245,8 +270,72 @@ def _event_row_preview(session, event) -> Tuple[str, str]:
         pieces: List[str] = [f"{n} enem{'ies' if n != 1 else 'y'}"]
         if head:
             pieces.append(head)
-        return ("⚔", "BATTLE — " + ", ".join(pieces))
+        return ("⚔", "BATTLE - " + ", ".join(pieces))
+    if event.kind == overlay5_mod.EVENT_KIND_WAIT:
+        f = int(payload.frames) & 0xFFFF
+        return ("⏱", f"WAIT - {f} frames (~{f / 60.0:.1f}s)")
+    if event.kind == overlay5_mod.EVENT_KIND_SPRITE_ANIM:
+        anim = int(payload.anim) & 0xFFFF
+        kind = "face" if anim < 8 else "pose"
+        return ("🎬", f"ANIM - {_who(payload.sprite)} {kind} 0x{anim:02x}")
+    if event.kind == overlay5_mod.EVENT_KIND_CAMERA:
+        if payload.is_xy:
+            return ("🎥", f"CAMERA - → ({payload.a}, {payload.b}) speed {payload.speed}")
+        return ("🎥", f"CAMERA - → {_who(payload.a)} speed {payload.speed}")
+    if event.kind == overlay5_mod.EVENT_KIND_ITEM:
+        item = int(payload.item) & 0xFFFF
+        try:
+            name = ITEM_ID_TO_STR.get(item, f"0x{item:02x}")
+        except Exception:
+            name = f"0x{item:02x}"
+        if payload.is_remove:
+            return ("\U0001f381", f"ITEM - Remove {name} from inventory")  # 🎁
+        return ("\U0001f381", f"ITEM - Add {name} to inventory")  # 🎁
+    if event.kind == overlay5_mod.EVENT_KIND_MOVE:
+        if payload.x == 0xFFFF and payload.y == 0xFFFF:
+            dest = "in place"
+        else:
+            dest = f"→ ({payload.x}, {payload.y})"
+        return ("➡️", f"MOVE - {_who(payload.tgt)} {dest}")  # ➡️
+    if event.kind == overlay5_mod.EVENT_KIND_CONTROL:
+        label, detail = payload.row_summary()
+        return (_CONTROL_ICONS.get(payload.category, "❓"), f"{label} - {detail}")
     return ("?", f"{event.kind} @ 0x{event.rel:04x}")
+
+
+def _compute_event_indents(events) -> List[int]:
+    """Indent level per event so a CMP_BRANCH's gated block reads like code.
+
+    A branch is a decision point at the base level; the events it gates —
+    those inside its relative skip extent (:attr:`ControlBlock.gate_len`) —
+    indent one step. Consecutive branches are siblings (each back at base),
+    matching the NPC dialogue-tree pattern (``if var == X: <line>`` repeated).
+    Deliberately flat (one level): branch skip-extents overlap slightly in the
+    data, so a stack-nested staircase would misread — one level conveys the
+    gating clearly without over-claiming structure."""
+    indents: List[int] = []
+    open_end: Optional[Tuple[int, int]] = None  # (entry_ix, end_rel)
+    for entry_ix, ev in events:
+        if open_end is not None and (
+            open_end[0] != entry_ix or ev.rel >= open_end[1]
+        ):
+            open_end = None
+        is_branch = (
+            ev.kind == overlay5_mod.EVENT_KIND_CONTROL
+            and getattr(ev.payload, "category", None) == "branch"
+        )
+        if is_branch:
+            indents.append(0)
+            glen = int(getattr(ev.payload, "gate_len", 0))
+            if 0 < glen < 0x400:
+                open_end = (entry_ix, ev.rel + glen)
+            else:
+                # A branch with no decoded skip extent (e.g. 0x06): gate the
+                # events up to the NEXT branch (which resets this) or the end.
+                open_end = (entry_ix, 1 << 30)
+        else:
+            indents.append(1 if open_end is not None else 0)
+    return indents
 
 
 # Roles for QListWidgetItem user-data on the events browser list.
@@ -274,7 +363,8 @@ def _events_section_header(
             f"<span class='muted'>({n})</span></div>"
         )
     parts: List[str] = []
-    for kind in ("dialog", "battle", "reaction", "set_music"):
+    for kind in ("dialog", "battle", "reaction", "set_music",
+                 "wait", "sprite_anim", "camera", "item", "move", "control"):
         c = counts.get(kind, 0)
         if not c:
             continue
@@ -295,6 +385,11 @@ _LIST_ROW_SPRITE = "sprite"
 _LIST_ROW_EXIT = "exit"
 _LIST_ROW_HITBOX = "hitbox"
 _LIST_ROW_SPAWN = "spawn"
+_LIST_ROW_GROUP = "group"
+# Block offsets a group header's checkbox governs (canvas visibility toggle).
+_LIST_ROW_GROUP_OFFSETS = Qt.UserRole + 6
+# Stable key (flag int, or "always") identifying a group for collapse state.
+_LIST_ROW_GROUP_KEY = Qt.UserRole + 7
 
 
 class _FlowLayout(QLayout):
@@ -487,6 +582,12 @@ class _MapState:
     ows_chain_by_offset: Dict[int, int] = field(default_factory=dict)
     exit_chain_by_offset: Dict[int, int] = field(default_factory=dict)
     hitbox_chain_by_offset: Dict[int, int] = field(default_factory=dict)
+    # block_offset → resolved exit form data (duck-typed ``_ExitFormData``
+    # from the map browser). Carries the handler location + current dest
+    # so the exit-destination card can push an ``EditExitDestinationCommand``
+    # without re-decoding the handler. Empty for maps the parent didn't
+    # hand form data (older call paths / tests).
+    exit_form_by_offset: Dict[int, object] = field(default_factory=dict)
     # (entry_ix, OWS-block-offset) → OWS chain index, indexed across the
     # WHOLE cutscene_index (not just ``chains_for_map``). Lets a HANDLER
     # chain that spawns NPCs in another entry (typically 0499) look up
@@ -913,24 +1014,24 @@ def _placements_for_entry(
 
 
 def _resolve_marker_pixmap(
-    session, mchr_id: int, behavior: Optional[int],
+    session, ow_id: int, behavior: Optional[int],
     cache: Dict[Tuple[int, Optional[int]], Optional["QPixmap"]],
 ):
-    """Memoized MCHR pixmap lookup that falls through to the session.
+    """Memoized overworld-object pixmap lookup that falls through to the session.
 
-    Chain extras can spawn MCHR ids that don't appear in the base map's
-    sprite list — those would render as bare circles if we only borrowed
-    from ``mchr_pixmap_by_id``. The session's own pixmap cache absorbs
-    repeated lookups, but a per-render cache here also avoids the
-    ``mchr_sprite_pixmap`` cache-key tuple build for sprites referenced
-    by multiple placements (a common case in chain-spawned NPC pairs).
+    ``ow_id`` is an OVERWORLD_SPRITE placement id (the 906-entry ow-id space),
+    resolved through the ARM9 table to a CHR graphic under that id's palette
+    (see session.mchr_sprite_pixmap_by_ow_id) — so a chain-spawned chest
+    (ow-id 0x2fb) renders as the chest, not the unrelated CHR-0x2fb graphic.
+    The per-render cache avoids the session cache-key tuple build for sprites
+    referenced by multiple placements (common in chain-spawned NPC pairs).
     """
-    key = (int(mchr_id), int(behavior) if behavior is not None else None)
+    key = (int(ow_id), int(behavior) if behavior is not None else None)
     if key in cache:
         return cache[key]
     try:
-        pix = session.mchr_sprite_pixmap(
-            int(mchr_id), max_size=512,
+        pix = session.mchr_sprite_pixmap_by_ow_id(
+            int(ow_id), max_size=512,
             frame=int(behavior) if behavior is not None else None,
         )
     except (AttributeError, ValueError):
@@ -1196,6 +1297,159 @@ def _is_map_warp_hop(entry_ix: int, rel: int, base_entry_ix: int) -> bool:
     return overlay5_mod.map_id_for(entry_ix) is not None
 
 
+def _chain_events_global(session, cindex, chain, entry_cache) -> list:
+    """Walk a chain's regions and return its editable events, independent of
+    any per-map tab ``_state`` — used by the cross-map cutscene Index.
+
+    Mirrors :meth:`CutscenesTab._collect_events_for_chain` but takes the
+    session + index explicitly so it can run over every chain in the game
+    without a loaded map. Stops at map-warp hops (their content belongs to
+    the warped-into map)."""
+    out: list = []
+    for entry_ix, rel in chain.path:
+        if _is_map_warp_hop(entry_ix, rel, chain.source_entry_ix):
+            break
+        region = cindex.regions.get((entry_ix, rel))
+        if region is None:
+            continue
+        eb = entry_cache.get(entry_ix)
+        if eb is None:
+            try:
+                eb = session.overlay5_entry_bytes(entry_ix)
+            except (ValueError, KeyError):
+                eb = b""
+            entry_cache[entry_ix] = eb
+        if not eb:
+            continue
+        evs, _ = overlay5_mod.iter_region_events_with_meta(eb, rel, region.end_rel)
+        out.extend(evs)
+    return out
+
+
+# Event kinds that make a chain a genuine cutscene. A bare ``wait`` doesn't
+# count — a chain of only WAIT_FRAMES is a script-timing fragment (e.g. the
+# ``CALL_SYS ext=0500`` stubs), not something worth listing/editing.
+_SUBSTANTIVE_EVENT_KINDS = frozenset({
+    overlay5_mod.EVENT_KIND_DIALOG,
+    overlay5_mod.EVENT_KIND_SPRITE_ANIM,
+    overlay5_mod.EVENT_KIND_CAMERA,
+    overlay5_mod.EVENT_KIND_BATTLE,
+    overlay5_mod.EVENT_KIND_ITEM,
+    overlay5_mod.EVENT_KIND_REACTION,
+    overlay5_mod.EVENT_KIND_MOVE,
+})
+
+
+# One row of the cross-map cutscene Index.
+class _SceneRow(NamedTuple):
+    map_id: Optional[int]   # field-map home, or host map for a shared scene
+    shared: bool            # source entry isn't a field map (shared/cross-map)
+    entry_ix: int
+    first_rel: int
+    global_ix: int
+    kind: str
+    label: str
+    counts: Dict[str, int]
+
+
+def _build_scene_index_rows(session) -> List["_SceneRow"]:
+    """Ordered, cross-map list of the game's real cutscenes for the Index.
+
+    One row per chain that carries a *substantive* event (dialog / anim /
+    camera / battle / item / reaction — see :data:`_SUBSTANTIVE_EVENT_KINDS`).
+    Wait-only fragments and pure-warp / empty chains are dropped: they aren't
+    cutscenes and (for warps) already live in the map view's Exit zones.
+
+    ``map_id`` is the chain's own field map, or — when the scene lives in a
+    shared/non-field entry — the field map that hosts it (resolved through
+    ``chains_by_map``), so a click can still navigate there. Scenes with no
+    host stay ``map_id=None`` (``shared=True``) and get rendered standalone.
+
+    Ordered by ``(entry_ix, first-region offset)`` — the scripts' own
+    definition order."""
+    try:
+        cindex = session.cutscene_index()
+    except (ValueError, KeyError):
+        return []
+    # global chain index → a field map that hosts it (for shared scenes).
+    host_by_gix: Dict[int, int] = {}
+    for mid, ixs in cindex.chains_by_map.items():
+        for gix in ixs:
+            host_by_gix.setdefault(gix, mid)
+    entry_cache: Dict[int, bytes] = {}
+    rows: List[_SceneRow] = []
+    for global_ix, chain in enumerate(cindex.chains):
+        events = _chain_events_global(session, cindex, chain, entry_cache)
+        counts: Dict[str, int] = {}
+        for ev in events:
+            counts[ev.kind] = counts.get(ev.kind, 0) + 1
+        if not any(counts.get(k) for k in _SUBSTANTIVE_EVENT_KINDS):
+            continue
+        own_map = overlay5_mod.map_id_for(chain.source_entry_ix)
+        shared = own_map is None
+        map_id = own_map if own_map is not None else host_by_gix.get(global_ix)
+        first_rel = chain.path[0][1] if chain.path else 0
+        rows.append(_SceneRow(
+            map_id=map_id,
+            shared=shared,
+            entry_ix=int(chain.source_entry_ix),
+            first_rel=int(first_rel),
+            global_ix=global_ix,
+            kind=chain.trigger_kind,
+            label=chain.trigger_label or "",
+            counts=counts,
+        ))
+    rows.sort(key=lambda r: (r.entry_ix, r.first_rel, r.global_ix))
+    return rows
+
+
+_SCENE_KIND_TAG = {
+    TriggerKind.OWS: "NPC",
+    TriggerKind.HANDLER: "Handler",
+    TriggerKind.OTHER: "Sub-scene",
+    TriggerKind.EXT: "Cross-script",
+    TriggerKind.HITBOX: "Hitbox",
+    TriggerKind.EXIT: "Exit",
+}
+
+# Order + short names for the per-row event-count summary in the Index.
+_SCENE_COUNT_ORDER = [
+    ("dialog", "dlg"), ("battle", "btl"), ("sprite_anim", "anim"),
+    ("camera", "cam"), ("item", "item"), ("reaction", "react"),
+    ("wait", "wait"),
+]
+
+
+def _scene_row_label(r: "_SceneRow", ow_name: Optional[str] = None) -> str:
+    """Compact one-line label for an Index scene row: kind + trigger detail
+    + an event-count summary (``NPC slot 4 (0x004b · Phascomon) · 14 dlg``).
+
+    ``ow_name`` (resolved by the caller for OWS rows) names the sprite id in
+    the brackets when the id has a known name."""
+    tag = _SCENE_KIND_TAG.get(r.kind, r.kind)
+    detail = ""
+    if r.kind == TriggerKind.OWS:
+        slot = _between(r.label, "slot=", " ")
+        owid = _between(r.label, "ow_id=", " ")
+        who = f"{owid} · {ow_name}" if ow_name else owid
+        detail = f" slot {slot} ({who})" if slot else ""
+    elif r.kind in (TriggerKind.OTHER, TriggerKind.HANDLER, TriggerKind.EXT):
+        addr = _between(r.label, "@", " ") or _between(r.label, "@", "")
+        detail = f" @{addr}" if addr else ""
+    elif r.kind == TriggerKind.HITBOX:
+        detail = f" #{_int_after(r.label, 'HITBOX#')}"
+    elif r.kind == TriggerKind.EXIT:
+        detail = f" #{_int_after(r.label, 'EXIT_ZONE#')}"
+    parts = [
+        f"{r.counts[k]} {nm}" for k, nm in _SCENE_COUNT_ORDER if r.counts.get(k)
+    ]
+    summary = ("  ·  " + ", ".join(parts)) if parts else ""
+    # A scene sourced from a shared/non-field entry but shown under its host
+    # map gets a marker so it's clear it isn't one of the map's own triggers.
+    shared_mark = "⇱ " if r.shared else ""
+    return f"{shared_mark}{tag}{detail}{summary}"
+
+
 def _parse_trigger_at_offset(label: str) -> Optional[int]:
     """Extract the ``@0x{hex}`` block offset embedded in a trigger label.
 
@@ -1225,6 +1479,213 @@ def _parse_trigger_at_offset(label: str) -> Optional[int]:
         return None
 
 
+# ---- exit-destination helpers -------------------------------------------
+#
+# A map exit's target is the CALL_SCRIPT_AT_OFFSET (op 0x0030) u32 inside
+# its handler script — an absolute overlay5 file offset that points at the
+# destination map entry's start. The Events tab already surfaces this as an
+# editable combo; these helpers mirror that resolution for the Cutscenes
+# tab but render the friendly "warp to map N (Area)" label the user asked
+# for instead of the bare "Map N (entry NNNN)" form.
+
+# Combo sentinel — the "leave as-is / raw offset" row that sits first so a
+# destination the editor can't name still shows something selectable.
+_EXIT_DEST_CUSTOM = -1
+
+
+def _warp_dest_label(map_id: int) -> str:
+    """The user-facing exit-destination string, e.g. ``warp to map 70
+    (Chip Forest)``."""
+    return f"warp to map {map_id} ({area_name(map_id)})"
+
+
+def _resolve_warp_dest(session, file_off: int) -> Tuple[Optional[int], str]:
+    """Resolve an exit handler's op 0x0030 u32 into ``(map_id, label)``.
+
+    ``file_off`` is the absolute overlay5 offset the handler jumps to.
+    When it starts a known field-map entry we return that map id and the
+    ``warp to map N (Area)`` label; otherwise ``(None, raw-hex)`` so the
+    combo can still display whatever's currently set as a Custom row.
+    """
+    if file_off <= 0:
+        return None, ""
+    try:
+        index = session.overlay5_index()
+    except (ValueError, KeyError, AttributeError):
+        return None, f"0x{file_off:08x} (raw)"
+    for entry_ix, start in index.entry_starts.items():
+        if start != file_off:
+            continue
+        map_id = overlay5_mod.map_id_for(entry_ix)
+        if map_id is not None:
+            return map_id, _warp_dest_label(map_id)
+        return None, f"entry {entry_ix:04d} (non-map)"
+    return None, f"0x{file_off:08x} (raw)"
+
+
+def _exit_dest_choices(session) -> List[Tuple[int, str]]:
+    """``[(entry_start_file_off, "warp to map N (Area)"), ...]`` for every
+    field map, sorted by map id — the pickable destinations for an exit.
+
+    Returns an empty list when the session can't produce an overlay5
+    index (headless / test paths); the card falls back to its sticky
+    Custom row so the current destination is still visible.
+    """
+    try:
+        index = session.overlay5_index()
+    except (ValueError, KeyError, AttributeError):
+        return []
+    rows: List[Tuple[int, int, str]] = []
+    for entry_ix, start in index.entry_starts.items():
+        map_id = overlay5_mod.map_id_for(entry_ix)
+        if map_id is None:
+            continue
+        rows.append((map_id, int(start), _warp_dest_label(map_id)))
+    rows.sort(key=lambda r: r[0])
+    return [(start, label) for _mid, start, label in rows]
+
+
+# ---- overworld chest (give-item) helpers --------------------------------
+#
+# A chest is an OVERWORLD_SPRITE (id 0x02fb) whose interaction script sets
+# ARG_1 (SET_VAR var 0x0005) to an item id then CALL_SYS 0x126a. See
+# ``digimon_core.overlay5.replace_chest_item`` + the project memory
+# ``project_overworld_chest_giveitem`` for the full anatomy. We surface the
+# item as the one editable field; the flag / frame check stay read-only.
+
+# How far past the script head to scan for the SET_VAR + CALL_SYS run.
+_CHEST_SCAN_WINDOW = 0x40
+
+
+@dataclass(frozen=True)
+class _ChestInfo:
+    """Decoded give-item data for one chest sprite.
+
+    ``item_value_offset`` is the in-``script_entry_ix`` offset of the ARG_1
+    item u16 — the splice address :class:`EditChestItemCommand` writes.
+    ``flag`` / ``arg2`` / ``arg3`` are shown read-only for context.
+    """
+    script_entry_ix: int
+    item_value_offset: int
+    item_id: int
+    flag: int
+    arg2: int
+    arg3: int
+
+
+def _item_choices() -> List[Tuple[int, str]]:
+    """``[(item_id, "Name (0xID)"), ...]`` for the chest item combo, id-sorted."""
+    return [
+        (iid, f"{name} (0x{iid:02x})")
+        for iid, name in sorted(ITEM_ID_TO_STR.items())
+    ]
+
+
+def _item_display_name(item_id: int) -> str:
+    """Item id → ``"Name (0xID)"`` with a hex fallback for unnamed ids."""
+    name = ITEM_ID_TO_STR.get(int(item_id))
+    if name is None:
+        return f"0x{int(item_id):02x}"
+    return f"{name} (0x{int(item_id):02x})"
+
+
+# ---- slot / target disambiguation ---------------------------------------
+#
+# Scene opcodes address actors by *slot* index. Slots 0..3 are always the
+# player + party digimon 1/2/3; slots 4+ are OVERWORLD_SPRITE placements in
+# the scene (each placement carries its own ``slot``). A slot picker shows
+# the resolved character so you edit "who", not a bare index.
+_FIXED_SLOT_LABELS = {0: "Player", 1: "Party 1", 2: "Party 2", 3: "Party 3"}
+
+
+def _clean_ow_name(raw: str) -> str:
+    """Pull the character name out of a verbose ow-sprite label like
+    ``"0x0226  [OW] OphanimonC - 6f 64×64"`` → ``"OphanimonC"``. Falls back
+    to the raw string when it doesn't match that shape (unnamed sprites)."""
+    s = raw
+    if "[OW]" in s:
+        s = s.split("[OW]", 1)[1]
+    if " - " in s:
+        s = s.split(" - ", 1)[0]
+    s = s.strip()
+    return s or raw
+
+
+def _slot_label(slot_labels: Dict[int, str], slot: int) -> str:
+    """Friendly one-liner for a slot: name if known, else ``slot N``."""
+    slot = int(slot) & 0xFFFF
+    name = slot_labels.get(slot)
+    return f"slot {slot} — {name}" if name else f"slot {slot}"
+
+
+def _populate_slot_combo(
+    combo, slot_labels: Dict[int, str], current: int,
+    referenced: Optional[set] = None,
+) -> None:
+    """Fill an editable combo with ``slot N — Name`` rows (userData=slot),
+    landing on ``current`` (sticky-added when the slot has no known name).
+
+    When ``referenced`` is given and splits the slots (some referenced, some
+    not), the slots this scene's opcodes actually drive are grouped first
+    under a non-selectable ``— in this scene —`` header, with the remaining
+    map-declared slots under ``— other slots —``. This keeps the combo from
+    implying every map sprite is part of the selected cutscene."""
+    combo.clear()
+
+    def _label(slot: int) -> str:
+        nm = slot_labels.get(slot)
+        return f"{slot} — {nm}" if nm else f"{slot} — (no sprite)"
+
+    def _add_header(text: str) -> None:
+        combo.addItem(text)
+        model = combo.model()
+        item = model.item(combo.count() - 1) if model is not None else None
+        if item is not None:
+            item.setFlags(
+                item.flags() & ~Qt.ItemIsSelectable & ~Qt.ItemIsEnabled
+            )
+
+    ref = {int(s) & 0xFFFF for s in (referenced or ())}
+    named = set(slot_labels)
+    in_scene = sorted(named & ref)
+    others = sorted(named - ref)
+    if in_scene and others:
+        _add_header("— in this scene —")
+        for slot in in_scene:
+            combo.addItem(_label(slot), slot)
+        _add_header("— other slots —")
+        for slot in others:
+            combo.addItem(_label(slot), slot)
+    else:
+        for slot in sorted(named):
+            combo.addItem(_label(slot), slot)
+
+    cur = int(current) & 0xFFFF
+    ix = combo.findData(cur)
+    if ix < 0:
+        combo.addItem(f"{cur} — (no sprite)", cur)
+        ix = combo.findData(cur)
+    combo.setCurrentIndex(ix)
+
+
+def _slot_combo_value(combo) -> Optional[int]:
+    """Resolve a slot combo to its slot index.
+
+    The display text always leads with the slot number — both a picked
+    row (``"4 — OphanimonC"``) and a freshly-typed value (``"7"`` /
+    ``"0x10"``) — so parse that. A typed value leaves ``currentData``
+    stale, which is why the text is the source of truth; userData is only
+    a fallback when the text can't be parsed.
+    """
+    txt = (combo.currentText() or "").strip()
+    tok = txt.split()[0] if txt else ""
+    try:
+        return int(tok, 0) & 0xFFFF
+    except ValueError:
+        data = combo.currentData()
+        return int(data) & 0xFFFF if data is not None else None
+
+
 # ---- wheel-ignoring input widgets ---------------------------------------
 #
 # Qt's default QSpinBox and QComboBox capture the mouse wheel and shift
@@ -1245,6 +1706,52 @@ class _NoWheelSpinBox(QSpinBox):
 class _NoWheelComboBox(QComboBox):
     def wheelEvent(self, event) -> None:  # noqa: D401
         event.ignore()
+
+
+class _CollapsibleSection(QWidget):
+    """A click-to-expand section — a header toggle + a hidden content
+    column. Used to tuck the chain's script/debug details (handler
+    summary, path, unmapped opcodes) out of the way so the editable
+    events read first; collapsed by default.
+    """
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 4, 0, 0)
+        outer.setSpacing(0)
+        self._btn = QToolButton()
+        self._btn.setText(title)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(False)
+        self._btn.setCursor(Qt.PointingHandCursor)
+        self._btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn.setArrowType(Qt.RightArrow)
+        self._btn.setStyleSheet(
+            "QToolButton { border: none; color: #9a9a9a; font-weight: 600;"
+            " font-size: 11px; padding: 3px 0; text-align: left; }"
+            "QToolButton:hover { color: #cccccc; }"
+        )
+        self._btn.toggled.connect(self._on_toggled)
+        outer.addWidget(self._btn, 0)
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(4)
+        self._content.setVisible(False)
+        outer.addWidget(self._content, 0)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self._content.setVisible(checked)
+
+    def add_html(self, html_str: str) -> None:
+        label = QLabel(_HTML_STYLE + html_str)
+        label.setTextFormat(Qt.RichText)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._content_layout.addWidget(label)
 
 
 class _DialogCard(QFrame):
@@ -1663,6 +2170,12 @@ def _card_style_for(class_name: str, alt: bool) -> str:
 class _MusicCard(QFrame):
     """Inline editable card for a ``0e 00 [music_id]`` SET_MUSIC block.
 
+    DORMANT: currently unreachable. The events walker no longer emits
+    ``EVENT_KIND_SET_MUSIC`` (``overlay5.SURFACE_SET_MUSIC_EVENTS`` is
+    off) because ``0e 00`` isn't reliably a SET_MUSIC opcode — it mostly
+    latches onto mid-instruction bytes. Kept intact so re-enabling the
+    flag restores the card once ``0e 00`` detection is trustworthy.
+
     One combo (BGM name) + a muted footer with the entry/offset. The
     combo enumerates every BGM slot the session's SDAT exposes
     (vanilla + user-staged "Add As New Entry" additions) via
@@ -2002,6 +2515,12 @@ class _BattleCard(QFrame):
         self._info.setStyleSheet("color: #888; font-size: 10px;")
         outer.addWidget(self._info, 0)
 
+        # Sprite VRAM budget: scripted battles skip the wild roll's
+        # Σ fs ≤ 1440 cap, so an over-budget enemy set crashes on load.
+        self._budget_label = QLabel()
+        self._budget_label.setWordWrap(True)
+        outer.addWidget(self._budget_label, 0)
+
         self._refresh_from_block(self._battle_block)
         QTimer.singleShot(0, self._attach_enemy_combo_models)
 
@@ -2039,6 +2558,42 @@ class _BattleCard(QFrame):
         self._info.setText(
             f"entry {self._entry_ix:04d} + 0x{self._block_offset:04x}"
             f"  ({block.total_size} bytes)"
+        )
+        self._refresh_battle_budget(block)
+
+    def _refresh_battle_budget(self, block) -> None:
+        """Show the enemy set's summed sprite footprint vs the VRAM budget.
+
+        Each non-empty slot's fs is resolved from the enemy's displayed
+        battle sprite (id -> sprite_map.main_sprite -> group footprint).
+        Scripted battles bypass the wild roll's Σ fs ≤ 1440 cap, so an
+        over-budget set overflows the shared OBJ VRAM pool and crashes on
+        load — flag it red. Unresolvable ids are counted as "+N?".
+        """
+        total = 0
+        unknown = 0
+        active = 0
+        for slot_ix in range(overlay5_mod.BATTLE_ENEMY_SLOTS):
+            eid = int(block.enemies[slot_ix]) & 0xFFFF
+            if eid == overlay5_mod.BATTLE_ENEMY_EMPTY:
+                continue
+            active += 1
+            fs = self._session.digimon_battle_footprint(eid)
+            if fs is None:
+                unknown += 1
+            else:
+                total += fs
+        if active == 0:
+            self._budget_label.setText("")
+            return
+        budget = BATTLE_SPRITE_TILE_BUDGET
+        over = total > budget
+        unk = f" +{unknown}?" if unknown else ""
+        color = "#c0392b" if over else "#888"
+        tail = " — over VRAM pool, crashes on load" if over else ""
+        self._budget_label.setStyleSheet(f"color: {color}; font-size: 10px;")
+        self._budget_label.setText(
+            f"sprite VRAM: {total}{unk} / {budget} tiles{tail}"
         )
 
     def _set_enemy_combo(self, combo: QComboBox, enemy_id: int) -> None:
@@ -2164,6 +2719,785 @@ class _BattleCard(QFrame):
         self._undo_stack.push(cmd)
 
 
+class _WaitCard(QFrame):
+    """Inline card for WAIT_FRAMES (``05 00 [frames]``) — a cutscene pause.
+
+    The dispatcher counts the frame value down each frame before running
+    the actor's script again, so this is the pacing knob between beats.
+    """
+
+    def __init__(self, session, undo_stack, entry_ix, block, alt=False, parent=None, slot_labels=None, referenced_slots=None, slot_ow_ids=None):
+        super().__init__(parent)
+        self._session = session
+        self._undo_stack = undo_stack
+        self._entry_ix = int(entry_ix)
+        self._block = block
+        self._block_offset = int(block.block_offset)
+        self._syncing = False
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_WaitCard", alt))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        tag = QLabel("⏱ Wait")
+        tag.setStyleSheet("color: #cccccc; font-weight: bold;")
+        row.addWidget(tag, 0)
+        self._spin = _NoWheelSpinBox()
+        self._spin.setRange(0, 0xFFFF)
+        self._spin.setKeyboardTracking(False)
+        self._spin.setSuffix(" frames")
+        self._spin.setMaximumWidth(130)
+        self._spin.editingFinished.connect(self._on_committed)
+        row.addWidget(self._spin, 0)
+        row.addStretch(1)
+        outer.addLayout(row)
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        outer.addWidget(self._info, 0)
+        self._refresh_from_block(block)
+
+    def refresh(self):
+        try:
+            eb = self._session.overlay5_entry_bytes(self._entry_ix)
+            self._block = overlay5_mod.WaitFramesBlock.from_bytes(
+                eb, self._block_offset,
+            )
+        except (ValueError, IndexError):
+            return
+        self._refresh_from_block(self._block)
+
+    def flush_pending(self):
+        return
+
+    def _refresh_from_block(self, block):
+        self._syncing = True
+        try:
+            self._spin.setValue(int(block.frames) & 0xFFFF)
+        finally:
+            self._syncing = False
+        self._info.setText(
+            f"~{int(block.frames) / 60.0:.2f}s @60fps  ·  "
+            f"entry {self._entry_ix:04d} + 0x{self._block_offset:04x}"
+        )
+
+    def _on_committed(self):
+        if self._syncing or self._undo_stack is None:
+            return
+        new = int(self._spin.value()) & 0xFFFF
+        if new == int(self._block.frames) & 0xFFFF:
+            return
+        self._undo_stack.push(EditScriptFieldCommand(
+            self._session, self._entry_ix, self._block_offset, 2, new,
+            overlay5_mod.WAIT_FRAMES_OPCODE,
+            description=f"Set wait to {new} frames",
+            on_change=lambda _v: self.refresh(),
+        ))
+
+
+class _SpriteAnimCard(QFrame):
+    """Inline card for SET_SPRITE_ANIM (``64 00 [sprite] [anim]``).
+
+    ``sprite`` is a scene slot id (same space as DIALOG.target); ``anim``
+    directly indexes the target sprite's MCHR_ANM animation list (verified
+    against scene data — low ids tend to be 8-way facing, higher ones named
+    poses like 0x18 head-nod). The card resolves the slot to its overworld
+    sprite so it can show a thumbnail, list the sprite's real animations, and
+    play the selected one — the same MCHR playback the overworld editor has,
+    trimmed to a preview.
+    """
+
+    _THUMB = 52
+    _PLAY_FPS = 60   # flatten already encodes per-frame duration → play real-time
+
+    def __init__(self, session, undo_stack, entry_ix, block, alt=False, parent=None, slot_labels=None, referenced_slots=None, slot_ow_ids=None):
+        super().__init__(parent)
+        self._session = session
+        self._undo_stack = undo_stack
+        self._entry_ix = int(entry_ix)
+        self._block = block
+        self._block_offset = int(block.block_offset)
+        self._slot_labels = slot_labels or {}
+        self._referenced_slots = referenced_slots or set()
+        self._slot_ow_ids = slot_ow_ids or {}
+        self._syncing = False
+        self._animations = []          # MchrAnimation list for the current sprite
+        self._play_frames = []         # flattened frames of the selected anim
+        self._play_ix = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._on_play_tick)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_SpriteAnimCard", alt))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        tag = QLabel("\U0001f3ac Sprite anim")
+        tag.setStyleSheet("color: #cccccc; font-weight: bold;")
+        outer.addWidget(tag, 0)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self._thumb = QLabel()
+        self._thumb.setFixedSize(self._THUMB, self._THUMB)
+        self._thumb.setAlignment(Qt.AlignCenter)
+        self._thumb.setStyleSheet(
+            "QLabel { border: 1px solid #1f1f23; background: #1e1e21; }"
+        )
+        row.addWidget(self._thumb, 0)
+
+        fields = QVBoxLayout()
+        fields.setContentsMargins(0, 0, 0, 0)
+        fields.setSpacing(3)
+        who_row = QHBoxLayout()
+        who_row.setContentsMargins(0, 0, 0, 0)
+        who_row.setSpacing(6)
+        who_row.addWidget(QLabel("who"), 0)
+        self._sprite = _NoWheelComboBox()
+        self._sprite.setEditable(True)
+        self._sprite.setInsertPolicy(QComboBox.NoInsert)
+        self._sprite.setMinimumWidth(150)
+        self._sprite.setMaxVisibleItems(20)
+        self._sprite.currentIndexChanged.connect(self._on_sprite_changed)
+        self._sprite.lineEdit().editingFinished.connect(self._on_sprite_changed)
+        who_row.addWidget(self._sprite, 1)
+        fields.addLayout(who_row)
+
+        anim_row = QHBoxLayout()
+        anim_row.setContentsMargins(0, 0, 0, 0)
+        anim_row.setSpacing(6)
+        anim_row.addWidget(QLabel("anim"), 0)
+        self._anim = _NoWheelComboBox()
+        self._anim.setEditable(True)
+        self._anim.setInsertPolicy(QComboBox.NoInsert)
+        self._anim.setMinimumWidth(150)
+        self._anim.setMaxVisibleItems(20)
+        self._anim.currentIndexChanged.connect(lambda _i: self._commit("anim", 4))
+        self._anim.lineEdit().editingFinished.connect(lambda: self._commit("anim", 4))
+        anim_row.addWidget(self._anim, 1)
+        self._play_btn = QPushButton("▶")
+        self._play_btn.setCheckable(True)
+        self._play_btn.setMaximumWidth(32)
+        self._play_btn.setToolTip("Play / stop this animation")
+        self._play_btn.toggled.connect(self._on_play_toggled)
+        anim_row.addWidget(self._play_btn, 0)
+        fields.addLayout(anim_row)
+        row.addLayout(fields, 1)
+        outer.addLayout(row)
+
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        outer.addWidget(self._info, 0)
+        self._refresh_from_block(block)
+
+    # ---- current-sprite resolution ---------------------------------------
+
+    def _current_ow_id(self) -> Optional[int]:
+        slot = _slot_combo_value(self._sprite)
+        if slot is None:
+            slot = int(self._block.sprite) & 0xFFFF
+        return self._slot_ow_ids.get(int(slot))
+
+    def _reload_sprite(self) -> None:
+        """Repopulate the anim dropdown + thumbnail for the current 'who'.
+
+        Called on first render and whenever the slot changes. Guarded by
+        ``_syncing`` so the anim combo's repopulation doesn't fire a spurious
+        commit."""
+        self._stop_playback()
+        ow_id = self._current_ow_id()
+        self._animations = (
+            self._session.mchr_animations_for_ow(ow_id) if ow_id is not None else []
+        )
+        cur_anim = int(self._block.anim) & 0xFFFF
+        self._syncing = True
+        try:
+            self._anim.clear()
+            for i, an in enumerate(self._animations):
+                n = len(an.frames)
+                self._anim.addItem(
+                    f"0x{i:02x} — anim {i} ({n}f)", i,
+                )
+            ix = self._anim.findData(cur_anim)
+            if ix < 0:
+                # id outside this sprite's animation table — keep it editable
+                self._anim.addItem(f"0x{cur_anim:02x}", cur_anim)
+                ix = self._anim.findData(cur_anim)
+            self._anim.setCurrentIndex(ix)
+        finally:
+            self._syncing = False
+        self._update_thumb_static()
+        playable = 0 <= cur_anim < len(self._animations)
+        self._play_btn.setEnabled(playable)
+
+    def _update_thumb_static(self) -> None:
+        """Show a still frame of the current sprite (first frame of the
+        selected animation when resolvable, else the sprite's default)."""
+        ow_id = self._current_ow_id()
+        if ow_id is None:
+            self._thumb.clear()
+            return
+        anim_id = _slot_combo_value(self._anim)
+        frame = None
+        if anim_id is not None and 0 <= anim_id < len(self._animations):
+            frames = self._animations[anim_id].frames
+            if frames:
+                frame = int(frames[0].frame)
+        pix = self._session.mchr_sprite_pixmap_by_ow_id(
+            int(ow_id), max_size=self._THUMB - 4, frame=frame,
+        )
+        self._thumb.setPixmap(pix) if pix is not None else self._thumb.clear()
+
+    # ---- playback --------------------------------------------------------
+
+    def _on_play_toggled(self, checked: bool) -> None:
+        if checked:
+            self._start_playback()
+        else:
+            self._stop_playback()
+
+    def _start_playback(self) -> None:
+        anim_id = _slot_combo_value(self._anim)
+        if anim_id is None or not (0 <= anim_id < len(self._animations)):
+            self._play_btn.setChecked(False)
+            return
+        from digimon_core import mchr_anm
+        # flatten_animation already expands each frame by its duration into one
+        # entry per NDS tick, so we advance one entry per FIXED-interval tick
+        # (same as the overworld editor) — not a duration-scaled interval, or
+        # the per-frame hold gets squared and playback looks frozen.
+        self._play_frames = mchr_anm.flatten_animation(self._animations[anim_id])
+        if not self._play_frames:
+            self._play_btn.setChecked(False)
+            return
+        self._play_ix = 0
+        self._play_btn.setText("■")
+        self._paint_play_frame()
+        self._timer.start(max(1, 1000 // self._PLAY_FPS))
+
+    def _stop_playback(self) -> None:
+        if self._timer.isActive():
+            self._timer.stop()
+        self._play_btn.blockSignals(True)
+        self._play_btn.setChecked(False)
+        self._play_btn.setText("▶")
+        self._play_btn.blockSignals(False)
+        self._update_thumb_static()
+
+    def _on_play_tick(self) -> None:
+        if not self._play_frames:
+            return
+        self._play_ix = (self._play_ix + 1) % len(self._play_frames)
+        self._paint_play_frame()
+
+    def _paint_play_frame(self) -> None:
+        ow_id = self._current_ow_id()
+        if ow_id is None:
+            return
+        fr = self._play_frames[self._play_ix % len(self._play_frames)]
+        pix = self._session.mchr_sprite_pixmap_by_ow_id(
+            int(ow_id), max_size=self._THUMB - 4, frame=int(fr.frame),
+        )
+        if pix is not None:
+            self._thumb.setPixmap(pix)
+
+    # ---- edit plumbing ---------------------------------------------------
+
+    def refresh(self):
+        try:
+            eb = self._session.overlay5_entry_bytes(self._entry_ix)
+            self._block = overlay5_mod.SpriteAnimBlock.from_bytes(
+                eb, self._block_offset,
+            )
+        except (ValueError, IndexError):
+            return
+        self._refresh_from_block(self._block)
+
+    def flush_pending(self):
+        self._stop_playback()
+
+    def _refresh_from_block(self, block):
+        self._syncing = True
+        try:
+            _populate_slot_combo(
+                self._sprite, self._slot_labels, int(block.sprite) & 0xFFFF,
+                self._referenced_slots,
+            )
+        finally:
+            self._syncing = False
+        self._reload_sprite()
+        n_anim = len(self._animations)
+        avail = f"  ·  {n_anim} anim" if n_anim else "  ·  no MCHR anim"
+        self._info.setText(
+            f"entry {self._entry_ix:04d} + 0x{self._block_offset:04x}{avail}"
+        )
+
+    def _on_sprite_changed(self, *_a) -> None:
+        # The slot drives both the committed value and which sprite's
+        # animations/thumbnail we show, so commit then reload for the new who.
+        self._commit("sprite", 2)
+        if not self._syncing:
+            self._reload_sprite()
+
+    def _commit(self, field, field_off):
+        if self._syncing or self._undo_stack is None:
+            return
+        cur = int(getattr(self._block, field)) & 0xFFFF
+        if field == "sprite":
+            new = _slot_combo_value(self._sprite)
+        else:
+            new = _slot_combo_value(self._anim)
+            self._update_thumb_static()
+        if new is None or new == cur:
+            return
+        self._undo_stack.push(EditScriptFieldCommand(
+            self._session, self._entry_ix, self._block_offset, field_off, new,
+            overlay5_mod.SPRITE_ANIM_OPCODE,
+            description=f"Set sprite {field}",
+            on_change=lambda _v: self.refresh(),
+        ))
+
+
+class _CameraCard(QFrame):
+    """Inline card for a camera pan — CAMERA_PAN_TO_TARGET (``40 00 tgt
+    speed``) or CAMERA_PAN_TO_XY (``c2 00 x y speed``). ``speed`` 0xFFFF
+    resets the camera."""
+
+    def __init__(self, session, undo_stack, entry_ix, block, alt=False, parent=None, slot_labels=None, referenced_slots=None, slot_ow_ids=None):
+        super().__init__(parent)
+        self._session = session
+        self._undo_stack = undo_stack
+        self._entry_ix = int(entry_ix)
+        self._block = block
+        self._block_offset = int(block.block_offset)
+        self._is_xy = bool(block.is_xy)
+        self._opcode = int(block.opcode)
+        self._slot_labels = slot_labels or {}
+        self._referenced_slots = referenced_slots or set()
+        self._syncing = False
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_CameraCard", alt))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        tag = QLabel(
+            "\U0001f3a5 Camera pan → point" if self._is_xy
+            else "\U0001f3a5 Camera pan → target"
+        )
+        tag.setStyleSheet("color: #cccccc; font-weight: bold;")
+        outer.addWidget(tag, 0)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        # a = target slot (0x40, a "who" picker) or x-coord (0xC2, spinbox);
+        # b = y-coord (0xC2 only).
+        if self._is_xy:
+            self._a = _NoWheelSpinBox()
+            self._a.setRange(0, 0xFFFF)
+            self._a.setKeyboardTracking(False)
+            self._a.setMaximumWidth(80)
+            self._a.editingFinished.connect(lambda: self._commit("a", 2))
+            row.addWidget(QLabel("x"), 0)
+            row.addWidget(self._a, 0)
+            row.addWidget(QLabel("y"), 0)
+            self._b = _NoWheelSpinBox()
+            self._b.setRange(0, 0xFFFF)
+            self._b.setKeyboardTracking(False)
+            self._b.setMaximumWidth(80)
+            self._b.editingFinished.connect(lambda: self._commit("b", 4))
+            row.addWidget(self._b, 0)
+            speed_off = 6
+        else:
+            row.addWidget(QLabel("who"), 0)
+            self._a = _NoWheelComboBox()
+            self._a.setEditable(True)
+            self._a.setInsertPolicy(QComboBox.NoInsert)
+            self._a.setMinimumWidth(150)
+            self._a.setMaxVisibleItems(20)
+            self._a.currentIndexChanged.connect(
+                lambda _i: self._commit("a", 2)
+            )
+            self._a.lineEdit().editingFinished.connect(
+                lambda: self._commit("a", 2)
+            )
+            row.addWidget(self._a, 1)
+            self._b = None
+            speed_off = 4
+        row.addWidget(QLabel("speed"), 0)
+        self._speed = _NoWheelSpinBox()
+        self._speed.setRange(0, 0xFFFF)
+        self._speed.setKeyboardTracking(False)
+        self._speed.setMaximumWidth(80)
+        self._speed.editingFinished.connect(
+            lambda: self._commit("speed", speed_off)
+        )
+        row.addWidget(self._speed, 0)
+        row.addStretch(1)
+        outer.addLayout(row)
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        outer.addWidget(self._info, 0)
+        self._refresh_from_block(block)
+
+    def refresh(self):
+        try:
+            eb = self._session.overlay5_entry_bytes(self._entry_ix)
+            self._block = overlay5_mod.CameraBlock.from_bytes(
+                eb, self._block_offset,
+            )
+        except (ValueError, IndexError):
+            return
+        self._refresh_from_block(self._block)
+
+    def flush_pending(self):
+        return
+
+    def _refresh_from_block(self, block):
+        self._syncing = True
+        try:
+            if self._is_xy:
+                self._a.setValue(int(block.a) & 0xFFFF)
+                self._b.setValue(int(block.b) & 0xFFFF)
+            else:
+                _populate_slot_combo(
+                    self._a, self._slot_labels, int(block.a) & 0xFFFF,
+                    self._referenced_slots,
+                )
+            self._speed.setValue(int(block.speed) & 0xFFFF)
+        finally:
+            self._syncing = False
+        reset = "  ·  speed 0xFFFF = reset camera" if int(block.speed) == 0xFFFF else ""
+        self._info.setText(
+            f"entry {self._entry_ix:04d} + 0x{self._block_offset:04x}{reset}"
+        )
+
+    def _commit(self, field, field_off):
+        if self._syncing or self._undo_stack is None:
+            return
+        cur = int(getattr(self._block, field)) & 0xFFFF
+        if field == "a" and not self._is_xy:
+            new = _slot_combo_value(self._a)
+            if new is None:
+                return
+        else:
+            widget = {"a": self._a, "b": self._b, "speed": self._speed}[field]
+            if widget is None:
+                return
+            new = int(widget.value()) & 0xFFFF
+        if new == cur:
+            return
+        self._undo_stack.push(EditScriptFieldCommand(
+            self._session, self._entry_ix, self._block_offset, field_off, new,
+            self._opcode,
+            description="Edit camera pan",
+            on_change=lambda _v: self.refresh(),
+        ))
+
+
+class _ItemEventCard(QFrame):
+    """Inline card for GIVE_ITEM (``b4 00 [item]``) / REMOVE_ITEM
+    (``f1 00 [item]``) — an item handed to or taken from the player mid-
+    scene (e.g. a quest turn-in)."""
+
+    def __init__(self, session, undo_stack, entry_ix, block, alt=False, parent=None, slot_labels=None, referenced_slots=None, slot_ow_ids=None):
+        super().__init__(parent)
+        self._session = session
+        self._undo_stack = undo_stack
+        self._entry_ix = int(entry_ix)
+        self._block = block
+        self._block_offset = int(block.block_offset)
+        self._opcode = int(block.opcode)
+        self._is_remove = bool(block.is_remove)
+        self._syncing = False
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_ItemEventCard", alt))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        tag = QLabel("\U0001f381 Remove item" if self._is_remove else "\U0001f381 Add item")  # 🎁
+        tag.setStyleSheet("color: #cccccc; font-weight: bold;")
+        row.addWidget(tag, 0)
+        self._combo = _NoWheelComboBox()
+        self._combo.setEditable(True)
+        self._combo.setInsertPolicy(QComboBox.NoInsert)
+        self._combo.setMaxVisibleItems(20)
+        self._combo.setMinimumContentsLength(16)
+        for iid, label in _item_choices():
+            self._combo.addItem(label, iid)
+        comp = QCompleter(self._combo)
+        comp.setCaseSensitivity(Qt.CaseInsensitive)
+        comp.setFilterMode(Qt.MatchContains)
+        comp.setCompletionMode(QCompleter.PopupCompletion)
+        comp.setModel(self._combo.model())
+        self._combo.setCompleter(comp)
+        self._combo.currentIndexChanged.connect(self._on_committed)
+        row.addWidget(self._combo, 1)
+        outer.addLayout(row)
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        outer.addWidget(self._info, 0)
+        self._refresh_from_block(block)
+
+    def refresh(self):
+        try:
+            eb = self._session.overlay5_entry_bytes(self._entry_ix)
+            self._block = overlay5_mod.ItemBlock.from_bytes(
+                eb, self._block_offset,
+            )
+        except (ValueError, IndexError):
+            return
+        self._refresh_from_block(self._block)
+
+    def flush_pending(self):
+        return
+
+    def _refresh_from_block(self, block):
+        self._syncing = True
+        try:
+            iid = int(block.item) & 0xFFFF
+            ix = self._combo.findData(iid)
+            if ix < 0:
+                self._combo.addItem(f"(unknown 0x{iid:02x})", iid)
+                ix = self._combo.findData(iid)
+            self._combo.setCurrentIndex(ix)
+        finally:
+            self._syncing = False
+        verb = "removed from" if self._is_remove else "added to"
+        self._info.setText(
+            f"{verb} bag  ·  entry {self._entry_ix:04d}"
+            f" + 0x{self._block_offset:04x}"
+        )
+
+    def _on_committed(self, _ix=-1):
+        if self._syncing or self._undo_stack is None:
+            return
+        val = self._combo.currentData()
+        if val is None:
+            return
+        new = int(val) & 0xFFFF
+        if new == int(self._block.item) & 0xFFFF:
+            return
+        verb = "Remove" if self._is_remove else "Give"
+        self._undo_stack.push(EditScriptFieldCommand(
+            self._session, self._entry_ix, self._block_offset, 2, new,
+            self._opcode,
+            description=f"{verb} item → {_item_display_name(new)}",
+            on_change=lambda _v: self.refresh(),
+        ))
+
+
+class _MoveCard(QFrame):
+    """Inline card for MOVE_BEGIN (``3C 00 [tgt] [type] [x] [y] [speed]``) —
+    start walking a sprite to a destination.
+
+    ``who`` (tgt) is the moved slot; ``x``/``y`` are the destination position
+    for the common walk type (``0xFFFF`` = leave that axis unchanged);
+    ``speed`` ``0xFFFF`` snaps instantly. ``type`` is an undecoded mode enum,
+    exposed raw so it round-trips without pretending to know its meaning.
+    """
+
+    def __init__(self, session, undo_stack, entry_ix, block, alt=False, parent=None, slot_labels=None, referenced_slots=None, slot_ow_ids=None):
+        super().__init__(parent)
+        self._session = session
+        self._undo_stack = undo_stack
+        self._entry_ix = int(entry_ix)
+        self._block = block
+        self._block_offset = int(block.block_offset)
+        self._slot_labels = slot_labels or {}
+        self._referenced_slots = referenced_slots or set()
+        self._syncing = False
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_MoveCard", alt))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        tag = QLabel("➡️ Move")
+        tag.setStyleSheet("color: #cccccc; font-weight: bold;")
+        outer.addWidget(tag, 0)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(QLabel("who"), 0)
+        self._who = _NoWheelComboBox()
+        self._who.setEditable(True)
+        self._who.setInsertPolicy(QComboBox.NoInsert)
+        self._who.setMinimumWidth(140)
+        self._who.setMaxVisibleItems(20)
+        self._who.currentIndexChanged.connect(lambda _i: self._commit("tgt", 2))
+        self._who.lineEdit().editingFinished.connect(lambda: self._commit("tgt", 2))
+        row.addWidget(self._who, 1)
+        outer.addLayout(row)
+
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(6)
+        self._x = self._coord_spin()
+        self._y = self._coord_spin()
+        self._speed = self._coord_spin()
+        self._type = _NoWheelSpinBox()
+        self._type.setRange(0, 0xFFFF)
+        self._type.setKeyboardTracking(False)
+        self._type.setDisplayIntegerBase(16)
+        self._type.setPrefix("0x")
+        self._type.setMaximumWidth(70)
+        self._type.editingFinished.connect(lambda: self._commit("move_type", 4))
+        for lbl, w in (("x", self._x), ("y", self._y),
+                       ("speed", self._speed), ("type", self._type)):
+            row2.addWidget(QLabel(lbl), 0)
+            row2.addWidget(w, 0)
+        self._x.editingFinished.connect(lambda: self._commit("x", 6))
+        self._y.editingFinished.connect(lambda: self._commit("y", 8))
+        self._speed.editingFinished.connect(lambda: self._commit("speed", 10))
+        row2.addStretch(1)
+        outer.addLayout(row2)
+
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        outer.addWidget(self._info, 0)
+        self._refresh_from_block(block)
+
+    @staticmethod
+    def _coord_spin():
+        sp = _NoWheelSpinBox()
+        sp.setRange(0, 0xFFFF)
+        sp.setKeyboardTracking(False)
+        sp.setMaximumWidth(70)
+        return sp
+
+    def refresh(self):
+        try:
+            eb = self._session.overlay5_entry_bytes(self._entry_ix)
+            self._block = overlay5_mod.MoveBeginBlock.from_bytes(
+                eb, self._block_offset,
+            )
+        except (ValueError, IndexError):
+            return
+        self._refresh_from_block(self._block)
+
+    def flush_pending(self):
+        return
+
+    def _refresh_from_block(self, block):
+        self._syncing = True
+        try:
+            _populate_slot_combo(
+                self._who, self._slot_labels, int(block.tgt) & 0xFFFF,
+                self._referenced_slots,
+            )
+            self._x.setValue(int(block.x) & 0xFFFF)
+            self._y.setValue(int(block.y) & 0xFFFF)
+            self._speed.setValue(int(block.speed) & 0xFFFF)
+            self._type.setValue(int(block.move_type) & 0xFFFF)
+        finally:
+            self._syncing = False
+        dest = "current" if block.x == 0xFFFF and block.y == 0xFFFF else f"({block.x}, {block.y})"
+        snap = "  ·  speed 0xFFFF = snap" if int(block.speed) == 0xFFFF else ""
+        self._info.setText(
+            f"walk to {dest}  ·  0xFFFF x/y = keep axis{snap}"
+            f"  ·  entry {self._entry_ix:04d} + 0x{self._block_offset:04x}"
+        )
+
+    def _commit(self, field, field_off):
+        if self._syncing or self._undo_stack is None:
+            return
+        cur = int(getattr(self._block, field)) & 0xFFFF
+        if field == "tgt":
+            new = _slot_combo_value(self._who)
+        else:
+            widget = {"move_type": self._type, "x": self._x,
+                      "y": self._y, "speed": self._speed}[field]
+            new = int(widget.value()) & 0xFFFF
+        if new is None or new == cur:
+            return
+        self._undo_stack.push(EditScriptFieldCommand(
+            self._session, self._entry_ix, self._block_offset, field_off, new,
+            overlay5_mod.MOVE_BEGIN_OPCODE,
+            description=f"Edit move {field}",
+            on_change=lambda _v: self.refresh(),
+        ))
+
+
+_CONTROL_ICONS = {
+    "branch": "❓",       # ❓  condition / if
+    "flag": "\U0001f516",     # 🔖  story-flag bookmark
+    "set_var": "\U0001f522",  # 🔢  set variable
+    "call_if": "❓",
+}
+_CONTROL_TITLES = {
+    "branch": "If", "flag": "Story flag", "set_var": "Set var",
+    "call_if": "Conditional call",
+}
+
+
+class _ControlCard(QFrame):
+    """Read-only view of a flag/branch control opcode — the gating that
+    decides when a scene runs and what story state it sets (CMP_BRANCH,
+    SET_VAR, FLAG_SET_OR_CLEAR, IFEQ, CALL_IF_EQ).
+
+    Not editable yet (by request — view only). Shows the decoded condition
+    plus the raw bytes + offset so it's traceable back to the script dump.
+    """
+
+    def __init__(self, session, undo_stack, entry_ix, block, alt=False, parent=None, slot_labels=None, referenced_slots=None, slot_ow_ids=None):
+        super().__init__(parent)
+        self._session = session
+        self._entry_ix = int(entry_ix)
+        self._block = block
+        self._block_offset = int(block.block_offset)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_ControlCard", alt))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(3)
+        cat = block.category
+        tag = QLabel(f"{_CONTROL_ICONS.get(cat, '⑂')} {_CONTROL_TITLES.get(cat, cat)}"
+                     "   ·   read-only")
+        tag.setStyleSheet("color: #cccccc; font-weight: bold;")
+        outer.addWidget(tag, 0)
+        self._desc = QLabel()
+        self._desc.setWordWrap(True)
+        self._desc.setStyleSheet("color: #dcdcaa;")
+        outer.addWidget(self._desc, 0)
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        outer.addWidget(self._info, 0)
+        self._refresh_from_block(block)
+
+    def refresh(self):
+        try:
+            eb = self._session.overlay5_entry_bytes(self._entry_ix)
+            self._block = overlay5_mod.ControlBlock.from_bytes(
+                eb, self._block_offset,
+            )
+        except (ValueError, IndexError):
+            return
+        self._refresh_from_block(self._block)
+
+    def flush_pending(self):
+        return
+
+    def _refresh_from_block(self, block):
+        self._desc.setText(block.describe())
+        size = overlay5_mod.CONTROL_OPCODE_SIZES.get(block.opcode, 2)
+        try:
+            raw = self._session.overlay5_entry_bytes(self._entry_ix)[
+                self._block_offset:self._block_offset + size
+            ]
+            raw_hex = " ".join(f"{b:02x}" for b in raw)
+        except (ValueError, IndexError):
+            raw_hex = ""
+        self._info.setText(
+            f"op 0x{block.opcode:02x}  ·  {raw_hex}  ·  "
+            f"entry {self._entry_ix:04d} + 0x{self._block_offset:04x}"
+        )
+
+
 class _SpriteEditorCard(QFrame):
     """Inline editable card for the selected OVERWORLD_SPRITE placement.
 
@@ -2234,7 +3568,9 @@ class _SpriteEditorCard(QFrame):
             QComboBox.AdjustToMinimumContentsLengthWithIcon,
         )
         self._id_combo.setMinimumContentsLength(14)
-        mchr_model = self._session.picker_model("mchr")
+        # ow-id space (UserRole == overworld_sprite_id), not CHR index —
+        # matches how the placement is stored + rendered.
+        mchr_model = self._session.picker_model("mchr_ow")
         if mchr_model is not None:
             self._id_combo.setModel(mchr_model)
         id_completer = QCompleter(self._id_combo)
@@ -2352,6 +3688,243 @@ class _SpriteEditorCard(QFrame):
         )
 
 
+class _ExitDestinationCard(QFrame):
+    """Inline editable card for a map-exit's warp destination.
+
+    Surfaces the exit handler's CALL_SCRIPT_AT_OFFSET target (op 0x0030
+    u32) as a ``warp to map N (Area)`` dropdown so the user can repoint an
+    exit without leaving the Cutscenes panel. Mirrors
+    :class:`_SpriteEditorCard`: bound to a handler location at
+    construction, re-synced via :meth:`sync_state` after undo/redo lands.
+
+    Shared-handler caveat (same as :class:`EditExitDestinationCommand`):
+    several 0x001b zones can point at one handler, so an edit here moves
+    every exit that shares it — the tab repaints all of them together.
+    """
+
+    def __init__(
+        self,
+        session,
+        undo_stack,
+        block_offset: int,
+        handler_entry_ix: int,
+        handler_rel_offset: int,
+        current_dest: int,
+        choices: List[Tuple[int, str]],
+        on_dest_commit,
+        alt: bool = False,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._session = session
+        self._undo_stack = undo_stack
+        self._block_offset = int(block_offset)
+        self._handler_entry_ix = int(handler_entry_ix)
+        self._handler_rel_offset = int(handler_rel_offset)
+        self._current_dest = int(current_dest) & 0xFFFFFFFF
+        self._on_dest_commit = on_dest_commit
+        self._syncing: bool = False
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_ExitDestinationCard", alt))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+
+        header = QLabel("\U0001f6aa Exit destination")
+        header.setStyleSheet("color: #cccccc; font-weight: bold;")
+        outer.addWidget(header, 0)
+
+        self._combo = _NoWheelComboBox()
+        self._combo.setMaxVisibleItems(24)
+        self._combo.setMinimumWidth(240)
+        self._combo.addItem(
+            "Custom (raw offset) — leave as-is", _EXIT_DEST_CUSTOM,
+        )
+        for file_off, label in choices:
+            self._combo.addItem(label, int(file_off))
+        self._combo.currentIndexChanged.connect(self._on_committed)
+        outer.addWidget(self._combo, 0)
+
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        self._info.setWordWrap(True)
+        outer.addWidget(self._info, 0)
+
+        self.sync_state(self._current_dest)
+
+    # ---- public interface (matches the other event cards) ----------------
+
+    def refresh(self) -> None:
+        # No block re-parse — the tab pushes ``sync_state`` after redo/undo.
+        return
+
+    def flush_pending(self) -> None:
+        # currentIndexChanged commits immediately; no debounce to drain.
+        return
+
+    def block_offset(self) -> int:
+        return self._block_offset
+
+    def sync_state(self, dest_file_off: int) -> None:
+        """Re-select the combo from a fresh dest without firing a commit."""
+        dest = int(dest_file_off) & 0xFFFFFFFF
+        self._current_dest = dest
+        self._syncing = True
+        try:
+            ix = self._combo.findData(dest)
+            if ix < 0:
+                # Off-list destination (a raw offset that doesn't start a
+                # known field-map entry). Park the Custom row on it so the
+                # user still sees what's set.
+                self._combo.setItemText(0, f"Custom (raw 0x{dest:08x})")
+                self._combo.setCurrentIndex(0)
+            else:
+                self._combo.setItemText(
+                    0, "Custom (raw offset) — leave as-is",
+                )
+                self._combo.setCurrentIndex(ix)
+        finally:
+            self._syncing = False
+        self._info.setText(
+            f"handler entry {self._handler_entry_ix:04d}"
+            f"  ·  +0x{self._handler_rel_offset:04x}"
+            f"  ·  dest 0x{dest:08x}"
+        )
+
+    def _on_committed(self, _ix: int = -1) -> None:
+        if self._syncing or self._undo_stack is None:
+            return
+        data = self._combo.currentData()
+        if data is None:
+            return
+        data = int(data)
+        if data == _EXIT_DEST_CUSTOM:
+            return
+        if (data & 0xFFFFFFFF) == self._current_dest:
+            return
+        self._on_dest_commit(
+            self._block_offset, self._handler_entry_ix,
+            self._handler_rel_offset, data,
+        )
+
+
+class _ChestCard(QFrame):
+    """Inline editable card for an overworld chest's given item.
+
+    A chest is an OVERWORLD_SPRITE (id 0x02fb) whose interaction script
+    sets ARG_1 (SET_VAR var 0x0005) to an item id then ``CALL_SYS 0x126a``.
+    This card edits that one item u16 in place via
+    :class:`EditChestItemCommand`; the opened-flag (which also drives the
+    load-time opened/closed frame via the 0x0006 pre-check) and the other
+    routine args are shown read-only, since editing the flag safely needs
+    both sites rewritten together.
+    """
+
+    def __init__(
+        self,
+        session,
+        undo_stack,
+        chest: "_ChestInfo",
+        choices: List[Tuple[int, str]],
+        on_item_commit,
+        alt: bool = False,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._session = session
+        self._undo_stack = undo_stack
+        self._chest = chest
+        self._current_item = int(chest.item_id) & 0xFFFF
+        self._on_item_commit = on_item_commit
+        self._syncing: bool = False
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_ChestCard", alt))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+
+        header = QLabel("\U0001f381 Chest")
+        header.setStyleSheet("color: #cccccc; font-weight: bold;")
+        outer.addWidget(header, 0)
+
+        item_row = QHBoxLayout()
+        item_row.setContentsMargins(0, 0, 0, 0)
+        item_row.setSpacing(6)
+        item_row.addWidget(QLabel("Item"), 0)
+        self._item_combo = _NoWheelComboBox()
+        self._item_combo.setEditable(True)
+        self._item_combo.setInsertPolicy(QComboBox.NoInsert)
+        self._item_combo.setMaxVisibleItems(20)
+        self._item_combo.setMinimumContentsLength(16)
+        for iid, label in choices:
+            self._item_combo.addItem(label, iid)
+        completer = QCompleter(self._item_combo)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        completer.setCompletionMode(QCompleter.PopupCompletion)
+        completer.setModel(self._item_combo.model())
+        self._item_combo.setCompleter(completer)
+        self._item_combo.currentIndexChanged.connect(self._on_committed)
+        item_row.addWidget(self._item_combo, 1)
+        outer.addLayout(item_row)
+
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        self._info.setWordWrap(True)
+        outer.addWidget(self._info, 0)
+
+        self.sync_state(self._current_item)
+
+    # ---- public interface (matches the other event cards) ----------------
+
+    def refresh(self) -> None:
+        return
+
+    def flush_pending(self) -> None:
+        return
+
+    def sync_state(self, item_id: int) -> None:
+        """Re-select the item combo from a fresh id without firing a commit."""
+        item_id = int(item_id) & 0xFFFF
+        self._current_item = item_id
+        self._syncing = True
+        try:
+            ix = self._item_combo.findData(item_id)
+            if ix < 0:
+                self._item_combo.addItem(
+                    f"(unknown 0x{item_id:02x})", item_id,
+                )
+                ix = self._item_combo.findData(item_id)
+            self._item_combo.setCurrentIndex(ix)
+        finally:
+            self._syncing = False
+        self._info.setText(
+            f"opened flag 0x{self._chest.flag:04x} "
+            f"(read-only — also drives the closed/opened frame)  ·  "
+            f"args 0x{self._chest.arg2:x}/0x{self._chest.arg3:x}  ·  "
+            f"give routine 0x{overlay5_mod.CHEST_GIVE_ROUTINE:04x}  ·  "
+            f"entry {self._chest.script_entry_ix:04d}"
+            f" @0x{self._chest.item_value_offset:04x}"
+        )
+
+    def _on_committed(self, _ix: int = -1) -> None:
+        if self._syncing or self._undo_stack is None:
+            return
+        value = self._item_combo.currentData()
+        if value is None:
+            return
+        new_item = int(value) & 0xFFFF
+        if new_item == self._current_item:
+            return
+        self._on_item_commit(
+            self._chest.script_entry_ix,
+            self._chest.item_value_offset,
+            new_item,
+        )
+
+
 class CutscenesTab(QWidget):
     """Read-only browser tab for a map's cutscene chains.
 
@@ -2385,13 +3958,290 @@ class CutscenesTab(QWidget):
         self._icon_hitbox: Optional[QIcon] = None
         self._icon_spawn: Optional[QIcon] = None
         self._icon_sprite_fallback: Optional[QIcon] = None
+        # Currently-pinned exit-destination editor card (top of Details,
+        # position 0) plus a lazy cache of the ROM-static destination
+        # choices its combo lists. Mutually exclusive with the sprite
+        # editor card — an object selection is one or the other.
+        self._exit_editor_card: Optional[_ExitDestinationCard] = None
+        self._exit_dest_choices_cache: Optional[List[Tuple[int, str]]] = None
+        # Chest give-item card, pinned above the sprite editor card when a
+        # chest sprite (0x02fb give-item) is selected. Item choices cached
+        # (static item-name table).
+        self._chest_editor_card: Optional[_ChestCard] = None
+        self._item_choices_cache: Optional[List[Tuple[int, str]]] = None
+        # slot index → character name for the currently-rendered chain, so
+        # the sprite-anim / camera cards can offer a "who" picker instead of
+        # a bare slot number. Rebuilt per chain render.
+        self._slot_labels: Dict[int, str] = {}
+        # Slots the currently-rendered chain's opcodes actually drive (anim /
+        # camera / dialog targets), so the "who" combos can rank the scene's
+        # real cast above the other map-declared sprites. Rebuilt per render.
+        self._referenced_slots: set = set()
+        # slot → overworld-sprite id for this chain (base placements, with the
+        # chain's own extras overriding), so the sprite-anim card can show the
+        # right sprite thumbnail + its animation list. Rebuilt per render.
+        self._slot_ow_ids: Dict[int, int] = {}
+        # Chain indices for EXT ('cross-script') chains that are really just
+        # warps (no editable events — the whole body hops into another map's
+        # init). They duplicate this map's Exit objects, so they're filtered
+        # out of the chip row. Recomputed per map render.
+        self._hidden_ext_ixs: set = set()
         # Single flag that brackets every programmatic selection nudge
         # (canvas → list, list → canvas, chip → list-clear). The
         # itemSelectionChanged / markerSelected / exitSelected handlers
         # all early-out while this is set so the round-trip can't loop.
         self._selection_syncing = False
+        # Cross-map cutscene Index: "map" (chip+canvas) vs "index" (flat scene
+        # list). Both edit through the shared right-hand detail panel. The
+        # tree is built once, lazily, on first entry to index mode. The
+        # navigate callback is wired by the map browser so a scene click can
+        # flip the map cursor + select the chain.
+        self._mode = "map"
+        self._scene_index_built = False
+        self._scene_rows: List[_SceneRow] = []
+        self._navigate_scene_cb = None
+        self._reload_map_cb = None
+        self._selecting_scene_row = False
+        # True while the detail panel shows a standalone shared/non-field
+        # scene (``_load_shared_scene``): its ``_state`` isn't the map
+        # browser's map, so toggling back to Map view must reload.
+        self._showing_shared = False
+        # OWS placement block_offsets hidden from the canvas via the Objects
+        # list's per-condition-group checkboxes. Reset per map.
+        self._hidden_sprite_offsets: set = set()
+        # Objects-list group keys the user has collapsed (header double-click).
+        self._collapsed_groups: set = set()
         self._build_ui()
         self._show_empty_state()
+
+    # ---- cross-map cutscene Index ----------------------------------------
+
+    def set_navigate_cb(self, cb) -> None:
+        """Wire the map browser's ``navigate_to_cutscene_chain(map_id,
+        global_ix)`` so an Index row click can jump to that scene's map and
+        select the chain (rendering its editable detail)."""
+        self._navigate_scene_cb = cb
+
+    def set_reload_cb(self, cb) -> None:
+        """Wire the map browser's ``_refresh_cutscenes_tab`` so toggling from a
+        standalone shared scene back to Map view can restore the real map."""
+        self._reload_map_cb = cb
+
+    def _build_scene_index_view(self) -> QWidget:
+        """Left-column widget for Index mode: a filter box + a map→scene
+        tree. Populated lazily (:meth:`_populate_scene_index`)."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self._scene_filter = QLineEdit()
+        self._scene_filter.setPlaceholderText("Filter scenes — map, kind, speaker…")
+        self._scene_filter.setClearButtonEnabled(True)
+        self._scene_filter.textChanged.connect(self._apply_scene_filter)
+        self._scene_filter.setStyleSheet(
+            "QLineEdit { background: #3c3c3c; color: #ddd; border: 1px solid "
+            "#1f1f23; padding: 3px 6px; margin: 4px; }"
+        )
+        lay.addWidget(self._scene_filter, 0)
+        self._scene_tree = QTreeWidget()
+        self._scene_tree.setHeaderHidden(True)
+        self._scene_tree.setUniformRowHeights(True)
+        self._scene_tree.setStyleSheet(
+            "QTreeWidget { background: #252526; color: #cccccc; border: none; }"
+            "QTreeWidget::item { padding: 2px 2px; }"
+            "QTreeWidget::item:selected { background: #094771; color: white; }"
+        )
+        self._scene_tree.itemSelectionChanged.connect(self._on_scene_row_selected)
+        lay.addWidget(self._scene_tree, 1)
+        self._scene_index_note = QLabel()
+        self._scene_index_note.setStyleSheet("color: #888; padding: 2px 6px; font-size: 10px;")
+        self._scene_index_note.setWordWrap(True)
+        lay.addWidget(self._scene_index_note, 0)
+        return w
+
+    def _set_mode(self, mode: str) -> None:
+        """Swap the left column between the map browser and the scene Index.
+
+        The detail panel is shared, so switching modes never disturbs an
+        in-progress edit. Entering index mode builds the tree once and
+        highlights the scene matching the current detail selection."""
+        self._mode = mode
+        self._map_mode_btn.setChecked(mode == "map")
+        self._index_mode_btn.setChecked(mode == "index")
+        self._left_stack.setCurrentIndex(1 if mode == "index" else 0)
+        if mode == "map":
+            # A standalone shared scene left ``_state`` pointing at a non-field
+            # entry; restore the map browser's actual map before showing it.
+            if self._showing_shared and self._reload_map_cb is not None:
+                self._showing_shared = False
+                self._reload_map_cb()
+        else:
+            if not self._scene_index_built:
+                self._populate_scene_index()
+            self._select_scene_row_for_current()
+
+    def _populate_scene_index(self) -> None:
+        """Build the map→scene tree once from the whole cutscene index.
+
+        Field-map scenes group under their map (shared scenes with a host map
+        fold in there, marked ``⇱``); scenes from shared entries with no host
+        collect under a trailing "Shared / cross-map" group and open via
+        standalone rendering."""
+        self._scene_rows = _build_scene_index_rows(self._session)
+        self._scene_tree.clear()
+        by_map: Dict[int, List[_SceneRow]] = {}
+        no_host: List[_SceneRow] = []
+        for r in self._scene_rows:
+            if r.map_id is None:
+                no_host.append(r)
+            else:
+                by_map.setdefault(r.map_id, []).append(r)
+
+        def _add_child(parent: QTreeWidgetItem, r: _SceneRow) -> None:
+            ow_name = (
+                self._resolve_ow_name(_between(r.label, "ow_id=", " "))
+                if r.kind == TriggerKind.OWS else None
+            )
+            child = QTreeWidgetItem([_scene_row_label(r, ow_name)])
+            child.setData(0, Qt.UserRole, r.global_ix)
+            child.setData(0, Qt.UserRole + 1, r.map_id)
+            child.setToolTip(0, f"entry {r.entry_ix} · {r.label}")
+            parent.addChild(child)
+
+        for map_id in sorted(by_map):
+            rows = by_map[map_id]
+            top = QTreeWidgetItem([
+                f"{map_id:>3}  {area_name(map_id)}  ({len(rows)})"
+            ])
+            top.setFirstColumnSpanned(True)
+            top.setFlags(top.flags() & ~Qt.ItemIsSelectable)
+            top.setForeground(0, QColor("#9cdcfe"))
+            for r in rows:
+                _add_child(top, r)
+            self._scene_tree.addTopLevelItem(top)
+            top.setExpanded(True)
+
+        if no_host:
+            top = QTreeWidgetItem([f"⇱  Shared / cross-map  ({len(no_host)})"])
+            top.setFirstColumnSpanned(True)
+            top.setFlags(top.flags() & ~Qt.ItemIsSelectable)
+            top.setForeground(0, QColor("#c39cde"))
+            for r in no_host:
+                _add_child(top, r)
+            self._scene_tree.addTopLevelItem(top)
+            top.setExpanded(True)
+
+        field_n = len(self._scene_rows) - len(no_host)
+        note = f"{field_n} cutscenes · {len(by_map)} maps"
+        if no_host:
+            note += f"  ·  {len(no_host)} shared/cross-map"
+        self._scene_index_note.setText(note)
+        self._scene_index_built = True
+
+    def _apply_scene_filter(self, text: str) -> None:
+        """Hide tree rows that don't match ``text`` (matched against the row
+        label + trigger label); drop map groups left with no visible child."""
+        needle = (text or "").strip().lower()
+        for i in range(self._scene_tree.topLevelItemCount()):
+            top = self._scene_tree.topLevelItem(i)
+            any_visible = False
+            for j in range(top.childCount()):
+                child = top.child(j)
+                hay = (child.text(0) + " " + (child.toolTip(0) or "")).lower()
+                hit = (needle in hay) if needle else True
+                child.setHidden(not hit)
+                any_visible = any_visible or hit
+            top.setHidden(not any_visible)
+            if needle and any_visible:
+                top.setExpanded(True)
+
+    def _on_scene_row_selected(self) -> None:
+        """An Index row was clicked. Field-map (and host-mapped) scenes
+        navigate through the map browser so they render in map context;
+        no-host shared scenes render standalone in the detail panel."""
+        if self._selecting_scene_row:
+            return
+        items = self._scene_tree.selectedItems()
+        if not items:
+            return
+        gix = items[0].data(0, Qt.UserRole)
+        map_id = items[0].data(0, Qt.UserRole + 1)
+        if gix is None:
+            return
+        if map_id is None:
+            self._load_shared_scene(int(gix))
+        elif self._navigate_scene_cb is not None:
+            self._navigate_scene_cb(int(map_id), int(gix))
+
+    def _load_shared_scene(self, global_ix: int) -> None:
+        """Render a shared/non-field-entry cutscene standalone in the detail
+        panel (no field map to host it).
+
+        Builds a minimal :class:`_MapState` around the chain's source entry —
+        enough for :meth:`_render_chain_detail` and the event cards, which
+        edit the ROM bytes through the session regardless of the map context.
+        ``map_id = -1`` marks it as a non-field state so toggling back to the
+        map view reloads the real map."""
+        try:
+            cindex = self._session.cutscene_index()
+        except (ValueError, KeyError):
+            return
+        if global_ix < 0 or global_ix >= len(cindex.chains):
+            return
+        chain = cindex.chains[global_ix]
+        entry_ix = int(chain.source_entry_ix)
+        try:
+            entry_bytes = self._session.overlay5_entry_bytes(entry_ix)
+        except (ValueError, KeyError):
+            return
+        src_idxs = cindex.chains_by_source.get(entry_ix, [])
+        chains = [cindex.chains[i] for i in src_idxs]
+        try:
+            local_ix = chains.index(chain)
+        except ValueError:
+            chains = [chain]
+            local_ix = 0
+        self._state = _MapState(
+            map_id=-1,
+            entry_ix=entry_ix,
+            chains=chains,
+            selected_chip_ix=local_ix,
+            entry_bytes=entry_bytes,
+        )
+        self._hidden_ext_ixs = set()
+        self._showing_shared = True
+        self._render_chain_detail(chain, local_ix)
+
+    def _select_scene_row_for_current(self) -> None:
+        """Highlight the tree row for the scene currently shown in the detail
+        panel (so toggling map→index lands on the same scene)."""
+        if self._scene_tree is None or self._state is None:
+            return
+        sel = self._state.selected_chip_ix
+        if sel is None or sel < 0 or sel >= len(self._state.chains):
+            return
+        try:
+            cindex = self._session.cutscene_index()
+        except (ValueError, KeyError):
+            return
+        target = self._state.chains[sel]
+        gix = next(
+            (i for i, c in enumerate(cindex.chains) if c is target), None,
+        )
+        if gix is None:
+            return
+        self._selecting_scene_row = True
+        try:
+            for i in range(self._scene_tree.topLevelItemCount()):
+                top = self._scene_tree.topLevelItem(i)
+                for j in range(top.childCount()):
+                    child = top.child(j)
+                    if child.data(0, Qt.UserRole) == gix:
+                        self._scene_tree.setCurrentItem(child)
+                        self._scene_tree.scrollToItem(child)
+                        return
+        finally:
+            self._selecting_scene_row = False
 
     # ---- UI construction --------------------------------------------------
 
@@ -2451,6 +4301,12 @@ class CutscenesTab(QWidget):
         )
         self._objects_list.itemSelectionChanged.connect(
             self._on_objects_list_selection_changed
+        )
+        self._objects_list.itemChanged.connect(
+            self._on_objects_group_toggled
+        )
+        self._objects_list.itemDoubleClicked.connect(
+            self._on_objects_group_double_clicked
         )
 
         # Details surface — a scrollable column that mixes read-only
@@ -2514,8 +4370,42 @@ class CutscenesTab(QWidget):
         right_split.setStretchFactor(1, 1)
         right_split.setSizes([240, 560])
 
+        # ---- Map / Index view toggle -------------------------------------
+        # The chip+canvas browser above is the map-tied way in; the Index is a
+        # flat, ordered, cross-map list of every scripted cutscene so scenes
+        # can be browsed/edited by listing instead of hunting map entries.
+        # Both modes share the right-hand detail/edit panel — only the left
+        # column swaps, so the current map view is untouched.
+        self._map_view_widget = left
+        self._index_view_widget = self._build_scene_index_view()
+        self._left_stack = QStackedWidget()
+        self._left_stack.addWidget(self._map_view_widget)    # page 0 = map
+        self._left_stack.addWidget(self._index_view_widget)  # page 1 = index
+
+        toggle_bar = QHBoxLayout()
+        toggle_bar.setContentsMargins(6, 4, 6, 0)
+        toggle_bar.setSpacing(4)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._map_mode_btn = QPushButton("\U0001f5fa Map")
+        self._index_mode_btn = QPushButton("☰ Index")
+        for _b in (self._map_mode_btn, self._index_mode_btn):
+            _b.setCheckable(True)
+            _b.setMaximumWidth(90)
+            self._mode_group.addButton(_b)
+            toggle_bar.addWidget(_b, 0)
+        self._map_mode_btn.setChecked(True)
+        self._map_mode_btn.clicked.connect(lambda: self._set_mode("map"))
+        self._index_mode_btn.clicked.connect(lambda: self._set_mode("index"))
+        toggle_bar.addStretch(1)
+        # De-clutter toggle for the on-canvas sprite/zone labels (default on).
+        self._labels_checkbox = QCheckBox("Show labels")
+        self._labels_checkbox.setChecked(self._canvas.labels_visible())
+        self._labels_checkbox.toggled.connect(self._canvas.set_labels_visible)
+        toggle_bar.addWidget(self._labels_checkbox, 0)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left)
+        splitter.addWidget(self._left_stack)
         splitter.addWidget(right_split)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
@@ -2523,6 +4413,7 @@ class CutscenesTab(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(toggle_bar)
         outer.addWidget(splitter)
 
     # ---- public API -------------------------------------------------------
@@ -2538,6 +4429,8 @@ class CutscenesTab(QWidget):
         finally:
             self._selection_syncing = False
         self._hide_sprite_editor()
+        self._hide_exit_editor()
+        self._hide_chest_editor()
         self._show_empty_state()
 
     def set_map(
@@ -2547,6 +4440,7 @@ class CutscenesTab(QWidget):
         composite_pixmap: QPixmap,
         sprite_specs: List[EventMarkerSpec],
         exit_specs: List[ExitZoneSpec],
+        exit_form_data: Optional[List[object]] = None,
     ) -> None:
         """Render the chip row + map (with overworld objects) for ``map_id``.
 
@@ -2554,9 +4448,23 @@ class CutscenesTab(QWidget):
         map browser builds for the Events / Composite tabs.
         ``sprite_specs`` / ``exit_specs`` are the OVERWORLD_SPRITE
         markers and 0x001b exit/spawn/hitbox specs the Events tab
-        already decoded for this map — we paint them on a read-only
-        :class:`EventsCanvas` (no moved callbacks → dragging disabled).
+        already decoded for this map — we paint them on an
+        :class:`EventsCanvas`.
+
+        ``exit_form_data`` is the parent's resolved per-exit handler
+        payload (duck-typed ``_ExitFormData`` — handler location, current
+        dest, dest map id). When supplied, real map exits become editable:
+        selecting one pins an :class:`_ExitDestinationCard` that repoints
+        the warp via :class:`EditExitDestinationCommand`. Real-exit specs
+        also get their tooltip/label rewritten to the ``warp to map N
+        (Area)`` form. Omitted (older call paths / tests) → exits stay
+        read-only with their incoming labels.
         """
+        # A real field map is loading — any standalone shared-scene state is
+        # superseded, and per-map canvas-visibility toggles reset.
+        self._showing_shared = False
+        self._hidden_sprite_offsets = set()
+        self._collapsed_groups = set()
         try:
             cutscene_index = self._session.cutscene_index()
         except (ValueError, KeyError) as e:
@@ -2685,6 +4593,26 @@ class CutscenesTab(QWidget):
                 (chain.source_entry_ix, spawn_off), ix,
             )
 
+        # Index the parent's resolved exit form data by block offset, and
+        # rewrite each real map exit's ``dest_label`` to the friendly
+        # "warp to map N (Area)" form so the Objects list rows + canvas
+        # tooltips read the way the user asked. Hitboxes / spawns keep
+        # their incoming labels (a hitbox label is its handler location,
+        # a spawn has none).
+        exit_form_by_offset: Dict[int, object] = {}
+        for fd in exit_form_data or ():
+            exit_form_by_offset[int(fd.block_offset)] = fd
+        relabeled_exit_specs: List[ExitZoneSpec] = []
+        for s in exit_specs:
+            fd = exit_form_by_offset.get(s.block_offset)
+            dest_map_id = getattr(fd, "dest_map_id", None) if fd else None
+            if not s.is_hitbox and not s.is_spawn and dest_map_id is not None:
+                relabeled_exit_specs.append(
+                    _dc_replace(s, dest_label=_warp_dest_label(dest_map_id))
+                )
+            else:
+                relabeled_exit_specs.append(s)
+
         self._state = _MapState(
             map_id=map_id,
             entry_ix=entry_ix,
@@ -2694,7 +4622,8 @@ class CutscenesTab(QWidget):
             handler_summaries=handler_summaries,
             composite_pixmap=composite_pixmap,
             sprite_specs=list(sprite_specs),
-            exit_specs=list(exit_specs),
+            exit_specs=relabeled_exit_specs,
+            exit_form_by_offset=exit_form_by_offset,
             chain_extras=chain_extras,
             chain_extra_placements=chain_extra_placements,
             chain_inherited_parents=chain_inherited_parents,
@@ -2705,9 +4634,19 @@ class CutscenesTab(QWidget):
             ows_chain_by_spawn=ows_chain_by_spawn,
         )
 
-        # Status line.
+        # EXT chains whose whole body is a warp into another map's init carry
+        # no editable events — they duplicate this map's Exit objects, so
+        # they're dropped from the chip row (the warp stays editable as an
+        # Exit zone). Content-bearing cross-map scenes keep their chip.
+        self._hidden_ext_ixs = self._compute_hidden_ext_ixs()
+
+        # Status line. Only content-bearing EXT chains count as cross-script;
+        # the warp-only ones are hidden, so they don't inflate the count.
         visible_n = sum(1 for c in chains if c.trigger_kind != TriggerKind.EXT)
-        ext_n = len(chains) - visible_n
+        ext_n = sum(
+            1 for i, c in enumerate(chains)
+            if c.trigger_kind == TriggerKind.EXT and i not in self._hidden_ext_ixs
+        )
         suffix = f" (+ {ext_n} cross-script)" if ext_n else ""
         self._status.setText(
             f"Map {map_id}  ·  entry {entry_ix:04d}  ·  "
@@ -2726,6 +4665,35 @@ class CutscenesTab(QWidget):
         self._select_chip(-1)
 
     # ---- chip row management ---------------------------------------------
+
+    def _compute_hidden_ext_ixs(self) -> set:
+        """Chain indices for EXT ('cross-script') chains that carry no
+        editable events.
+
+        Such a chain's entire body is a warp-hop into another map's init
+        (``entry N + 0x0000``) with nothing scripted before it — i.e. it's a
+        plain map-to-map warp, already editable as an Exit zone. Surfacing it
+        as a "cross-script" chip is misleading (85% of EXT chains game-wide
+        are this), so we drop it from the chip row. Genuine cross-map scenes
+        — shared ``CALL_SYS`` bodies with dialog / anim / battle events —
+        walk to a non-empty event list and keep their chip.
+        """
+        hidden: set = set()
+        if self._state is None:
+            return hidden
+        entry_cache: Dict[int, bytes] = {
+            self._state.entry_ix: self._state.entry_bytes,
+        }
+        for ix, chain in enumerate(self._state.chains):
+            if chain.trigger_kind != TriggerKind.EXT:
+                continue
+            try:
+                events, _ = self._collect_events_for_chain(chain, entry_cache)
+            except (ValueError, KeyError, AssertionError):
+                events = []
+            if not events:
+                hidden.add(ix)
+        return hidden
 
     def _clear_chips(self) -> None:
         if getattr(self, "_base_chip", None) is not None:
@@ -2763,6 +4731,8 @@ class CutscenesTab(QWidget):
         self._chips = [None] * len(self._state.chains)
         for ix, chain in enumerate(self._state.chains):
             if chain.trigger_kind in _OBJECTS_LIST_KINDS:
+                continue
+            if ix in self._hidden_ext_ixs:
                 continue
             summary = self._state.handler_summaries.get(ix)
             chip = _ChainChip(
@@ -2864,7 +4834,12 @@ class CutscenesTab(QWidget):
         if self._state is None or self._state.composite_pixmap is None:
             return
         if chip_ix < 0:
-            specs = list(self._state.sprite_specs)
+            # Base view honours the Objects-list group checkboxes — hidden
+            # placements drop off the canvas but stay in the list.
+            specs = [
+                s for s in self._state.sprite_specs
+                if s.block_offset not in self._hidden_sprite_offsets
+            ]
         else:
             specs = list(self._state.chain_extras.get(chip_ix, []))
         moved_cb = (
@@ -3041,6 +5016,296 @@ class CutscenesTab(QWidget):
         self._sprite_editor_card = card
         self._detail_layout.insertWidget(0, card)
 
+    # ---- exit-destination editor card ------------------------------------
+
+    def _get_exit_dest_choices(self) -> List[Tuple[int, str]]:
+        """ROM-static ``(file_off, "warp to map N (Area)")`` choices, cached."""
+        if self._exit_dest_choices_cache is None:
+            self._exit_dest_choices_cache = _exit_dest_choices(self._session)
+        return self._exit_dest_choices_cache
+
+    def _hide_exit_editor(self) -> None:
+        """Remove the pinned exit-destination card, if any."""
+        card = self._exit_editor_card
+        if card is None:
+            return
+        self._detail_layout.removeWidget(card)
+        card.setParent(None)
+        card.deleteLater()
+        self._exit_editor_card = None
+
+    def _show_exit_editor_for(self, offset: int) -> None:
+        """Pin a fresh exit-destination card at the top of the Details panel.
+
+        Only standard map exits (a ``0x0002 + 0x0030`` handler the parent
+        resolved) are editable; spawns and bespoke hitboxes have no
+        repointable destination and get no card. No-ops without an undo
+        stack (read-only session).
+        """
+        if self._state is None or self._undo_stack is None:
+            self._hide_exit_editor()
+            return
+        fd = self._state.exit_form_by_offset.get(offset)
+        if (
+            fd is None
+            or getattr(fd, "is_spawn", False)
+            or getattr(fd, "is_hitbox", False)
+            or int(getattr(fd, "handler_entry_ix", -1)) < 0
+        ):
+            self._hide_exit_editor()
+            return
+        self._hide_exit_editor()
+        card = _ExitDestinationCard(
+            self._session,
+            self._undo_stack,
+            offset,
+            int(fd.handler_entry_ix),
+            int(fd.handler_rel_offset),
+            int(fd.handler_dest),
+            self._get_exit_dest_choices(),
+            on_dest_commit=self._push_exit_dest_command,
+            alt=False,
+            parent=self._detail_container,
+        )
+        self._exit_editor_card = card
+        self._detail_layout.insertWidget(0, card)
+
+    def _push_exit_dest_command(
+        self,
+        block_offset: int,
+        handler_entry_ix: int,
+        handler_rel_offset: int,
+        new_dest: int,
+    ) -> None:
+        """Bridge from a card's destination commit to the undo stack."""
+        if self._undo_stack is None:
+            return
+        _mid, label = _resolve_warp_dest(self._session, new_dest)
+        cmd = EditExitDestinationCommand(
+            self._session,
+            handler_entry_ix,
+            handler_rel_offset,
+            new_dest,
+            description=(
+                f"Repoint exit @0x{block_offset:04x} → "
+                f"{label or f'0x{new_dest:08x}'}"
+            ),
+            on_change=lambda dest, bo=block_offset, he=handler_entry_ix,
+            hr=handler_rel_offset:
+                self._on_exit_dest_applied(bo, he, hr, dest),
+        )
+        self._undo_stack.push(cmd)
+
+    def _on_exit_dest_applied(
+        self,
+        block_offset: int,
+        handler_entry_ix: int,
+        handler_rel_offset: int,
+        new_dest: int,
+    ) -> None:
+        """Model→view sync after an EditExitDestinationCommand redo/undo.
+
+        Fires on both directions, so it re-resolves the label from the
+        actual applied dest each time. Shared-handler aware: every exit
+        whose handler location matches gets its cached form data, spec
+        label, list row, and canvas tooltip refreshed together.
+        """
+        if self._state is None:
+            return
+        map_id, label = _resolve_warp_dest(self._session, new_dest)
+        for off, fd in self._state.exit_form_by_offset.items():
+            if (
+                int(getattr(fd, "handler_entry_ix", -1)) != handler_entry_ix
+                or int(getattr(fd, "handler_rel_offset", -1)) != handler_rel_offset
+            ):
+                continue
+            fd.handler_dest = int(new_dest) & 0xFFFFFFFF
+            fd.dest_map_id = map_id
+            fd.dest_label = label
+            for i, s in enumerate(self._state.exit_specs):
+                if s.block_offset != off:
+                    continue
+                self._state.exit_specs[i] = _dc_replace(s, dest_label=label)
+                self._refresh_exit_objects_row(off, label)
+                self._canvas.update_exit_dest_label(off, label)
+                break
+        card = self._exit_editor_card
+        if card is not None and card.block_offset() == block_offset:
+            card.sync_state(new_dest)
+
+    def _refresh_exit_objects_row(self, offset: int, label: str) -> None:
+        """Repaint the Objects-list exit row whose block_offset matches."""
+        if self._state is None:
+            return
+        spec = next(
+            (e for e in self._state.exit_specs if e.block_offset == offset),
+            None,
+        )
+        if spec is None:
+            return
+        for i in range(self._objects_list.count()):
+            item = self._objects_list.item(i)
+            if (
+                item.data(_LIST_ROW_TYPE_ROLE) != _LIST_ROW_EXIT
+                or item.data(Qt.UserRole) != offset
+            ):
+                continue
+            item.setText(f"Exit {spec.display_idx}  →  {label or '?'}")
+            item.setToolTip(
+                f"Exit zone (tile {spec.x1},{spec.y1} — {spec.x2},{spec.y2})\n"
+                f"to: {label or '(unknown)'}"
+            )
+            return
+
+    # ---- chest (give-item) editor card -----------------------------------
+
+    def _get_item_choices(self) -> List[Tuple[int, str]]:
+        """Item combo choices, cached (the name table is static)."""
+        if self._item_choices_cache is None:
+            self._item_choices_cache = _item_choices()
+        return self._item_choices_cache
+
+    def _resolve_abs_overlay5_offset(
+        self, abs_off: int,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Absolute overlay5 file offset → ``(entry_ix, rel)`` or ``(None,
+        None)``. Used to follow an OWS ``string_ptr`` to its interaction
+        script (string_ptr is absolute per project memory)."""
+        try:
+            index = self._session.overlay5_index()
+        except (ValueError, KeyError, AttributeError):
+            return None, None
+        for entry_ix, start in index.entry_starts.items():
+            if start <= abs_off < index.entry_ends[entry_ix]:
+                return entry_ix, abs_off - start
+        return None, None
+
+    def _detect_chest(
+        self, entry_ix: int, block_offset: int,
+    ) -> Optional[_ChestInfo]:
+        """Return chest give-item data for the OWS at ``(entry_ix,
+        block_offset)``, or ``None`` when it isn't a chest.
+
+        Follows the sprite's ``string_ptr`` to its interaction script and
+        looks for the give-item run — SET_VAR of ARG_0..3 with a
+        ``CALL_SYS`` to the shared chest routine. Gating on the routine id
+        keeps ordinary NPC dialog scripts from matching.
+        """
+        try:
+            entry = self._session.overlay5_entry_bytes(entry_ix)
+        except (ValueError, KeyError):
+            return None
+        if block_offset + overlay5_mod.OVERWORLD_SPRITE_BLOCK_SIZE > len(entry):
+            return None
+        try:
+            pl = overlay5_mod.OverworldSpritePlacement.from_bytes(
+                entry, block_offset,
+            )
+        except (AssertionError, struct.error, ValueError):
+            return None
+        script_entry_ix, rel = self._resolve_abs_overlay5_offset(pl.string_ptr)
+        if script_entry_ix is None:
+            return None
+        try:
+            seb = self._session.overlay5_entry_bytes(script_entry_ix)
+        except (ValueError, KeyError):
+            return None
+        vars_: Dict[int, int] = {}
+        item_off: Optional[int] = None
+        call_target: Optional[int] = None
+        p = rel
+        n = min(len(seb), rel + _CHEST_SCAN_WINDOW)
+        while p + 2 <= n:
+            op = struct.unpack_from("<H", seb, p)[0]
+            if op == 0x0015 and p + 6 <= n:  # SET_VAR
+                var, val = struct.unpack_from("<HH", seb, p + 2)
+                vars_[var] = val
+                if var == 0x0005:
+                    item_off = p + 4
+                p += 6
+            elif op == 0x0002 and p + 6 <= n:  # CALL_SYS
+                call_target = struct.unpack_from("<I", seb, p + 2)[0]
+                p += 6
+                if item_off is not None:
+                    break
+            elif op in (0x0006, 0x0030) and p + 6 <= n:
+                p += 6
+            else:
+                p += 2
+        if item_off is None or call_target != overlay5_mod.CHEST_GIVE_ROUTINE:
+            return None
+        return _ChestInfo(
+            script_entry_ix=script_entry_ix,
+            item_value_offset=item_off,
+            item_id=vars_.get(0x0005, 0),
+            flag=vars_.get(0x0004, 0),
+            arg2=vars_.get(0x0006, 0),
+            arg3=vars_.get(0x0007, 0),
+        )
+
+    def _hide_chest_editor(self) -> None:
+        """Remove the pinned chest card, if any."""
+        card = self._chest_editor_card
+        if card is None:
+            return
+        self._detail_layout.removeWidget(card)
+        card.setParent(None)
+        card.deleteLater()
+        self._chest_editor_card = None
+
+    def _show_chest_editor_for(self, canvas_offset: int) -> None:
+        """Pin a chest card on top of the sprite card when ``canvas_offset``
+        names a chest give-item sprite. No-op (and hides any stale card)
+        otherwise."""
+        if self._state is None or self._undo_stack is None:
+            self._hide_chest_editor()
+            return
+        resolved = self._resolve_canvas_offset(canvas_offset)
+        if resolved is None:
+            self._hide_chest_editor()
+            return
+        real_entry_ix, real_offset = resolved
+        chest = self._detect_chest(real_entry_ix, real_offset)
+        if chest is None:
+            self._hide_chest_editor()
+            return
+        self._hide_chest_editor()
+        card = _ChestCard(
+            self._session,
+            self._undo_stack,
+            chest,
+            self._get_item_choices(),
+            on_item_commit=self._push_chest_item_command,
+            alt=False,
+            parent=self._detail_container,
+        )
+        self._chest_editor_card = card
+        # Above the sprite editor card (inserted at 0 earlier) so the chest
+        # — the salient thing about this object — reads first.
+        self._detail_layout.insertWidget(0, card)
+
+    def _push_chest_item_command(
+        self, script_entry_ix: int, item_value_offset: int, new_item_id: int,
+    ) -> None:
+        """Bridge from a chest card's item commit to the undo stack."""
+        if self._undo_stack is None:
+            return
+        cmd = EditChestItemCommand(
+            self._session,
+            script_entry_ix,
+            item_value_offset,
+            new_item_id,
+            description=f"Set chest item → {_item_display_name(new_item_id)}",
+            on_change=self._on_chest_item_applied,
+        )
+        self._undo_stack.push(cmd)
+
+    def _on_chest_item_applied(self, item_id: int) -> None:
+        """Re-sync the chest card after an EditChestItemCommand redo/undo."""
+        card = self._chest_editor_card
+        if card is not None:
+            card.sync_state(item_id)
+
     def _push_sprite_id_command(
         self,
         canvas_offset: int,
@@ -3187,20 +5452,133 @@ class CutscenesTab(QWidget):
             return
 
     def _sprite_marker_label_for(self, sprite_id: int) -> str:
-        """MCHR id → label string, matching what the chain-extras
+        """ow-id → label string, matching what the chain-extras
         renderer uses for cutscene placements."""
         try:
-            labels = self._session.get_mchr_labels()
+            labels = self._session.get_mchr_ow_labels()
         except (AttributeError, ValueError):
             labels = []
         if 0 <= int(sprite_id) < len(labels):
             return str(labels[int(sprite_id)])
         return f"MCHR 0x{int(sprite_id):04x}"
 
-    def _sprite_marker_pixmap_for(self, sprite_id: int):
-        """MCHR id → 32x32 marker pixmap, or ``None`` for unmapped ids."""
+    def _resolve_ow_name(self, ow_id_str: str) -> Optional[str]:
+        """Clean character name for an OWS ``ow_id`` (hex string from a
+        trigger label), or ``None`` when the id has no known name.
+
+        Rejects the fallback forms (raw ``MCHR 0x..`` label, leftover ``[OW]``
+        / hex) so the Index only shows a name when there really is one."""
         try:
-            return self._session.mchr_sprite_pixmap(
+            ow = int(ow_id_str, 0)
+        except (ValueError, TypeError):
+            return None
+        name = _clean_ow_name(self._sprite_marker_label_for(ow))
+        if (not name or "[OW]" in name or name.startswith("MCHR ")
+                or name.lower().startswith("0x")):
+            return None
+        return name
+
+    def _build_slot_labels(self, chain_ix: int) -> Dict[int, str]:
+        """Map slot index → character name for the selected chain.
+
+        0..3 are always player + party 1/2/3. 4+ come from the scene's
+        OVERWORLD_SPRITE placements (each carries its own ``slot``): the
+        map's own placements first, then the chain-injected ones so a
+        scene actor spawned by this cutscene wins a shared slot.
+        """
+        labels: Dict[int, str] = dict(_FIXED_SLOT_LABELS)
+        if self._state is None:
+            return labels
+        placements: List = []
+        try:
+            placements.extend(
+                overlay5_mod.iter_overworld_sprites(self._state.entry_bytes)
+            )
+        except (ValueError, AttributeError):
+            pass
+        for _e_ix, placement in self._state.chain_extra_placements.get(
+            chain_ix, [],
+        ):
+            placements.append(placement)
+        for p in placements:
+            slot = int(getattr(p, "slot", -1))
+            if slot < 4 or slot > 0xFFFF:   # keep player/party fixed
+                continue
+            labels[slot] = _clean_ow_name(self._sprite_marker_label_for(
+                int(p.overworld_sprite_id),
+            ))
+        return labels
+
+    def _build_referenced_slots(self, chain_ix: int) -> set:
+        """Slots the chain's opcodes actually target — sprite-anim subjects,
+        camera pan-to-sprite targets, and dialog speakers.
+
+        These are the scene's genuine cast (vs. every sprite the map merely
+        declares). The "who" combos group them first so a user editing a
+        Phascomon scene sees Player + Phascomon up top rather than the whole
+        map's sprite list. Walk errors degrade to an empty set (combo just
+        falls back to the flat, unranked list)."""
+        refs: set = set()
+        if self._state is None:
+            return refs
+        try:
+            chain = self._state.chains[chain_ix]
+        except (IndexError, TypeError):
+            return refs
+        entry_cache: Dict[int, bytes] = {
+            self._state.entry_ix: self._state.entry_bytes,
+        }
+        try:
+            events, _ = self._collect_events_for_chain(chain, entry_cache)
+        except (ValueError, KeyError, AssertionError):
+            return refs
+        for _entry_ix, ev in events:
+            pay = ev.payload
+            if ev.kind == overlay5_mod.EVENT_KIND_SPRITE_ANIM:
+                refs.add(int(pay.sprite) & 0xFFFF)
+            elif ev.kind == overlay5_mod.EVENT_KIND_CAMERA and not pay.is_xy:
+                refs.add(int(pay.a) & 0xFFFF)
+            elif ev.kind == overlay5_mod.EVENT_KIND_MOVE:
+                refs.add(int(pay.tgt) & 0xFFFF)
+            elif ev.kind == overlay5_mod.EVENT_KIND_DIALOG:
+                target = getattr(pay, "target", None)
+                if target is not None:
+                    refs.add(int(target) & 0xFFFF)
+        return refs
+
+    def _build_slot_ow_ids(self, chain_ix: int) -> Dict[int, int]:
+        """slot index → overworld-sprite id for the selected chain.
+
+        Same resolution rule the anim-id verification relies on: start from
+        the base map entry's OVERWORLD_SPRITE placements, then let this
+        chain's own ``chain_extra_placements`` override — a scene actor
+        spawned by the cutscene wins the slot. Player/party slots (0-3) have
+        no placement and are intentionally absent (the sprite-anim thumbnail
+        only resolves real overworld sprites)."""
+        mapping: Dict[int, int] = {}
+        if self._state is None:
+            return mapping
+        placements: List = []
+        try:
+            placements.extend(
+                overlay5_mod.iter_overworld_sprites(self._state.entry_bytes)
+            )
+        except (ValueError, AttributeError):
+            pass
+        for _e_ix, placement in self._state.chain_extra_placements.get(
+            chain_ix, [],
+        ):
+            placements.append(placement)
+        for p in placements:
+            slot = int(getattr(p, "slot", -1))
+            if 0 <= slot <= 0xFFFF:
+                mapping[slot] = int(p.overworld_sprite_id)
+        return mapping
+
+    def _sprite_marker_pixmap_for(self, sprite_id: int):
+        """ow-id → 32x32 marker pixmap, or ``None`` for unmapped ids."""
+        try:
+            return self._session.mchr_sprite_pixmap_by_ow_id(
                 int(sprite_id), max_size=512, frame=None,
             )
         except (AttributeError, ValueError):
@@ -3273,6 +5651,8 @@ class CutscenesTab(QWidget):
             w.setParent(None)
             w.deleteLater()
         self._sprite_editor_card = None
+        self._exit_editor_card = None
+        self._chest_editor_card = None
         # The events browser widgets are children of the detail layout
         # that we just tore down; drop the references so a stale list
         # widget can't be reused across chain switches.
@@ -3353,15 +5733,26 @@ class CutscenesTab(QWidget):
             self._detail_layout.count() - 1, card,
         )
 
+    # Tier-1 scene-action cards → their (payload class is already parsed
+    # by the walker) constructors. Keyed by event kind so both the inline
+    # column (_add_event_card) and the events browser (_card_for_event)
+    # share one dispatch table.
+    _EVENT_CARD_CTORS = {
+        overlay5_mod.EVENT_KIND_WAIT: _WaitCard,
+        overlay5_mod.EVENT_KIND_SPRITE_ANIM: _SpriteAnimCard,
+        overlay5_mod.EVENT_KIND_CAMERA: _CameraCard,
+        overlay5_mod.EVENT_KIND_ITEM: _ItemEventCard,
+        overlay5_mod.EVENT_KIND_MOVE: _MoveCard,
+        overlay5_mod.EVENT_KIND_CONTROL: _ControlCard,
+    }
+
     def _add_event_card(
         self, entry_ix: int, event, alt: bool,
     ) -> None:
         """Dispatch to the right card constructor for ``event.kind``.
 
-        Unknown kinds are ignored — the events walker only emits the
-        four we recognize, so this is a defensive fallthrough for the
-        forward-compat case where a new kind gets added to the codec
-        before the UI catches up.
+        Unknown kinds are ignored — a defensive fallthrough for a codec
+        that adds a kind before the UI catches up.
         """
         payload = event.payload
         if event.kind == overlay5_mod.EVENT_KIND_DIALOG:
@@ -3372,6 +5763,14 @@ class CutscenesTab(QWidget):
             self._add_reaction_card(entry_ix, payload, alt)
         elif event.kind == overlay5_mod.EVENT_KIND_BATTLE:
             self._add_battle_card(entry_ix, payload, alt)
+        else:
+            ctor = self._EVENT_CARD_CTORS.get(event.kind)
+            if ctor is not None:
+                self._install_event_card(ctor(
+                    self._session, self._undo_stack, entry_ix, payload,
+                    alt, self._detail_container, self._slot_labels,
+                    self._referenced_slots, self._slot_ow_ids,
+                ))
 
     # ---- events browser (list of sub-events + active card slot) ---------
 
@@ -3418,13 +5817,22 @@ class CutscenesTab(QWidget):
         entry_ix: int,
         event,
         npc_prefix: Optional[str] = None,
+        indent: int = 0,
     ) -> None:
-        """Append one clickable row to the events browser list."""
+        """Append one clickable row to the events browser list.
+
+        ``indent`` (from :func:`_compute_event_indents`) shifts events gated by
+        a preceding CMP_BRANCH one step right so the list reads like indented
+        code (``if var … :`` then its gated block)."""
         assert self._events_list_widget is not None
-        icon, preview = _event_row_preview(self._session, event)
+        icon, preview = _event_row_preview(
+            self._session, event, self._slot_labels,
+        )
         text = f"{icon}  {preview}"
         if npc_prefix:
             text = f"{icon}  [{npc_prefix}] {preview}"
+        if indent > 0:
+            text = ("    " * indent) + text
         item = QListWidgetItem(text)
         item.setData(_EVENTS_ROW_ENTRY_IX_ROLE, int(entry_ix))
         item.setData(_EVENTS_ROW_EVENT_REL_ROLE, int(event.rel))
@@ -3503,6 +5911,13 @@ class CutscenesTab(QWidget):
                 self._session, self._undo_stack,
                 entry_ix, payload, False, self._events_card_container,
             )
+        ctor = self._EVENT_CARD_CTORS.get(event.kind)
+        if ctor is not None:
+            return ctor(
+                self._session, self._undo_stack,
+                entry_ix, payload, False, self._events_card_container,
+                self._slot_labels, self._referenced_slots, self._slot_ow_ids,
+            )
         return None
 
     def _events_browser_select_first_selectable(self) -> None:
@@ -3577,6 +5992,17 @@ class CutscenesTab(QWidget):
         """
         assert self._state is not None
         self._clear_detail_layout()
+        # slot → character map for this scene, so the event cards can offer
+        # a "who" picker instead of a bare slot index. Built before the
+        # events browser populates (its cards read it at construction).
+        self._slot_labels = self._build_slot_labels(chain_ix)
+        # Slots this scene's opcodes actually drive — the "who" combos group
+        # these under "in this scene" so the reader isn't offered map sprites
+        # that aren't part of the selected cutscene.
+        self._referenced_slots = self._build_referenced_slots(chain_ix)
+        # slot → ow-id for this chain (extras override base) so the sprite-anim
+        # card resolves each slot to the correct sprite for its thumbnail/anims.
+        self._slot_ow_ids = self._build_slot_ow_ids(chain_ix)
         color = _KIND_COLORS.get(chain.trigger_kind, _KIND_COLORS["base"]).name()
 
         # Top header block — just the trigger-kind chip + short label so
@@ -3672,16 +6098,19 @@ class CutscenesTab(QWidget):
                 f" <span class='muted'>{html.escape(short)}</span></li>"
             )
         bottom_parts.append("</ol>")
-        self._add_html_section("".join(bottom_parts))
 
-        # Debug footers — skipped-NPC notice + unmapped opcodes from
-        # both walks — land at the very bottom of the details column so
-        # they don't push the chain metadata off-screen.
-        for html_str in (
-            skipped_html, main_unknowns_html, npc_unknowns_html,
-        ):
+        # Chain metadata + debug (handler summary, path, unmapped opcodes)
+        # is useful but noisy while editing — tuck it into a collapsed
+        # "Script details" section so the events browser reads first. The
+        # detail-layout teardown removes it like any other child widget.
+        details = _CollapsibleSection("Script details", self._detail_container)
+        details.add_html("".join(bottom_parts))
+        for html_str in (skipped_html, main_unknowns_html, npc_unknowns_html):
             if html_str:
-                self._add_html_section(html_str)
+                details.add_html(html_str)
+        self._detail_layout.insertWidget(
+            self._detail_layout.count() - 1, details,
+        )
 
         # Auto-select the first selectable row so a card is always
         # visible when the browser is non-empty. Deferred one tick so
@@ -3824,6 +6253,39 @@ class CutscenesTab(QWidget):
         out.append("</ul>")
         return "".join(out)
 
+    def _sibling_ows_chains(
+        self, chain: CutsceneChain,
+    ) -> List[CutsceneChain]:
+        """Every OWS chain for the same sprite (source entry + slot + ow_id).
+
+        A sprite placed several times — one placement per story state — has
+        one OWS chain each, and each points at that state's dialog handler via
+        ``string_ptr``. The deduped Objects list shows only the FIRST
+        placement, whose handler is frequently an empty ``END_SCRIPT`` stub
+        (the state where the NPC does nothing), so its dialogue looks missing.
+        Aggregating the siblings surfaces the state(s) that actually carry the
+        lines — e.g. map 96 (entry 0331) Gabumon's dialogue lives in its 2nd
+        placement's handler in entry 0499, lost by the dedup otherwise."""
+        label = chain.trigger_label or ""
+        slot = _between(label, "slot=", " ")
+        ow = _between(label, "ow_id=", " ")
+        if not (slot and ow):
+            return [chain]
+        try:
+            cindex = self._session.cutscene_index()
+        except (ValueError, KeyError):
+            return [chain]
+        marker_slot = f"slot={slot} "
+        marker_ow = f"ow_id={ow} "
+        out = [
+            c for c in cindex.chains
+            if c.trigger_kind == TriggerKind.OWS
+            and c.source_entry_ix == chain.source_entry_ix
+            and marker_slot in (c.trigger_label or "")
+            and marker_ow in (c.trigger_label or "")
+        ]
+        return out or [chain]
+
     def _append_dialog_cards_for_chain(self, chain: CutsceneChain) -> str:
         """Populate the events browser with the chain's editable events.
 
@@ -3834,6 +6296,10 @@ class CutscenesTab(QWidget):
         HANDLER-mode "spawned NPC" caller extends the same list with
         per-NPC groups underneath.
 
+        For an OWS sprite we aggregate every placement's handler (see
+        :meth:`_sibling_ows_chains`) so a story-state whose 1st placement is
+        an empty stub still shows the dialogue carried by another placement.
+
         Returns the trailing "unmapped opcodes" HTML string (empty when
         the walk was clean) so the caller can position it after the
         chain-metadata block, keeping debug info at the bottom.
@@ -3842,13 +6308,30 @@ class CutscenesTab(QWidget):
         """
         assert self._state is not None
         entry_cache: Dict[int, bytes] = {self._state.entry_ix: self._state.entry_bytes}
-        events, unknowns = self._collect_events_for_chain(chain, entry_cache)
+        source_chains = (
+            self._sibling_ows_chains(chain)
+            if chain.trigger_kind == TriggerKind.OWS else [chain]
+        )
+        events: List[Tuple[int, "overlay5_mod.RegionEvent"]] = []
+        unknowns: List[Tuple[int, int, int]] = []
+        seen: set = set()
+        for c in source_chains:
+            evs, unk = self._collect_events_for_chain(c, entry_cache)
+            for entry_ix, ev in evs:
+                key = (entry_ix, ev.rel)
+                if key in seen:
+                    continue
+                seen.add(key)
+                events.append((entry_ix, ev))
+            unknowns.extend(unk)
         if not events:
             return self._render_unknown_opcodes_section(unknowns)
+        events.sort(key=lambda x: (x[0], x[1].rel))
         self._add_html_section(_events_section_header(events))
         self._ensure_events_browser()
-        for entry_ix, ev in events:
-            self._events_browser_add_event_row(entry_ix, ev)
+        indents = _compute_event_indents(events)
+        for (entry_ix, ev), indent in zip(events, indents):
+            self._events_browser_add_event_row(entry_ix, ev, indent=indent)
         return self._render_unknown_opcodes_section(unknowns)
 
     def _append_spawned_npc_dialog_cards(
@@ -3946,9 +6429,10 @@ class CutscenesTab(QWidget):
                     f"· entry {entry_ix:04d} +0x{placement.block_offset:04x})"
                 )
                 self._events_browser_add_group_header(header_label)
-                for d_entry_ix, ev in events:
+                npc_indents = _compute_event_indents(events)
+                for (d_entry_ix, ev), indent in zip(events, npc_indents):
                     self._events_browser_add_event_row(
-                        d_entry_ix, ev, npc_prefix=name,
+                        d_entry_ix, ev, npc_prefix=name, indent=indent,
                     )
 
         skipped_msgs: List[str] = []
@@ -4065,6 +6549,152 @@ class CutscenesTab(QWidget):
 
     # ---- objects list ----------------------------------------------------
 
+    def _add_object_sprite_row(self, s, chip_ix: int) -> None:
+        """Append one sprite row to the Objects list (shared by the flat and
+        grouped paths)."""
+        item = QListWidgetItem()
+        item.setText(f"0x{s.overworld_sprite_id:04x}  ({s.x}, {s.y})")
+        if s.pixmap is not None and not s.pixmap.isNull():
+            item.setIcon(QIcon(s.pixmap))
+        else:
+            item.setIcon(self._sprite_fallback_icon())
+        item.setData(Qt.UserRole, s.block_offset)
+        item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_SPRITE)
+        tooltip = s.label
+        if (
+            chip_ix < 0
+            and s.block_offset not in self._state.ows_chain_by_offset
+        ):
+            tooltip += "\n(no scripted scene attached)"
+        item.setToolTip(tooltip)
+        self._objects_list.addItem(item)
+
+    def _add_object_group_header(
+        self, label: str, block_offsets: List[int], tooltip: str,
+        group_key,
+    ) -> bool:
+        """A non-selectable, checkable header row.
+
+        The checkbox toggles the canvas visibility of the group's placements
+        (editor-only — no effect on the game). Double-clicking the header
+        collapses/expands the group in the list. Returns ``True`` when the
+        group is currently collapsed (caller then skips its child rows)."""
+        offs = [int(o) for o in block_offsets]
+        visible = not (
+            offs and all(o in self._hidden_sprite_offsets for o in offs)
+        )
+        collapsed = group_key in self._collapsed_groups
+        arrow = "▸ " if collapsed else "▾ "  # ▸ / ▾
+        item = QListWidgetItem(arrow + label)
+        item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_GROUP)
+        item.setData(_LIST_ROW_GROUP_OFFSETS, offs)
+        item.setData(_LIST_ROW_GROUP_KEY, group_key)
+        item.setToolTip(
+            tooltip
+            + "\n\n☑ = show on the canvas — editor view only,"
+            " no effect on the game.\nDouble-click to collapse / expand."
+        )
+        item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        item.setCheckState(Qt.Checked if visible else Qt.Unchecked)
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        item.setForeground(QColor("#9cdcfe"))
+        self._objects_list.addItem(item)
+        return collapsed
+
+    def _on_objects_group_double_clicked(self, item) -> None:
+        """Header double-click → collapse/expand that group in the list."""
+        if self._state is None:
+            return
+        if item.data(_LIST_ROW_TYPE_ROLE) != _LIST_ROW_GROUP:
+            return
+        key = item.data(_LIST_ROW_GROUP_KEY)
+        if key in self._collapsed_groups:
+            self._collapsed_groups.discard(key)
+        else:
+            self._collapsed_groups.add(key)
+        self._populate_objects_list()
+
+    def _populate_object_sprite_groups(self, sprite_specs: list) -> None:
+        """Base-mode sprite listing grouped by spawn condition.
+
+        ``overlay5.sprite_gate_conditions`` maps each placement gated by a
+        conditional (0x06 IFEQ / 0x2A CMP directly before the 0x0150) to that
+        condition. Unconditional sprites go under an "Always on map" header;
+        each distinct condition gets its own checkbox group (short id +
+        raw-condition tooltip). When no sprite is conditional, the list stays
+        a plain flat row set."""
+        try:
+            gates = overlay5_mod.sprite_gate_conditions(self._state.entry_bytes)
+        except (ValueError, AttributeError):
+            gates = {}
+        always: list = []
+        groups: Dict[int, list] = {}
+        group_op: Dict[int, int] = {}
+        order: List[int] = []
+        for s in sprite_specs:
+            cond = gates.get(s.block_offset)
+            if cond is None:
+                always.append(s)
+            else:
+                op, flag = cond
+                if flag not in groups:
+                    groups[flag] = []
+                    group_op[flag] = op
+                    order.append(flag)
+                groups[flag].append(s)
+        if not groups:
+            # No conditional sprites — flat list, then the zones.
+            for s in sprite_specs:
+                self._add_object_sprite_row(s, -1)
+            self._add_object_zone_rows()
+            return
+        # Always group holds the ungated sprites AND the (never-gated) exit /
+        # hitbox / spawn zones, so those don't read as part of a flag group.
+        # Its checkbox governs only the sprite offsets (zones aren't hideable).
+        collapsed = self._add_object_group_header(
+            f"Always on map  ({len(always)})",
+            [s.block_offset for s in always],
+            "Sprites with no detected spawn gate, plus the map's zones.",
+            "always",
+        )
+        if not collapsed:
+            for s in always:
+                self._add_object_sprite_row(s, -1)
+            self._add_object_zone_rows()
+        gate_names = {0x0006: "IFEQ", 0x00A6: "HANDLER_META", 0x002A: "CMP"}
+        for flag in order:
+            specs = groups[flag]
+            opname = gate_names.get(group_op[flag], f"op 0x{group_op[flag]:02x}")
+            header = f"Flag · 0x{flag:04x}  ({len(specs)})"
+            tip = (
+                "Spawns only when this story flag is set\n"
+                f"gate {opname} · flag 0x{flag:04x}"
+            )
+            collapsed = self._add_object_group_header(
+                header, [s.block_offset for s in specs], tip, flag,
+            )
+            if not collapsed:
+                for s in specs:
+                    self._add_object_sprite_row(s, -1)
+
+    def _on_objects_group_toggled(self, item) -> None:
+        """A group-header checkbox flipped — hide/show its placements on the
+        canvas. Sprite/exit rows and programmatic populates are ignored."""
+        if self._selection_syncing or self._state is None:
+            return
+        if item.data(_LIST_ROW_TYPE_ROLE) != _LIST_ROW_GROUP:
+            return
+        offs = item.data(_LIST_ROW_GROUP_OFFSETS) or []
+        hide = item.checkState() != Qt.Checked
+        for o in offs:
+            if hide:
+                self._hidden_sprite_offsets.add(int(o))
+            else:
+                self._hidden_sprite_offsets.discard(int(o))
+        self._rebuild_canvas_for_selection(self._state.selected_chip_ix)
+
     def _populate_objects_list(self) -> None:
         """Refill the Objects on Map list for the current selection.
 
@@ -4093,73 +6723,61 @@ class CutscenesTab(QWidget):
         self._selection_syncing = True
         try:
             self._objects_list.clear()
-            for s in sprite_specs:
-                item = QListWidgetItem()
-                item.setText(
-                    f"0x{s.overworld_sprite_id:04x}  ({s.x}, {s.y})"
-                )
-                if s.pixmap is not None and not s.pixmap.isNull():
-                    item.setIcon(QIcon(s.pixmap))
-                else:
-                    item.setIcon(self._sprite_fallback_icon())
-                item.setData(Qt.UserRole, s.block_offset)
-                item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_SPRITE)
-                tooltip = s.label
-                if (
-                    chip_ix < 0
-                    and s.block_offset not in self._state.ows_chain_by_offset
-                ):
-                    tooltip += "\n(no scripted scene attached)"
-                item.setToolTip(tooltip)
-                self._objects_list.addItem(item)
-            if not show_zones:
-                self._objects_list.setCurrentRow(-1)
-                return
-            for e in self._state.exit_specs:
-                if e.is_spawn or e.is_hitbox:
-                    continue
-                item = QListWidgetItem()
-                item.setText(
-                    f"Exit {e.display_idx}  \u2192  {e.dest_label or '?'}"
-                )
-                item.setIcon(self._exit_icon())
-                item.setData(Qt.UserRole, e.block_offset)
-                item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_EXIT)
-                item.setToolTip(
-                    f"Exit zone (tile {e.x1},{e.y1} \u2014 {e.x2},{e.y2})\n"
-                    f"to: {e.dest_label or '(unknown)'}"
-                )
-                self._objects_list.addItem(item)
-            for e in self._state.exit_specs:
-                if not e.is_hitbox:
-                    continue
-                item = QListWidgetItem()
-                item.setText(
-                    f"Hitbox {e.display_idx}  "
-                    f"(tile {e.x1},{e.y1} \u2014 {e.x2},{e.y2})"
-                )
-                item.setIcon(self._hitbox_icon())
-                item.setData(Qt.UserRole, e.block_offset)
-                item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_HITBOX)
-                item.setToolTip(
-                    f"Interaction hitbox\n"
-                    f"tile ({e.x1},{e.y1}) \u2014 ({e.x2},{e.y2})\n"
-                    f"{e.dest_label or ''}".rstrip()
-                )
-                self._objects_list.addItem(item)
-            for e in self._state.exit_specs:
-                if not e.is_spawn:
-                    continue
-                item = QListWidgetItem()
-                item.setText(f"Spawn {e.display_idx}  ({e.x1}, {e.y1})")
-                item.setIcon(self._spawn_icon())
-                item.setData(Qt.UserRole, e.block_offset)
-                item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_SPAWN)
-                item.setToolTip(f"Spawn point (tile {e.x1}, {e.y1})")
-                self._objects_list.addItem(item)
+            if chip_ix < 0:
+                # Base view: grouped sprites (Always first, then one checkbox
+                # group per gating flag). The always-present zones render
+                # under the Always group so they don't read as flag-gated.
+                self._populate_object_sprite_groups(sprite_specs)
+            else:
+                for s in sprite_specs:
+                    self._add_object_sprite_row(s, chip_ix)
             self._objects_list.setCurrentRow(-1)
         finally:
             self._selection_syncing = False
+
+    def _add_object_zone_rows(self) -> None:
+        """Append the map's exit / hitbox / spawn zones. These aren't
+        flag-gated, so in grouped mode they belong under "Always on map"."""
+        for e in self._state.exit_specs:
+            if e.is_spawn or e.is_hitbox:
+                continue
+            item = QListWidgetItem()
+            item.setText(f"Exit {e.display_idx}  \u2192  {e.dest_label or '?'}")
+            item.setIcon(self._exit_icon())
+            item.setData(Qt.UserRole, e.block_offset)
+            item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_EXIT)
+            item.setToolTip(
+                f"Exit zone (tile {e.x1},{e.y1} \u2014 {e.x2},{e.y2})\n"
+                f"to: {e.dest_label or '(unknown)'}"
+            )
+            self._objects_list.addItem(item)
+        for e in self._state.exit_specs:
+            if not e.is_hitbox:
+                continue
+            item = QListWidgetItem()
+            item.setText(
+                f"Hitbox {e.display_idx}  "
+                f"(tile {e.x1},{e.y1} \u2014 {e.x2},{e.y2})"
+            )
+            item.setIcon(self._hitbox_icon())
+            item.setData(Qt.UserRole, e.block_offset)
+            item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_HITBOX)
+            item.setToolTip(
+                f"Interaction hitbox\n"
+                f"tile ({e.x1},{e.y1}) \u2014 ({e.x2},{e.y2})\n"
+                f"{e.dest_label or ''}".rstrip()
+            )
+            self._objects_list.addItem(item)
+        for e in self._state.exit_specs:
+            if not e.is_spawn:
+                continue
+            item = QListWidgetItem()
+            item.setText(f"Spawn {e.display_idx}  ({e.x1}, {e.y1})")
+            item.setIcon(self._spawn_icon())
+            item.setData(Qt.UserRole, e.block_offset)
+            item.setData(_LIST_ROW_TYPE_ROLE, _LIST_ROW_SPAWN)
+            item.setToolTip(f"Spawn point (tile {e.x1}, {e.y1})")
+            self._objects_list.addItem(item)
 
     def _lookup_chain_for_row(
         self, row_type: str, offset: int,
@@ -4256,10 +6874,22 @@ class CutscenesTab(QWidget):
             self._render_chain_detail(self._state.chains[chain_ix], chain_ix)
         else:
             self._render_object_no_scene_detail(row_type, offset)
+        # Pin the editor card for the active object on top of whatever the
+        # detail render produced (both render paths clear the layout first,
+        # so this must come after). Sprite and exit cards are mutually
+        # exclusive — a selection is one kind of object.
         if row_type == _LIST_ROW_SPRITE:
+            self._hide_exit_editor()
             self._show_sprite_editor_for(offset)
+            self._show_chest_editor_for(offset)
+        elif row_type == _LIST_ROW_EXIT:
+            self._hide_sprite_editor()
+            self._hide_chest_editor()
+            self._show_exit_editor_for(offset)
         else:
             self._hide_sprite_editor()
+            self._hide_exit_editor()
+            self._hide_chest_editor()
 
     def _activate_chain_extra_sprite(self, canvas_offset: int) -> None:
         """Chip-mode sprite click: pin the sprite editor card to one of
@@ -4272,6 +6902,8 @@ class CutscenesTab(QWidget):
         """
         if self._state is None:
             return
+        # Chain-extra sprites are cutscene-spawned NPCs, never chests.
+        self._hide_chest_editor()
         self._show_sprite_editor_for(canvas_offset)
 
     def _on_objects_list_selection_changed(self) -> None:
@@ -4321,7 +6953,11 @@ class CutscenesTab(QWidget):
             self._activate_chain_extra_sprite(block_offset)
             return
         self._set_list_current_row(_LIST_ROW_SPRITE, block_offset)
-        self._activate_object(_LIST_ROW_SPRITE, block_offset)
+        # Deferred for the same reason as the exit path — activation can clear
+        # the scene, which is unsafe inside ``selectionChanged``.
+        QTimer.singleShot(
+            0, lambda: self._activate_object(_LIST_ROW_SPRITE, block_offset),
+        )
 
     def _on_canvas_exit_selected(self, block_offset: int) -> None:
         """Canvas told us an exit/hitbox/spawn item was selected."""
@@ -4331,7 +6967,14 @@ class CutscenesTab(QWidget):
             return
         row_type = self._classify_exit_offset(block_offset)
         self._set_list_current_row(row_type, block_offset)
-        self._activate_object(row_type, block_offset)
+        # Defer the activation: in chip mode it rebuilds the canvas scene,
+        # which must NOT happen inside the scene's ``selectionChanged``
+        # emission — clearing the scene deletes the very item being selected
+        # and Qt crashes (access violation). singleShot(0) runs it after the
+        # selection event unwinds.
+        QTimer.singleShot(
+            0, lambda: self._activate_object(row_type, block_offset),
+        )
 
     def _render_object_no_scene_detail(
         self, row_type: str, offset: int,
@@ -4471,3 +7114,51 @@ class CutscenesTab(QWidget):
             p.end()
             self._icon_spawn = QIcon(pm)
         return self._icon_spawn
+
+
+def battle_vram_issues(session) -> List[ValidationIssue]:
+    """Validation collector: scripted battles whose enemy sprites overflow the
+    shared OBJ VRAM pool.
+
+    Scripted battles skip the wild roll's ``Σ fs ≤ 1440`` cap, so an over-
+    budget enemy set overflows VRAM and crashes on load. This is surfaced in
+    the validation footer only — it does NOT gate saving (mirrors the
+    informational ``sprite VRAM`` label on each battle card). Enemy ids are
+    read live per block so the list tracks edits; block positions come from
+    the cached :meth:`RomSession.scripted_battle_positions`.
+    """
+    from digimon_core import overlay5 as ov5
+    from digimon_core.map_labels import area_name
+
+    budget = BATTLE_SPRITE_TILE_BUDGET
+    issues: List[ValidationIssue] = []
+    for entry_ix, block_offset, chain_ix, _source_ix, map_id in \
+            session.scripted_battle_positions():
+        block = ov5._parse_battle_at(
+            session.overlay5_entry_bytes(entry_ix), block_offset,
+        )
+        if block is None:
+            continue
+        total = 0
+        for eid_raw in block.enemies:
+            eid = int(eid_raw) & 0xFFFF
+            if eid == ov5.BATTLE_ENEMY_EMPTY:
+                continue
+            fs = session.digimon_battle_footprint(eid)
+            if fs:
+                total += fs
+        if total <= budget:
+            continue
+        where = area_name(map_id) if map_id is not None else f"entry 0x{entry_ix:04X}"
+        issues.append(ValidationIssue(
+            section="Scripted Battles",
+            category="Sprite VRAM",
+            message=(
+                f"{where} (entry 0x{entry_ix:04X}+0x{block_offset:04X}): enemy "
+                f"sprites total {total} tiles, over the {budget}-tile VRAM pool "
+                "— this battle can crash on load."
+            ),
+            editor_key="cutscene_battle" if chain_ix >= 0 else "map_browser",
+            record_id=chain_ix if chain_ix >= 0 else None,
+        ))
+    return issues

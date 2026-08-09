@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
 from digimon_core import constants, model
 
 from .._perf import span
-from ..commands import ReskinSlotCommand, SetAttrCommand
+from ..commands import ReskinSlotCommand, SetAttrCommand, SyncChrsizeFootprintCommand
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
     BoundIdCombo,
@@ -297,6 +298,28 @@ class SpriteMapRow:
         top_form.addRow(self._status)
         outer.addLayout(top_form)
 
+        # --- reskin-safety: spawn-budget (CHRSIZE.BIN) vs displayed sprite ---
+        # The wild-encounter roll budgets each enemy against
+        # CHRSIZE.BIN[lo==id].hi (Σ fs ≤ 1440), but renders main_sprite.
+        # A reskin desyncs them → over-spawn → VRAM crash. Warn + offer a
+        # one-click sync of the budget to the displayed sprite's real fs.
+        self._pending_footprint_sync: Optional[Tuple[int, int]] = None
+        self._footprint_warn = QLabel("")
+        self._footprint_warn.setWordWrap(True)
+        self._footprint_warn.setStyleSheet("color: #c0392b;")
+        self._footprint_sync_btn = QPushButton("Sync")
+        self._footprint_sync_btn.setMaximumWidth(64)
+        self._footprint_sync_btn.clicked.connect(self._on_sync_footprint)
+        fp_row = QHBoxLayout()
+        fp_row.setContentsMargins(0, 0, 0, 0)
+        fp_row.setSpacing(6)
+        fp_row.addWidget(self._footprint_warn, 1)
+        fp_row.addWidget(self._footprint_sync_btn, 0, Qt.AlignTop)
+        self._footprint_widget = QWidget()
+        self._footprint_widget.setLayout(fp_row)
+        self._footprint_widget.setVisible(False)
+        outer.addWidget(self._footprint_widget)
+
         # --- divider checkbox ---
         self._customize_checkbox = QCheckBox("Customize sprite/string data manually")
         self._customize_checkbox.setChecked(False)
@@ -372,6 +395,7 @@ class SpriteMapRow:
         # the session level, so leaving the connections live would leak
         # into the next editor that acquires them.
         self._main_sprite_combo.currentIndexChanged.connect(self._refresh_battle_preview)
+        self._main_sprite_combo.currentIndexChanged.connect(self._refresh_footprint_check)
         self._overworld_combo.currentIndexChanged.connect(self._refresh_overworld_preview)
         self._upper_sprite_low_combo.currentIndexChanged.connect(self._refresh_portrait_preview)
         self._upper_sprite_high_combo.currentIndexChanged.connect(self._refresh_mini_preview)
@@ -430,6 +454,7 @@ class SpriteMapRow:
         """
         for combo, slot in (
             (self._main_sprite_combo, self._refresh_battle_preview),
+            (self._main_sprite_combo, self._refresh_footprint_check),
             (self._overworld_combo, self._refresh_overworld_preview),
             (self._upper_sprite_low_combo, self._refresh_portrait_preview),
             (self._upper_sprite_high_combo, self._refresh_mini_preview),
@@ -474,6 +499,7 @@ class SpriteMapRow:
         # Refresh previews first — each one handles its own "no slot / bad
         # id" case so the early-return branches below don't have to.
         self._refresh_all_previews()
+        self._refresh_footprint_check()
 
         if target_id < 0:
             self._combo.setEnabled(False)
@@ -585,6 +611,51 @@ class SpriteMapRow:
             spr_idx, max_size=self._preview_size
         ))
 
+    def _refresh_footprint_check(self, *_args) -> None:
+        """Show/hide the spawn-budget mismatch warning for the current id.
+
+        Reads ``main_sprite`` from the model (the source of truth, updated
+        synchronously by the picker/reskin command) and asks the session
+        whether ``CHRSIZE.BIN[lo==id].hi`` matches the displayed sprite's
+        real footprint. Surfaces a one-click Sync when they diverge;
+        hidden when there's no slot / no chrsize entry / in sync.
+        """
+        tid = self._target_id
+        if tid < 0 or not self._has_slot_for_target():
+            self._pending_footprint_sync = None
+            self._footprint_widget.setVisible(False)
+            return
+        main_sprite = self._sprite_map[tid].main_sprite
+        mismatch = self._session.chrsize_footprint_mismatch(tid, main_sprite)
+        if mismatch is None:
+            self._pending_footprint_sync = None
+            self._footprint_widget.setVisible(False)
+            return
+        entry_group, budget_fs, real_fs = mismatch
+        self._pending_footprint_sync = (entry_group, real_fs)
+        if real_fs > budget_fs:
+            tail = "wild encounters can over-spawn and crash (VRAM)."
+        else:
+            tail = "wild encounters under-spawn this id."
+        self._footprint_warn.setText(
+            f"⚠ Spawn budget {budget_fs} tiles ≠ displayed sprite "
+            f"{real_fs} — {tail}"
+        )
+        self._footprint_widget.setVisible(True)
+
+    def _on_sync_footprint(self) -> None:
+        if self._pending_footprint_sync is None:
+            return
+        entry_group, real_fs = self._pending_footprint_sync
+        name = self._session.digimon_display_name(self._target_id)
+        self._undo_stack.push(
+            SyncChrsizeFootprintCommand(
+                self._session, entry_group, real_fs,
+                f"Sync spawn footprint ({name})",
+                on_change=self._refresh_footprint_check,
+            )
+        )
+
     def _snap_reskin_text(self) -> None:
         """Revert free-typed text to the current item's label on focus-out."""
         line_edit = self._combo.lineEdit()
@@ -631,6 +702,11 @@ class SpriteMapRow:
                 source_str.value,
             )
         )
+        # The quick-reskin rewrites main_sprite on the model directly
+        # (the manual pickers don't fire), so refresh the previews and the
+        # spawn-budget check off the updated slot.
+        self._refresh_all_previews()
+        self._refresh_footprint_check()
 
 
 def displayed_as_suffix(

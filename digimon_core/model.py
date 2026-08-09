@@ -319,8 +319,13 @@ class MoveData:
     is_consumable: int
     num_hits: int
     move_range: int
-    unknown_0x14: int
-    unknown_0x16: int
+    # Verified in the ov2 battle executor FUN_0017cdbc — the old u16 "unknown"
+    # pair at 0x14/0x16 is really four independent bytes. (The actual damage
+    # power is primary_value at +8; +0x15 is the to-hit term, not damage.)
+    status_strength: int  # +0x14 u8 — base status-infliction value (trait-modified)
+    accuracy: int         # +0x15 u8 — to-hit contributor: rand(1000) < (this+offense)*(1000-def)/1000
+    crit_rate: int        # +0x16 u8 — +50%-damage chance (rand(100) < attacker_mod + this)
+    flinch_chance: int    # +0x17 u8 — flinch/turn-skip chance (rand(100) < this - target_resist)
     level_learned: int
     eos_bytes: int
 
@@ -338,8 +343,10 @@ class MoveData:
         self.is_consumable = int.from_bytes(move_data[0x10:0x12], byteorder="little")
         self.num_hits = move_data[0x12]
         self.move_range = move_data[0x13]
-        self.unknown_0x14 = int.from_bytes(move_data[0x14:0x16], byteorder="little")
-        self.unknown_0x16 = int.from_bytes(move_data[0x16:0x18], byteorder="little")
+        self.status_strength = move_data[0x14]
+        self.accuracy = move_data[0x15]
+        self.crit_rate = move_data[0x16]
+        self.flinch_chance = move_data[0x17]
         self.level_learned = int.from_bytes(move_data[0x18:0x1a], byteorder="little")
         self.eos_bytes = int.from_bytes(move_data[0x1a:0x1c], byteorder="little")
 
@@ -357,8 +364,10 @@ class MoveData:
         out[0x10:0x12] = self.is_consumable.to_bytes(2, byteorder="little")
         out[0x12] = self.num_hits
         out[0x13] = self.move_range
-        out[0x14:0x16] = self.unknown_0x14.to_bytes(2, byteorder="little")
-        out[0x16:0x18] = self.unknown_0x16.to_bytes(2, byteorder="little")
+        out[0x14] = self.status_strength & 0xFF
+        out[0x15] = self.accuracy & 0xFF
+        out[0x16] = self.crit_rate & 0xFF
+        out[0x17] = self.flinch_chance & 0xFF
         out[0x18:0x1a] = self.level_learned.to_bytes(2, byteorder="little")
         out[0x1a:0x1c] = self.eos_bytes.to_bytes(2, byteorder="little")
         return out
@@ -392,7 +401,8 @@ class BaseDataDigimon:
     steel_res: int
     water_res: int
     thunder_res: int
-    unknown_0x26: int
+    element_affinity: int      # +0x26 element/STAB affinity bitmask (bit0 Light .. bit7 Thunder)
+    unknown_0x27: int          # +0x27 second element-shaped mask; battle code reads only +0x26
     trait_1: int
     trait_2: int
     trait_3: int
@@ -432,7 +442,12 @@ class BaseDataDigimon:
         self.steel_res = int.from_bytes(digimon_data[0x20:0x22], byteorder="little")
         self.water_res = int.from_bytes(digimon_data[0x22:0x24], byteorder="little")
         self.thunder_res = int.from_bytes(digimon_data[0x24:0x26], byteorder="little")
-        self.unknown_0x26 = int.from_bytes(digimon_data[0x26:0x28], byteorder="little")
+        # +0x26 is the element-affinity mask read by the STAB check in the
+        # battle damage code (ov2 FUN_0017cdbc → species accessor FUN_00036bb8:
+        # `mask & (1 << move_element)` grants ×1.15). +0x27 is a separate
+        # element-shaped mask whose consumer is not yet identified.
+        self.element_affinity = digimon_data[0x26]
+        self.unknown_0x27 = digimon_data[0x27]
         self.trait_1 = digimon_data[0x28]
         self.trait_2 = digimon_data[0x29]
         self.trait_3 = digimon_data[0x2a]
@@ -519,7 +534,8 @@ class BaseDataDigimon:
         out[0x20:0x22] = self.steel_res.to_bytes(2, byteorder="little")
         out[0x22:0x24] = self.water_res.to_bytes(2, byteorder="little")
         out[0x24:0x26] = self.thunder_res.to_bytes(2, byteorder="little")
-        out[0x26:0x28] = self.unknown_0x26.to_bytes(2, byteorder="little")
+        out[0x26] = self.element_affinity
+        out[0x27] = self.unknown_0x27
         out[0x28] = self.trait_1
         out[0x29] = self.trait_2
         out[0x2a] = self.trait_3
@@ -565,7 +581,8 @@ class EnemyDataDigimon:
     steel_res: int
     water_res: int
     thunder_res: int
-    unknown_0x24: int
+    element_affinity: int      # +0x24 element affinity, SAME elements as base +0x26 but a
+    unknown_0x25: int          # different bit order (see __init__); +0x25 always 0 in vanilla
     trait_1: int  # enemy traits are 2 bytes each (unlike base data which is 1 byte)
     trait_2: int
     trait_3: int
@@ -613,7 +630,16 @@ class EnemyDataDigimon:
         self.steel_res = int.from_bytes(digimon_data[0x1e:0x20], byteorder="little")
         self.water_res = int.from_bytes(digimon_data[0x20:0x22], byteorder="little")
         self.thunder_res = int.from_bytes(digimon_data[0x22:0x24], byteorder="little")
-        self.unknown_0x24 = int.from_bytes(digimon_data[0x24:0x26], byteorder="little")
+        # +0x24 is the enemy table's copy of the element-affinity mask. It encodes
+        # the SAME elements as the base record's +0x26 mask, but in a DIFFERENT bit
+        # order — base is Light,Dark,Fire,Earth,Wind,Steel,Water,Thunder while the
+        # enemy table is Light,Fire,Water,Wind,Dark,Earth,Steel,Thunder (verified:
+        # enemy == permute(base) for all 398 named digimon). Combat STAB reads the
+        # base copy via FUN_00036bb8(species_id), not this field. Traced the enemy
+        # accessor FUN_00036c4c + all 11 call sites (battler build + scene setup):
+        # none read +0x24, so this copy appears vestigial. +0x25 is always 0.
+        self.element_affinity = digimon_data[0x24]
+        self.unknown_0x25 = digimon_data[0x25]
         self.trait_1 = int.from_bytes(digimon_data[0x26:0x28], byteorder="little")
         self.trait_2 = int.from_bytes(digimon_data[0x28:0x2a], byteorder="little")
         self.trait_3 = int.from_bytes(digimon_data[0x2a:0x2c], byteorder="little")
@@ -693,7 +719,8 @@ class EnemyDataDigimon:
         out[0x1e:0x20] = self.steel_res.to_bytes(2, byteorder="little")
         out[0x20:0x22] = self.water_res.to_bytes(2, byteorder="little")
         out[0x22:0x24] = self.thunder_res.to_bytes(2, byteorder="little")
-        out[0x24:0x26] = self.unknown_0x24.to_bytes(2, byteorder="little")
+        out[0x24] = self.element_affinity
+        out[0x25] = self.unknown_0x25
         out[0x26:0x28] = self.trait_1.to_bytes(2, byteorder="little")
         out[0x28:0x2a] = self.trait_2.to_bytes(2, byteorder="little")
         out[0x2a:0x2c] = self.trait_3.to_bytes(2, byteorder="little")
@@ -726,53 +753,45 @@ class EnemyDataDigimon:
 
 
 class FarmTerrain:
-    SIZE = 0x5c
+    """One 0x5c-byte farm-terrain record (17 total). Layout verified against the
+    arm9 accessors + overlay-6 consumers — see
+    ``research_docs/claude_notes/arm9_data_table_readers.md``. Every byte is
+    accounted for:
 
-    # field layout: most slots are still uncharacterized, kept as unknown_*
-    _UNKNOWN_FIELDS = [
-        (0x02, "unknown_0x2"),
-        (0x06, "unknown_0x6"),
-        (0x08, "unknown_0x8"),
-        (0x0A, "unknown_0xA"),
-        (0x0C, "unknown_0xC"),
-        (0x0E, "unknown_0xE"),
-        (0x10, "unknown_0x10"),
-        (0x12, "unknown_0x12"),
-        (0x14, "unknown_0x14"),
-        (0x16, "unknown_0x16"),
-        (0x18, "unknown_0x18"),
-        (0x1A, "unknown_0x1A"),
-        (0x1C, "unknown_0x1C"),
-        (0x1E, "unknown_0x1E"),
-        (0x20, "unknown_0x20"),
-        (0x22, "unknown_0x22"),
-        (0x24, "unknown_0x24"),
-        (0x26, "unknown_0x26"),
-        (0x28, "unknown_0x28"),
-        (0x2A, "unknown_0x2A"),
-        (0x2C, "unknown_0x2C"),
-        (0x2E, "unknown_0x2E"),
-        (0x30, "unknown_0x30"),
-        (0x32, "unknown_0x32"),
-        (0x34, "unknown_0x34"),
-        (0x36, "unknown_0x36"),
-        (0x38, "unknown_0x38"),
-        (0x3A, "unknown_0x3A"),
-        (0x3C, "unknown_0x3C"),
-        (0x3E, "unknown_0x3E"),
-        (0x40, "unknown_0x40"),
-        (0x42, "unknown_0x42"),
-        (0x44, "unknown_0x44"),
-        (0x46, "unknown_0x46"),
-        (0x48, "unknown_0x48"),
-        (0x4A, "unknown_0x4A"),
-    ]
+    - 0x00 id (u16)
+    - 0x02 ``secondary_id`` (s16, == id-370 in vanilla) — a sequential
+      per-terrain resource index cached into the farm-scene object at init;
+      the exact table it indexes (name / background / layout) is unconfirmed.
+    - 0x04 ``farm_digimon_limit`` — how many digimon this terrain holds
+      (`FUN_000d10e4`; the "can add digimon?" gate).
+    - 0x06..0x25 ``digimon{0..7}_x/_y`` — 8 on-screen placement coords for the
+      farm digimon (`FUN_000d10fc`; only the first ``farm_digimon_limit`` used).
+    - 0x26 ``farm_item_limit`` — how many decoration items this terrain holds.
+    - 0x28..0x47 ``item{0..7}_x/_y`` — 8 placement coords for farm decorations.
+    - 0x48/0x4A ``anchor_x/anchor_y`` — a single {x,y} home point (cursor/avatar).
+    - 0x4C..0x5B — 8 per-attribute EXP values.
+    """
+    SIZE = 0x5c
+    POSITION_COUNT = 8
+
+    # Named 2-byte fields for offsets 0x02..0x4B (id / limit / positions /
+    # anchor). EXP block (0x4C..) is handled explicitly below.
+    _FIELDS = (
+        [(0x02, "secondary_id"), (0x04, "farm_digimon_limit")]
+        + [pair for i in range(POSITION_COUNT)
+           for pair in ((0x06 + i * 4, f"digimon{i}_x"),
+                        (0x08 + i * 4, f"digimon{i}_y"))]
+        + [(0x26, "farm_item_limit")]
+        + [pair for i in range(POSITION_COUNT)
+           for pair in ((0x28 + i * 4, f"item{i}_x"),
+                        (0x2A + i * 4, f"item{i}_y"))]
+        + [(0x48, "anchor_x"), (0x4A, "anchor_y")]
+    )
 
     def __init__(self, digimon_data: bytearray, offset: int):
         self.offset = offset
         self.id = int.from_bytes(digimon_data[0:2], byteorder="little")
-        self.farm_digimon_limit = int.from_bytes(digimon_data[4:6], byteorder="little")
-        for field_offset, attr in self._UNKNOWN_FIELDS:
+        for field_offset, attr in self._FIELDS:
             setattr(self, attr, int.from_bytes(digimon_data[field_offset:field_offset + 2], byteorder="little"))
         self.holy_exp = int.from_bytes(digimon_data[0x4C:0x4E], byteorder="little")
         self.dark_exp = int.from_bytes(digimon_data[0x4E:0x50], byteorder="little")
@@ -786,8 +805,7 @@ class FarmTerrain:
     def getByteArray(self) -> bytearray:
         out = bytearray(self.SIZE)
         out[0:2] = self.id.to_bytes(2, byteorder="little")
-        out[4:6] = self.farm_digimon_limit.to_bytes(2, byteorder="little")
-        for field_offset, attr in self._UNKNOWN_FIELDS:
+        for field_offset, attr in self._FIELDS:
             out[field_offset:field_offset + 2] = getattr(self, attr).to_bytes(2, byteorder="little")
         out[0x4C:0x4E] = self.holy_exp.to_bytes(2, byteorder="little")
         out[0x4E:0x50] = self.dark_exp.to_bytes(2, byteorder="little")
@@ -1163,15 +1181,27 @@ class StarterEntry:
 class WildEncounter:
     """A single 24-byte wild-encounter record inside a wild-encounter area.
 
-    The interior bytes (filler 0x0C80 repetitions, the `unknown_0x12` field that
-    crashes the game when set to wrong values, the trailing 0xFFFF terminator)
-    aren't yet fully reverse-engineered, so we preserve the original 24 bytes
-    raw and overlay only the editable fields on serialize.
+    Field layout (verified against arm9 ``FUN_00058500``, the spawn selector —
+    see ``research_docs/claude_notes/wild_encounter_format.md``):
+    - 0x00 u16  digimon_id
+    - 0x02..0x10  placement coords (``0x0C80`` == wildcard / random position;
+      a non-``0x0C80`` value pins a fixed on-map roaming encounter). Preserved
+      raw — not yet split into named x/y pairs.
+    - 0x12 u16  ``spawn_chance`` — per-slot appearance chance, rolled each
+      battle against ``rand(100)`` (higher = more likely). Vanilla values are
+      multiples of 10 in 10..100.
+    - 0x14 u16  ``reward_slot`` — selects which encounter-reward table to roll.
+    - 0x16 u16  extra per-record param (0..0xFFFF; ``0xFFFF`` == none). Purpose
+      not yet pinned; preserved raw.
+
+    Coordinate slots and the 0x16 param stay in ``_raw`` and round-trip
+    untouched; only the named fields are overlaid on serialize.
     """
     SIZE = 0x18
 
     offset: int
     digimon_id: int
+    spawn_chance: int  # offset 0x12 — appearance chance %, rolled vs rand(100)
     reward_slot: int  # offset 0x14 — selects which encounter-reward table to roll
     _raw: bytearray
 
@@ -1179,11 +1209,13 @@ class WildEncounter:
         self.offset = offset
         self._raw = bytearray(data[:self.SIZE])
         self.digimon_id = int.from_bytes(self._raw[0:2], byteorder="little")
+        self.spawn_chance = int.from_bytes(self._raw[0x12:0x14], byteorder="little")
         self.reward_slot = int.from_bytes(self._raw[0x14:0x16], byteorder="little")
 
     def getByteArray(self) -> bytearray:
         out = bytearray(self._raw)
         out[0:2] = self.digimon_id.to_bytes(2, byteorder="little")
+        out[0x12:0x14] = self.spawn_chance.to_bytes(2, byteorder="little")
         out[0x14:0x16] = self.reward_slot.to_bytes(2, byteorder="little")
         return out
 
@@ -1208,8 +1240,16 @@ class WildEncounterArea:
     """
     SIZE = 0x200
     HEADER_SIZE = 0x10
+    # Engine cap: arm9 FUN_00058500 gathers candidates into a fixed 16-entry
+    # stack buffer (frame 0x1bc, array at sp+0xbc stride 0x10). num_encounters
+    # >= 17 overruns the frame -> stack smash -> crash. Vanilla max is 14.
+    MAX_ENCOUNTERS = 16
+    # FNT area files terminate the record list with a 4-byte `00 00 00 00`
+    # (digimon_id == 0). No trailing 0xFFFF padding in the trimmed file.
+    TERMINATOR = b"\x00\x00\x00\x00"
 
     offset: int
+    original_size: int
     num_encounters: int
     rate_lower: int
     rate_upper: int
@@ -1219,6 +1259,14 @@ class WildEncounterArea:
     def __init__(self, data: bytearray, offset: int):
         self.offset = offset
         self._raw = bytearray(data)
+        # Vanilla FNT file size, used to detect an add/remove-slot resize that
+        # can no longer ride the in-place ``writeToRom`` path (the session's
+        # wild-encounter FAT splice handles those instead).
+        self.original_size = len(self._raw)
+        self._reparse()
+
+    def _reparse(self) -> None:
+        """Rebuild the header fields + encounter list from ``_raw``."""
         self.num_encounters = int.from_bytes(self._raw[0:2], byteorder="little")
         self.rate_lower = int.from_bytes(self._raw[2:4], byteorder="little")
         self.rate_upper = int.from_bytes(self._raw[4:6], byteorder="little")
@@ -1230,9 +1278,102 @@ class WildEncounterArea:
             if dig_id == 0:
                 break
             self.encounters.append(
-                WildEncounter(self._raw[cur:cur + WildEncounter.SIZE], offset + cur)
+                WildEncounter(self._raw[cur:cur + WildEncounter.SIZE], self.offset + cur)
             )
             cur += WildEncounter.SIZE
+
+    @property
+    def is_resized(self) -> bool:
+        """True once an add/remove-slot changed the file's byte length."""
+        return len(self._raw) != self.original_size
+
+    def can_add_encounter(self) -> bool:
+        return len(self.encounters) < self.MAX_ENCOUNTERS
+
+    def _default_record(self) -> bytes:
+        """A plain random encounter (all-wildcard coords). Seeds digimon_id +
+        reward_slot from the last existing record so the new slot lands in the
+        area's level/reward range; the user retargets it in the editor."""
+        rec = bytearray(WildEncounter.SIZE)
+        for off in range(0x02, 0x12, 2):  # coord slots -> 0x0C80 wildcard
+            rec[off:off + 2] = (0x0C80).to_bytes(2, byteorder="little")
+        seed = self.encounters[-1] if self.encounters else None
+        digimon_id = seed.digimon_id if seed else 1
+        reward_slot = seed.reward_slot if seed else 0
+        rec[0:2] = (digimon_id & 0xFFFF).to_bytes(2, byteorder="little")
+        rec[0x12:0x14] = (30).to_bytes(2, byteorder="little")  # spawn_chance %
+        rec[0x14:0x16] = (reward_slot & 0xFFFF).to_bytes(2, byteorder="little")
+        rec[0x16:0x18] = (0xFFFF).to_bytes(2, byteorder="little")
+        return bytes(rec)
+
+    def _insert(self, index: int, enc: "WildEncounter") -> None:
+        """Splice ``enc`` into the record list at ``index``, preserving the
+        identity of every other encounter object (their ``offset`` shifts but
+        the instances are the same — undo commands may hold references)."""
+        index = max(0, min(index, len(self.encounters)))
+        # Bake any pending field/rate edits into _raw before mutating length.
+        self._raw = self.getByteArray()
+        pos = self.HEADER_SIZE + index * WildEncounter.SIZE
+        self._raw[pos:pos] = enc.getByteArray()
+        for existing in self.encounters[index:]:
+            existing.offset += WildEncounter.SIZE
+        enc.offset = self.offset + pos
+        self.encounters.insert(index, enc)
+        self.num_encounters = len(self.encounters)
+        self._raw[0:2] = self.num_encounters.to_bytes(2, byteorder="little")
+
+    def _remove(self, index: int) -> "WildEncounter":
+        enc = self.encounters[index]
+        self._raw = self.getByteArray()
+        pos = self.HEADER_SIZE + index * WildEncounter.SIZE
+        del self._raw[pos:pos + WildEncounter.SIZE]
+        del self.encounters[index]
+        for existing in self.encounters[index:]:
+            existing.offset -= WildEncounter.SIZE
+        self.num_encounters = len(self.encounters)
+        self._raw[0:2] = self.num_encounters.to_bytes(2, byteorder="little")
+        return enc
+
+    def add_encounter(
+        self, record_bytes: bytes = None, index: int = None,
+    ) -> "WildEncounter":
+        """Create + insert a new encounter and return the object. Raises
+        ValueError at the engine cap."""
+        if not self.can_add_encounter():
+            raise ValueError(
+                f"area is at the {self.MAX_ENCOUNTERS}-encounter engine cap"
+            )
+        rec = bytes(record_bytes) if record_bytes is not None else self._default_record()
+        if len(rec) != WildEncounter.SIZE:
+            raise ValueError(f"encounter record must be {WildEncounter.SIZE} bytes")
+        if index is None:
+            index = len(self.encounters)
+        enc = WildEncounter(rec, self.offset)  # real offset set in _insert
+        self._insert(index, enc)
+        return enc
+
+    def insert_encounter(self, index: int, enc: "WildEncounter") -> None:
+        """Re-insert an existing encounter object (undo/redo path — keeps the
+        same instance so its bound undo commands stay valid)."""
+        if not self.can_add_encounter():
+            raise ValueError(
+                f"area is at the {self.MAX_ENCOUNTERS}-encounter engine cap"
+            )
+        self._insert(index, enc)
+
+    def remove_encounter(self, index: int) -> "WildEncounter":
+        """Remove the encounter at ``index`` and return the object (so an undo
+        command can re-insert the same instance)."""
+        if not (0 <= index < len(self.encounters)):
+            raise IndexError(f"encounter index {index} out of range")
+        return self._remove(index)
+
+    def replace_raw(self, new_bytes: bytes) -> None:
+        """Install ``new_bytes`` as the file body and reparse (keeps
+        ``original_size`` so ``is_resized`` still reflects the vanilla delta).
+        Used by the .romproj wild-encounter-area edit channel on load."""
+        self._raw = bytearray(new_bytes)
+        self._reparse()
 
     def getByteArray(self) -> bytearray:
         out = bytearray(self._raw)
@@ -1480,6 +1621,55 @@ class Consumable:
         out[0xa:0xc] = self.secondary_effect_id.to_bytes(2, byteorder="little")
         out[0xc:0x10] = self.effect_value.to_bytes(4, byteorder="little")
         out[0x10:0x14] = self.flags.to_bytes(4, byteorder="little")
+        return out
+
+    def writeToRom(self, rom_data: bytearray):
+        rom_data[self.offset:self.offset + self.SIZE] = self.getByteArray()
+
+
+class TraitData:
+    """One 8-byte trait record: ``[index:u16, kind:u16, effect_type:u8,
+    value_mode:u8, magnitude:u16]``.
+
+    Indexed 1:1 with ``constants.TRAIT_ARRAY_STR``. ``index`` is the trait's own
+    slot (== position in the table). ``kind`` is the stacking mode read by the
+    battle aggregator (``FUN_00058f0c``): 0 = take the max among matching traits,
+    nonzero = sum them (every vanilla trait is 1 = additive). ``effect_type``
+    (byte ``+4``) selects the effect (see ``constants.TRAIT_EFFECT_TYPE_NAMES``).
+    ``value_mode`` (byte ``+5``, read by ``FUN_00058e24``) picks how ``magnitude``
+    applies: 0 = flat, 1 = percent of the base stat/damage (``base*mag/100``).
+    Earlier code read ``+4..+5`` as one u16, so percent traits surfaced as
+    ``0x1xx`` (e.g. Flame Aura ``0x127`` = type ``0x27`` + percent flag).
+    """
+    SIZE = 0x8
+    FLAT, PERCENT = 0, 1
+
+    offset: int
+    index: int
+    kind: int
+    effect_type: int
+    value_mode: int
+    magnitude: int
+
+    def __init__(self, data: bytearray, offset: int):
+        self.offset = offset
+        self.index = int.from_bytes(data[0:2], byteorder="little")
+        self.kind = int.from_bytes(data[2:4], byteorder="little")
+        self.effect_type = data[4]
+        self.value_mode = data[5]
+        self.magnitude = int.from_bytes(data[6:8], byteorder="little")
+
+    @property
+    def is_percent(self) -> bool:
+        return self.value_mode != self.FLAT
+
+    def getByteArray(self) -> bytearray:
+        out = bytearray(self.SIZE)
+        out[0:2] = self.index.to_bytes(2, byteorder="little")
+        out[2:4] = self.kind.to_bytes(2, byteorder="little")
+        out[4] = self.effect_type & 0xFF
+        out[5] = self.value_mode & 0xFF
+        out[6:8] = self.magnitude.to_bytes(2, byteorder="little")
         return out
 
     def writeToRom(self, rom_data: bytearray):

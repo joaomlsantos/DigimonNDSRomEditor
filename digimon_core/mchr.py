@@ -19,11 +19,13 @@ ambiguous (tall vs. wide), we default to *tall* — overworld content is
 virtually all standing humanoids/digimon. Validated end-to-end against all
 890 sprites in MCHR_CHR.PAK 2026-06-05.
 
-Sprite→palette index mapping is 1:1 for sprites 0..662; past that the
-mapping is irregular (sprite 663 → pal 664, sprite 754+ → pal sprite+16,
-others still unresolved). The codec is mapping-agnostic — callers pass the
-palette bytes they want. The editor exposes a per-sprite palette-index
-spinner so users can pin the right palette until we work out the table.
+Sprite→palette index mapping is 1:1 for sprites 0..662; past that it drifts
+(e.g. CHR 0x2ed → PAL 0x2fb) because 13 sprites carry 2-3 recolor palettes,
+making MCHR_PAL 16 entries longer than MCHR_CHR. The exact CHR→PAL map is
+read from the ARM9 overworld-sprite table by
+:func:`digimon_core.loaders.loadMchrChrToPalMap`. The codec itself is
+mapping-agnostic — callers pass the palette bytes they want; the editor
+resolves the default palette per sprite and lets users pin an alternate.
 
 Module surface:
 

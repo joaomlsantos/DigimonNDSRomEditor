@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import re
 import struct
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QUndoStack, qRgba
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -49,8 +50,15 @@ from ..commands import (
     PortBtchrSpriteCommand,
     ReplaceSpriteCommand,
 )
-from ._png_palette import build_palette_from_png, nearest_idx_opaque
+from ._png_palette import (
+    build_palette_from_png,
+    intensity_matched_palette,
+    nearest_idx_opaque,
+)
 from .collapsible import CollapsibleSection
+from .palette_batch_adjuster import PaletteBatchAdjuster
+from .palette_editor import PaletteEditor
+from .palette_grid import PaletteGrid
 from .form_helpers import add_unknown_form_row, wrap_tooltip
 from .cell_png_io import (
     CellPngContext,
@@ -73,6 +81,12 @@ from .transparent_picker import TransparentColorPicker
 BTCHR_PAK = "DAT/BTCHR.PAK"
 CHRSIZE_PATH = "DAT/BTCHR/CHRSIZE.BIN"
 PREVIEW_ZOOM = 2  # nearest-neighbor zoom so 64-pixel sprites are visible
+# Cap on the palette scroll's height — the bank is taller than the pane at the
+# minimum column count, so beyond this it scrolls instead of shoving the editor
+# down. PALETTE_COLS_MIN is the fewest swatches/row; widening the pane adds more.
+PALETTE_SCROLL_MAX_H = 360
+PALETTE_SWATCH = 20
+PALETTE_COLS_MIN = 8
 # Sheet default picks a width based on the digimon's on-screen footprint
 # so a 32×32 mini doesn't preview at 8 wide (lots of vertical padding) and
 # a 96×96 boss doesn't preview at 4 wide (very tall narrow strip). User
@@ -181,6 +195,50 @@ def compute_btchr_group_labels(session) -> List[str]:
     return out
 
 
+def scan_compressible_btchr(session, should_cancel=None, on_progress=None):
+    """Re-cover every BTCHR group with occupied-only OAM coverage and collect
+    the ones that actually shrink. Pure (no UI) so the header-bar menu action
+    and a headless test share it: ``should_cancel()`` aborts early (the call
+    then returns ``None``), ``on_progress(done, total)`` drives a progress bar.
+
+    Returns ``(ports, stats)`` — ``ports`` is ``[(group, BtchrSprite)]`` ready
+    for :class:`BatchCompressBtchrCommand`; ``stats`` carries ``old_sum`` /
+    ``new_sum`` (footprint totals over the shrinking groups), the ``tight`` /
+    ``declined`` skip counts, and ``savers`` = ``[(saved, group)]``.
+    """
+    pak_obj = session.sprite_pak(BTCHR_PAK)
+    total = btchr.parse_pak_groups(pak_obj)
+    ports = []
+    old_sum = new_sum = 0
+    tight = declined = 0
+    savers = []
+    for g in range(total):
+        if should_cancel is not None and should_cancel():
+            return None
+        if on_progress is not None:
+            on_progress(g, total)
+        entries = [
+            bytes(pak_obj.entries[g * btchr.GROUP_SIZE + i])
+            for i in range(btchr.GROUP_SIZE)
+        ]
+        try:
+            spr, old_fs, new_fs = btchrspr.compress_existing(entries)
+        except ValueError:
+            declined += 1
+            continue
+        if new_fs >= old_fs:
+            tight += 1
+            continue
+        ports.append((g, spr))
+        old_sum += old_fs
+        new_sum += new_fs
+        savers.append((old_fs - new_fs, g))
+    return ports, {
+        "old_sum": old_sum, "new_sum": new_sum,
+        "tight": tight, "declined": declined, "savers": savers,
+    }
+
+
 class BtchrBrowser(QWidget):
     """Read-only browser for BTCHR battle sprites."""
 
@@ -197,6 +255,12 @@ class BtchrBrowser(QWidget):
         self._current_group: Optional[int] = None
         self._current_decoded: Optional[btchr.BtchrDigimon] = None
         self._current_cell: int = 0
+        # group -> per-slot pixel histogram (for dominant-colour borrow match)
+        self._group_counts_cache: dict[int, Optional[List[int]]] = {}
+        # Non-None while the batch adjuster is dragging: a full palette with the
+        # selected slots recoloured, used to render a live preview of the sprite
+        # without committing. Cleared on Apply/Reset and on any re-decode.
+        self._preview_palette: Optional[List[Tuple[int, int, int]]] = None
         # Per-group tile-sheet width memory. Switching away from a
         # digimon and back restores the user's last pick instead of
         # snapping back to the bbox-based default.
@@ -408,6 +472,38 @@ class BtchrBrowser(QWidget):
         self._import_pal_btn = QPushButton("Import palette PNG…")
         self._import_pal_btn.clicked.connect(self._on_import_palette_png)
 
+        # Live palette editor (same widgets as the icons/portraits/ui browser):
+        # click a swatch to select, edit R/G/B + hex or the colour picker below.
+        # 8 colours per row with larger swatches — easier to see and click for
+        # recolour work (the 256-colour bank scrolls; the pane is collapsible).
+        self._palette_grid = PaletteGrid(cols=PALETTE_COLS_MIN, swatch=PALETTE_SWATCH)
+        self._palette_grid.set_select_mode(True)
+        self._palette_grid.set_multi_select(True)
+        self._palette_grid.setToolTip(wrap_tooltip(
+            "The sprite's 256-colour palette. Click a swatch to edit one colour "
+            "below; shift-click a range or drag a box to select several, then "
+            "shift them together with the H/S/L sliders (great for recolours). "
+            "Colours quantise to NDS 5-bit BGR555 on save. Slot 0 (diagonal "
+            "mark) is the transparent index."
+        ))
+        self._palette_grid.colorEdited.connect(self._apply_palette_color)
+        self._palette_editor = PaletteEditor()
+        self._palette_editor.colorEdited.connect(self._apply_palette_color)
+        self._palette_grid.selectedChanged.connect(
+            lambda s: self._palette_editor.set_slot(s, self._palette_grid.color_at(s))
+        )
+        # Batch recolour: shift H/S/L of every selected swatch by the same delta.
+        self._palette_adjuster = PaletteBatchAdjuster()
+        self._palette_grid.selectionChanged.connect(self._refresh_palette_adjuster)
+        self._palette_adjuster.previewChanged.connect(self._on_palette_preview)
+        self._palette_adjuster.committed.connect(self._apply_palette_colors)
+        # Coalesces rapid slider ticks into ~30 fps sprite re-renders so the
+        # live recolour preview stays smooth during a drag.
+        self._live_preview_timer = QTimer(self)
+        self._live_preview_timer.setSingleShot(True)
+        self._live_preview_timer.setInterval(33)
+        self._live_preview_timer.timeout.connect(self._refresh_preview)
+
         # Transparent-color picker — palette slot 0 of the live NCLR. The
         # engine honors index 0 as the transparent slot regardless of its
         # RGB, so changing the colour here mostly affects PNG round-trips
@@ -419,8 +515,20 @@ class BtchrBrowser(QWidget):
         # still draws those pixels — only the slot-0 RGB drives
         # transparency, not the colour.
         self._picker = TransparentColorPicker(
-            on_color_picked=self._apply_transparent_color
+            on_color_picked=self._apply_transparent_color,
+            on_slot_picked=self._pick_slot_from_rgb,
         )
+        # Eyedropper lives in the palette sidebar (distinct from the single-slot
+        # "Colour picker…" dialog). Click capture is the shared picker's slot-pick
+        # mode; this checkable button drives it and stays in sync both ways.
+        self._eyedropper_btn = QPushButton("Eyedropper")
+        self._eyedropper_btn.setCheckable(True)
+        self._eyedropper_btn.setToolTip(wrap_tooltip(
+            "Then click a pixel on the sprite preview to select its palette "
+            "slot — handy for finding which slot a given shade uses."
+        ))
+        self._eyedropper_btn.toggled.connect(self._picker.set_slot_pick_mode)
+        self._picker.slotPickModeChanged.connect(self._eyedropper_btn.setChecked)
 
         self._export_sheet_btn = QPushButton("Export tile sheet PNG…")
         self._export_sheet_btn.clicked.connect(self._on_export_sheet_png)
@@ -463,6 +571,69 @@ class BtchrBrowser(QWidget):
         self._export_per_cell_btn.clicked.connect(self._on_export_per_cell_pngs)
         self._import_per_cell_btn = QPushButton("Import per-cell PNGs…")
         self._import_per_cell_btn.clicked.connect(self._on_import_per_cell_pngs)
+        # Custom-OAM import: unlike the two above (which repaint pixels
+        # *through* the existing OAM layout), this generates a fresh OAM
+        # layout to fit each imported cell's dimensions and rebuilds the whole
+        # sprite kit — so you can import differently-shaped/animated sprites.
+        self._import_custom_cells_btn = QPushButton("Import cells → new OAM…")
+        self._import_custom_cells_btn.setToolTip(wrap_tooltip(
+            "Import one PNG per cell and rebuild the sprite with a freshly "
+            "generated OAM layout sized to each image (not limited to the "
+            "current sprite's shape). Cells share one concatenated tile bank; "
+            "the tpf / btchrsize sidecars are recomputed. Larger sprites can "
+            "exceed the tile budget — you'll be warned (they may glitch in "
+            "multi-sprite screens)."
+        ))
+        self._import_custom_cells_btn.clicked.connect(self._on_import_custom_cells)
+
+        # Consolidated sprite-sheet IO: one Export / one Import fronting the
+        # cells-sheet (composite) and per-cell paths, switched by a "Separate
+        # frames" toggle. The old four buttons stay in code, just hidden.
+        self._separate_frames_cb = QCheckBox("Separate frames (one PNG per cell)")
+        self._separate_frames_cb.setToolTip(wrap_tooltip(
+            "Off: the sprite sheet is one PNG with every frame composited side "
+            "by side. On: one PNG per frame. Applies to both Export and Import."
+        ))
+        self._export_sprite_sheet_btn = QPushButton("Export sprite sheet…")
+        self._export_sprite_sheet_btn.setToolTip(wrap_tooltip(
+            "Save the sprite's frames to PNG (read-only). Tick 'Separate frames' "
+            "for one PNG per frame instead of a single composite."
+        ))
+        self._export_sprite_sheet_btn.clicked.connect(self._on_export_sprite_sheet)
+        self._import_sprite_sheet_btn = QPushButton("Import sprite sheet…")
+        self._import_sprite_sheet_btn.setToolTip(wrap_tooltip(
+            "Repaint the sprite's art from a PNG (as written by Export sprite "
+            "sheet). Paints into the current OAM layout — cell count and OAM "
+            "rectangles are unchanged. Tick 'Separate frames' for one PNG per "
+            "frame. To reshape the sprite, use 'Import cells → new OAM' instead."
+        ))
+        self._import_sprite_sheet_btn.clicked.connect(self._on_import_sprite_sheet)
+
+        # Compress OAM: re-cover THIS sprite with occupied-only coverage (same
+        # pixels, tighter tile bank) to cut its footprint_scale — no art. Lets
+        # a sprite that overflows a VRAM budget (party pool / wild-spawn Σfs)
+        # drop under it. No-ops when the OAM is already tight.
+        self._compress_oam_btn = QPushButton("Compress OAM…")
+        self._compress_oam_btn.setToolTip(wrap_tooltip(
+            "Rebuild this sprite's OAM to cover only its non-transparent tiles "
+            "— identical pixels, fewer tiles per frame (lower footprint_scale). "
+            "Sparse silhouettes (wings, long bodies) shrink a lot; it lets them "
+            "fit VRAM budgets they currently exceed. Does nothing when the OAM "
+            "is already tight."
+        ))
+        self._compress_oam_btn.clicked.connect(self._on_compress_oam)
+
+        # Fit-to-512: lossless union re-cover first, and only if that still
+        # overflows the party-viewer cap (512 tiles/cell), trim the minimum
+        # faint edge tiles needed to fit — showing the pixel cost for approval.
+        self._compress_oam_fit_btn = QPushButton("Compress OAM (fit ≤512)…")
+        self._compress_oam_fit_btn.setToolTip(wrap_tooltip(
+            "Re-cover losslessly; if the sprite still just misses the 512-tile "
+            "party-viewer cap, trim the fewest faint edge pixels needed to fit "
+            "and show the exact cost first. Use for a boss that lands a little "
+            "over 512 (same gallery-safe union layout, just a hair smaller)."
+        ))
+        self._compress_oam_fit_btn.clicked.connect(self._on_compress_oam_fit)
 
         # .btchrspr: portable single-digimon sprite kit. Export packs the 5
         # PAK entries + the two sidecar u32s into one file; import replays
@@ -476,13 +647,84 @@ class BtchrBrowser(QWidget):
         # In-context duplicate: same op as the list's "+ Add Entry" button
         # but acts on the currently-selected group directly (no extra
         # picker step).
-        self._duplicate_entry_btn = QPushButton("Duplicate sprite entry")
+        self._duplicate_entry_btn = QPushButton("Duplicate entry")
         self._duplicate_entry_btn.setToolTip(
             "Append a new BTCHR group at the end of the list carrying a "
             "copy of this sprite's data. Equivalent to selecting + Add "
             "Entry below the list with this group selected."
         )
         self._duplicate_entry_btn.clicked.connect(self._on_add_entry)
+
+        # "Export as…" / "Import as…" dropdowns front every format & mode, so
+        # nothing has to be hidden behind a toggle and a new option is just one
+        # more menu row. Each row calls the existing per-format handler.
+        self._export_menu = QMenu(self)
+        self._export_menu.addAction(
+            "Sprite sheet (all frames, one PNG)…", self._on_export_cells_sheet_png)
+        self._export_menu.addAction(
+            "Individual frames (one PNG per frame)…", self._on_export_per_cell_pngs)
+        self._export_menu.addSeparator()
+        self._export_menu.addAction(
+            "Tile sheet (raw 8×8 tiles)…", self._on_export_sheet_png)
+        self._export_menu.addAction("Palette (PNG)…", self._on_export_palette_png)
+        self._export_menu.addSeparator()
+        self._export_menu.addAction(
+            ".btchrspr (portable sprite kit)…", self._on_export_btchrspr)
+        # Raw Nitro components in a submenu so the top menu stays short.
+        export_src = self._export_menu.addMenu("Source files (NCGR/NCLR/…)")
+        for _i, _name, _ext in self._SOURCE_COMPONENTS:
+            export_src.addAction(
+                f"{_name}…",
+                lambda _checked=False, i=_i, n=_name, e=_ext:
+                    self._on_export_source(i, n, e),
+            )
+        self._export_as_btn = QPushButton("Export…")
+        self._export_as_btn.setMenu(self._export_menu)
+
+        # The sprite-sheet / individual-frames rows honour the "Build new OAM
+        # layout on import" checkbox: on → rebuild the OAM sized to the images
+        # (reshape, obsoletes the old "Import cells → new OAM" button); off →
+        # paint into the current OAM rectangles.
+        self._import_menu = QMenu(self)
+        self._import_menu.addAction(
+            "Sprite sheet (all frames, one PNG)…",
+            self._on_import_cells_sheet_png)
+        self._import_menu.addAction(
+            "Individual frames (one PNG per frame)…",
+            self._on_import_per_cell_pngs)
+        self._import_menu.addSeparator()
+        self._import_menu.addAction(
+            "Tile sheet (raw 8×8 tiles)…", self._on_import_sheet_png)
+        self._import_menu.addAction("Palette (PNG)…", self._on_import_palette_png)
+        self._import_menu.addSeparator()
+        self._import_menu.addAction(
+            ".btchrspr (portable sprite kit)…", self._on_import_btchrspr)
+        # Raw Nitro components (re-derives fs/btchrsize to stay consistent).
+        import_src = self._import_menu.addMenu("Source files (NCGR/NCLR/…)")
+        for _i, _name, _ext in self._SOURCE_COMPONENTS:
+            import_src.addAction(
+                f"{_name}…",
+                lambda _checked=False, i=_i, n=_name, e=_ext:
+                    self._on_import_source(i, n, e),
+            )
+        self._import_as_btn = QPushButton("Import…")
+        self._import_as_btn.setMenu(self._import_menu)
+
+        # Every individual IO button is now a row on those two menus — kept in
+        # code (nothing deleted), just not laid out. "Import cells → new OAM"
+        # is folded into the Import dropdown + the Build-OAM checkbox below.
+        for _superseded in (
+            self._export_sheet_btn, self._import_sheet_btn,
+            self._export_cells_sheet_btn, self._import_cells_sheet_btn,
+            self._export_per_cell_btn, self._import_per_cell_btn,
+            self._export_sprite_sheet_btn, self._import_sprite_sheet_btn,
+            self._separate_frames_cb, self._compress_oam_fit_btn,
+            self._export_pal_btn, self._import_pal_btn,
+            self._export_btchrspr_btn, self._import_btchrspr_btn,
+            self._import_custom_cells_btn,
+        ):
+            _superseded.setParent(self)
+            _superseded.setVisible(False)
 
         # When on, an Indexed8 import also rebuilds the NCLR from the PNG's
         # embedded color table — matches the natural Aseprite/GIMP workflow
@@ -497,11 +739,35 @@ class BtchrBrowser(QWidget):
             "Off: index against the existing NCLR (colours may posterize)."
         )
 
+        # Applies to the two "Sprite sheet" / "Individual frames" import rows.
+        # On (default): rebuild a fresh OAM layout sized to the imported images
+        # — reshape the sprite freely (the old "Import cells → new OAM"). The
+        # only constraints are 8-px-multiple dimensions and uniform frame size.
+        # Off: paint the art into the sprite's existing OAM rectangles (layout
+        # and footprint_scale unchanged; art must already fit the current shape).
+        self._build_oam_on_import_cb = QCheckBox("Build new OAM layout on import")
+        self._build_oam_on_import_cb.setChecked(True)
+        self._build_oam_on_import_cb.setToolTip(wrap_tooltip(
+            "Sprite-sheet / individual-frames import only.\n"
+            "On (default): rebuild the OAM to fit the imported frames — reshape "
+            "the sprite to any size (frames must be multiples of 8 px and all "
+            "the same size). Recomputes the tile budget; larger sprites may "
+            "exceed VRAM and get a warning.\n"
+            "Off: paint the frames into the current OAM layout — cell count, "
+            "OAM rectangles, and footprint_scale stay put, so the art has to "
+            "fit the sprite's existing shape."
+        ))
+
         cells_controls = QFormLayout()
         cells_controls.addRow("Cell", self._cell_spin)
         cells_controls.addRow("", self._show_all_cells)
         cells_controls.addRow("", self._show_red_overlay_cb)
-        cells_controls.addRow("", self._bake_red_overlay_cb)
+        # "Include OAM coverage gaps in exported PNGs" is hidden (kept in code):
+        # now that imports can build a fresh gap-free OAM, baking the gap tint
+        # into exports is a niche concern. Reparented so it stays constructed
+        # and its handlers callable, just not laid out.
+        self._bake_red_overlay_cb.setParent(self)
+        self._bake_red_overlay_cb.setVisible(False)
 
         # ---- Animation playback + step editing -----------------------
         # Timer drives _anim_pos at the chosen FPS; _on_anim_tick reads
@@ -718,8 +984,11 @@ class BtchrBrowser(QWidget):
         # Right column: the Animation editor, always visible so the track
         # picker, playback controls, and editable step list sit beside the
         # preview instead of hidden in a bottom drawer.
-        anim_panel = QWidget()
-        anim_panel_layout = QVBoxLayout(anim_panel)
+        # Hidden as a whole (not collapsed to a strip) via the "Animation"
+        # view checkbox under the tabs — the Cells splitter then hands the
+        # freed width to the preview.
+        self._anim_panel = QWidget()
+        anim_panel_layout = QVBoxLayout(self._anim_panel)
         anim_panel_layout.setContentsMargins(0, 0, 0, 0)
         anim_header = QLabel("Animation")
         _hf = anim_header.font()
@@ -740,13 +1009,13 @@ class BtchrBrowser(QWidget):
         anim_btn_row.addWidget(self._anim_remove_btn)
         anim_panel_layout.addLayout(anim_btn_row)
 
-        cells_split = QSplitter(Qt.Horizontal)
-        cells_split.addWidget(cells_left)
-        cells_split.addWidget(anim_panel)
-        cells_split.setStretchFactor(0, 1)
-        cells_split.setStretchFactor(1, 0)
-        cells_split.setSizes([560, 300])
-        cells_layout.addWidget(cells_split, 1)
+        self._cells_split = QSplitter(Qt.Horizontal)
+        self._cells_split.addWidget(cells_left)
+        self._cells_split.addWidget(self._anim_panel)
+        self._cells_split.setStretchFactor(0, 1)
+        self._cells_split.setStretchFactor(1, 0)
+        self._cells_split.setSizes([560, 300])
+        cells_layout.addWidget(self._cells_split, 1)
 
         # ---- Tile sheet tab: width + columns spinners + sheet preview
         sheet_tab = QWidget()
@@ -774,61 +1043,65 @@ class BtchrBrowser(QWidget):
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         # Import/export buttons stay visible regardless of the active tab
-        # so the workflow doesn't require remembering which tab hosts
-        # which action. Two columns (tile sheet PNG | palette PNG), all
-        # four buttons pinned to the widest label so Export/Import line
-        # up across columns.
-        sheet_btns = (self._export_sheet_btn, self._import_sheet_btn)
-        per_cell_btns = (
-            self._export_cells_sheet_btn,
-            self._import_cells_sheet_btn,
-            self._export_per_cell_btn,
-            self._import_per_cell_btn,
+        # so the workflow doesn't require remembering which tab hosts which
+        # action. Every format/mode now lives inside the two "as…" dropdown
+        # menus; the standalone actions (compress, duplicate) sit in a second
+        # column. All buttons pinned to the widest label.
+        vis_btns = (
+            self._import_as_btn, self._export_as_btn,
+            self._compress_oam_btn, self._duplicate_entry_btn,
         )
-        pal_btns = (self._export_pal_btn, self._import_pal_btn)
-        kit_btns = (
-            self._export_btchrspr_btn,
-            self._import_btchrspr_btn,
-            self._duplicate_entry_btn,
-        )
+        # Pin all four to one width so they read as an aligned group. Target the
+        # width the dropdowns naturally take under the checkbox column (the
+        # widest sizeHint among the buttons *and* the two checkboxes) so nothing
+        # looks cramped.
         max_btn_w = max(
-            b.sizeHint().width()
-            for b in sheet_btns + per_cell_btns + pal_btns + kit_btns
+            w.sizeHint().width() for w in (
+                *vis_btns,
+                self._build_oam_on_import_cb, self._import_pal_with_sheet_cb,
+            )
         )
-        for b in sheet_btns + per_cell_btns + pal_btns + kit_btns:
-            b.setMinimumWidth(max_btn_w)
+        for b in vis_btns:
+            b.setFixedWidth(max_btn_w)
+        # Column 1 — the two "as…" dropdowns (every format/mode lives inside),
+        # Import above Export since importing is the common task. The two
+        # checkboxes beneath modify how the import rows behave.
         sheet_col = QVBoxLayout()
         sheet_col.setSpacing(4)
-        sheet_col.addWidget(self._export_sheet_btn)
-        sheet_col.addWidget(self._import_sheet_btn)
+        sheet_col.addWidget(self._import_as_btn)
+        sheet_col.addWidget(self._export_as_btn)
+        sheet_col.addWidget(self._build_oam_on_import_cb)
         sheet_col.addWidget(self._import_pal_with_sheet_cb)
         sheet_col.addStretch(1)
+        # Column 2 — the standalone actions (compress, duplicate).
         per_cell_col = QVBoxLayout()
         per_cell_col.setSpacing(4)
-        per_cell_col.addWidget(self._export_cells_sheet_btn)
-        per_cell_col.addWidget(self._import_cells_sheet_btn)
-        per_cell_col.addWidget(self._export_per_cell_btn)
-        per_cell_col.addWidget(self._import_per_cell_btn)
+        per_cell_col.addWidget(self._compress_oam_btn)
+        per_cell_col.addWidget(self._duplicate_entry_btn)
         per_cell_col.addStretch(1)
-        # Palette buttons share a column with the .btchrspr sprite-kit
-        # buttons — kit IO is a sibling operation (port a whole digimon
-        # vs. a single channel) and the visual gap between the two pairs
-        # keeps the two scopes distinct without burning extra columns.
-        pal_col = QVBoxLayout()
-        pal_col.setSpacing(4)
-        pal_col.addWidget(self._export_pal_btn)
-        pal_col.addWidget(self._import_pal_btn)
-        pal_col.addSpacing(12)
-        pal_col.addWidget(self._export_btchrspr_btn)
-        pal_col.addWidget(self._import_btchrspr_btn)
-        pal_col.addWidget(self._duplicate_entry_btn)
-        pal_col.addStretch(1)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(self._tabs, 1)
         right_layout.addWidget(self._coverage_note)
+
+        # View toggles: hide the whole palette / animation panel to give the
+        # preview the width. Hiding a splitter child hands its space to the
+        # sibling, so this reclaims the full pane (not a leftover strip).
+        # anim_panel exists now; palette_col is wired after it's built below.
+        view_col = QVBoxLayout()
+        view_col.setSpacing(4)
+        self._show_palette_cb = QCheckBox("Palette")
+        self._show_palette_cb.setChecked(True)
+        self._show_palette_cb.setToolTip("Show/hide the palette sidebar")
+        self._show_anim_cb = QCheckBox("Animation")
+        self._show_anim_cb.setChecked(True)
+        self._show_anim_cb.setToolTip("Show/hide the Cells-tab animation panel")
+        self._show_anim_cb.toggled.connect(self._anim_panel.setVisible)
+        view_col.addWidget(self._show_palette_cb)
+        view_col.addWidget(self._show_anim_cb)
+        view_col.addStretch(1)
 
         # Single row under the tabs: cell nav controls (leftmost — the
         # space the picker used to occupy), button columns, metadata,
@@ -842,7 +1115,7 @@ class BtchrBrowser(QWidget):
         actions_row.addSpacing(16)
         actions_row.addLayout(per_cell_col)
         actions_row.addSpacing(16)
-        actions_row.addLayout(pal_col)
+        actions_row.addLayout(view_col)
         actions_row.addSpacing(16)
         actions_row.addLayout(meta_form)
         actions_row.addStretch(1)
@@ -869,12 +1142,52 @@ class BtchrBrowser(QWidget):
         list_col_layout.addWidget(self._list, 1)
         list_col_layout.addWidget(self._add_entry_btn)
 
+        # Hidden as a whole (not collapsed to a strip) via the "Palette" view
+        # checkbox under the tabs — the outer splitter hands the freed width to
+        # the preview. Grid + single-slot editor + batch adjuster stack top to
+        # bottom; the 256-colour bank is taller than the pane at 8/row so the
+        # scroll caps and scrolls (h-bar off, room reserved for the v-bar).
+        self._palette_col = QWidget()
+        palette_col_layout = QVBoxLayout(self._palette_col)
+        palette_col_layout.setContentsMargins(4, 4, 4, 4)
+        palette_col_layout.setSpacing(6)
+        pal_header = QHBoxLayout()
+        palette_title = QLabel("Palette")
+        palette_title.setStyleSheet("font-weight: bold;")
+        pal_header.addWidget(palette_title)
+        pal_header.addStretch(1)
+        pal_header.addWidget(self._eyedropper_btn)
+        palette_col_layout.addLayout(pal_header)
+        self._pal_scroll = QScrollArea()
+        self._pal_scroll.setWidget(self._palette_grid)
+        self._pal_scroll.setWidgetResizable(False)
+        self._pal_scroll.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self._pal_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._pal_scroll.setMinimumWidth(self._palette_grid.width() + 20)
+        self._pal_scroll.setFixedHeight(
+            min(self._palette_grid.height() + 2, PALETTE_SCROLL_MAX_H)
+        )
+        palette_col_layout.addWidget(self._pal_scroll)
+        palette_col_layout.addWidget(self._palette_editor)
+        palette_col_layout.addWidget(self._palette_adjuster)
+        palette_col_layout.addLayout(self._build_borrow_palette_section())
+        palette_col_layout.addStretch(1)
+        # Never shrink below the full swatch grid (+ vertical scrollbar + margins).
+        self._pal_min_w = self._palette_grid.width() + 30
+        self._show_palette_cb.toggled.connect(self._palette_col.setVisible)
+        self._palette_col.setMinimumWidth(self._pal_min_w)
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(list_col)
         splitter.addWidget(right)
+        splitter.addWidget(self._palette_col)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([240, 800])
+        splitter.setStretchFactor(2, 0)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([230, 780, self._pal_min_w])
+        # Widening the palette pane reflows more swatches per row.
+        splitter.splitterMoved.connect(lambda *_: self._reflow_palette())
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -900,6 +1213,8 @@ class BtchrBrowser(QWidget):
             return
 
         d = self._current_decoded
+        self._sync_palette_grid()
+        self._reset_borrow()
         self._cell_spin.blockSignals(True)
         self._cell_spin.setRange(0, max(0, len(d.ncer.cells) - 1))
         self._cell_spin.setValue(0)
@@ -920,6 +1235,12 @@ class BtchrBrowser(QWidget):
             self._meta_footprint_scale.setText(
                 f"{stored_fs} (expected {derived_fs} — mini-header out of sync)"
             )
+        # Red when over the party-viewer VRAM cap — the sprite won't render
+        # there (see the note under the tabs + _update_coverage_note).
+        over_cap = derived_fs > btchrspr.PARTY_VIEWER_TPF_CAP
+        self._meta_footprint_scale.setStyleSheet(
+            "color: #c0392b; font-weight: bold;" if over_cap else ""
+        )
         layout = self._cell_layout()
         if layout is None:
             self._meta_cell_size.setText("—")
@@ -1128,7 +1449,7 @@ class BtchrBrowser(QWidget):
             return cached
         cell = d.ncer.cells[cell_idx]
         rgba, w, h = btchr.render_cell_rgba(
-            cell, d.tile_bytes, d.palette,
+            cell, d.tile_bytes, self._render_palette(),
             boundary_bytes=d.ncer.boundary_bytes,
         )
         if self._show_red_overlay_cb.isChecked():
@@ -1330,41 +1651,58 @@ class BtchrBrowser(QWidget):
         self._refresh_preview()
         self._refresh_sheet_preview()
 
-    def _update_coverage_note(self) -> None:
-        """Refresh the "red overlay means uncovered pixels" note.
-
-        Shows the total gap-pixel count for the current view (single
-        cell, or every cell in the strip) so the user knows how much of
-        the visible red is actually consequential. Hidden — along with
-        the overlay toggles — when the current sprite has no gaps.
-        """
+    def _orphaned_opaque_pixels(self) -> int:
+        """Non-transparent pixels in tiles no OAM references (won't render)."""
         if self._current_decoded is None:
-            self._coverage_note.setVisible(False)
-            self._show_red_overlay_cb.setEnabled(False)
-            self._bake_red_overlay_cb.setEnabled(False)
-            return
+            return 0
         d = self._current_decoded
-        if self._show_all_cells.isChecked():
-            total = sum(
-                self._cell_uncovered_pixel_count(i)
-                for i in range(len(d.ncer.cells))
-            )
-            scope = "across all cells"
-        else:
-            total = self._cell_uncovered_pixel_count(self._current_cell)
-            scope = f"in cell {self._current_cell}"
+        return btchr.count_orphaned_opaque_pixels(
+            d.tile_bytes, d.ncer.cells, d.ncer.boundary_bytes,
+        )
+
+    def _update_coverage_note(self) -> None:
+        """Flag sprite issues that stop it rendering correctly, and point at
+        the fix. Currently two, shown together when both apply:
+
+        - Over the party-viewer VRAM cap (tiles/cell > 512): the sprite won't
+          render in the party viewer / gallery (and large battles may crash).
+        - Orphaned content: non-transparent pixels in tiles no OAM references
+          (art stranded by earlier OAM edits) — never renders; Compress OAM
+          re-covers from the visible cells and drops the strays.
+
+        Silent for normal, in-budget sprites.
+        """
+        # The red-tint overlay toggles are a separate geometric preview aid
+        # (bbox holes); keep them keyed to actual gaps, independent of this note.
         sprite_has_gaps = self._sprite_has_gaps()
         self._show_red_overlay_cb.setEnabled(sprite_has_gaps)
         self._bake_red_overlay_cb.setEnabled(sprite_has_gaps)
-        if total <= 0:
+
+        lines: List[str] = []
+        d = self._current_decoded
+        if d is not None:
+            n_cells = len(d.ncer.cells)
+            fs = btchr.derived_footprint_scale(d.n_tiles, n_cells) if n_cells else 0
+            cap = btchrspr.PARTY_VIEWER_TPF_CAP
+            if fs > cap:
+                lines.append(
+                    f"{fs} tiles/cell exceeds the {cap}-tile party-viewer VRAM "
+                    "cap — this sprite won't render in the party viewer / gallery "
+                    "(large battles may also crash). Try \"Compress OAM\"; a "
+                    "genuinely large boss may not fit."
+                )
+            orphaned = self._orphaned_opaque_pixels()
+            if orphaned > 0:
+                lines.append(
+                    f"{orphaned} non-transparent pixel{'s' if orphaned != 1 else ''} "
+                    "sit in tiles no OAM references, so they won't render in-game "
+                    "(usually left over from OAM edits). Click \"Compress OAM\" to "
+                    "re-cover the sprite and clear them."
+                )
+        if not lines:
             self._coverage_note.setVisible(False)
             return
-        self._coverage_note.setText(
-            f"Red overlay: {total} pixel{'s' if total != 1 else ''} {scope} "
-            "sit inside the cell bounding box but no OAM covers them. "
-            "Content painted here (via PNG import) will not render "
-            "in-game, as the sprite's OAM layout leaves those gaps."
-        )
+        self._coverage_note.setText("\n".join(lines))
         self._coverage_note.setVisible(True)
 
     def _confirm_uncovered_content(self, lost: int) -> bool:
@@ -1379,6 +1717,8 @@ class BtchrBrowser(QWidget):
             f"{'s' if lost != 1 else ''} in regions that no OAM covers. "
             "Those pixels will not appear in-game — this sprite's OAM "
             "layout leaves gaps inside its bounding box.\n\n"
+            "Tip: enable \"Build new OAM layout on import\" to reshape the "
+            "sprite to fit the whole image instead.\n\n"
             "Import anyway?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1508,6 +1848,23 @@ class BtchrBrowser(QWidget):
 
     # ---- tile sheet PNG ------------------------------------------------
 
+    def _on_export_sprite_sheet(self) -> None:
+        """Consolidated sprite-sheet export — routes to the per-cell path when
+        'Separate frames' is ticked, else the single composite."""
+        if self._separate_frames_cb.isChecked():
+            self._on_export_per_cell_pngs()
+        else:
+            self._on_export_cells_sheet_png()
+
+    def _on_import_sprite_sheet(self) -> None:
+        """Consolidated sprite-sheet import (paints into the existing OAM
+        layout) — per-cell path when 'Separate frames' is ticked, else the
+        single composite."""
+        if self._separate_frames_cb.isChecked():
+            self._on_import_per_cell_pngs()
+        else:
+            self._on_import_cells_sheet_png()
+
     def _on_export_cells_sheet_png(self) -> None:
         """Export all cells composited into one row as a single PNG.
 
@@ -1550,18 +1907,18 @@ class BtchrBrowser(QWidget):
             QMessageBox.critical(self, "Export failed", f"Could not write {path}.")
 
     def _on_import_cells_sheet_png(self) -> None:
-        """Import a cells-composite PNG back into the sprite's tiles.
+        """Import one composite sprite-sheet PNG (all frames side by side).
 
-        Symmetric with :meth:`_on_export_cells_sheet_png`. Forces the
-        cells codec regardless of the view-mode combo — the OAM-rectangle
-        layout is what the file encodes. Delegates the actual decode +
-        undo wrapping to the shared :meth:`_import_cells_png`.
+        Honours the "Build new OAM layout on import" checkbox: on → split the
+        sheet into the sprite's frames and rebuild a fresh OAM sized to them;
+        off → paint the sheet into the existing OAM rectangles (symmetric with
+        :meth:`_on_export_cells_sheet_png`, via :meth:`_import_cells_png`).
         """
         if self._current_decoded is None or self._current_group is None:
             return
         d = self._current_decoded
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import cells sheet PNG", "", "PNG (*.png)"
+            self, "Import sprite sheet PNG", "", "PNG (*.png)"
         )
         if not path:
             return
@@ -1569,7 +1926,14 @@ class BtchrBrowser(QWidget):
         if img.isNull():
             QMessageBox.critical(self, "Import failed", f"Could not read {path}.")
             return
-        self._import_cells_png(img, d)
+        if self._build_oam_on_import_cb.isChecked():
+            n_cells = len(d.ncer.cells)
+            imgs = self._split_cells_sheet(img, n_cells) if n_cells > 1 else [img]
+            if imgs is None:
+                return
+            self._build_new_oam_from_images(imgs)
+        else:
+            self._import_cells_png(img, d)
 
     def _on_export_sheet_png(self) -> None:
         if self._current_decoded is None or self._current_group is None:
@@ -1982,18 +2346,65 @@ class BtchrBrowser(QWidget):
                 )
                 return
 
-    def _on_import_per_cell_pngs(self) -> None:
-        """Read 5 per-cell PNGs and rebuild the tile bank from them.
+    @staticmethod
+    def _order_frame_files(paths: List[str]) -> List[str]:
+        """Order selected frame files by the trailing number in each name
+        (so ``*_cell_0.png`` … ``*_cell_4.png`` land in cell order regardless
+        of the OS file-dialog's selection order); files without a number sort
+        after, lexically."""
+        def key(p: str):
+            nums = re.findall(r"\d+", os.path.basename(p))
+            return (0, int(nums[-1])) if nums else (1, os.path.basename(p).lower())
+        return sorted(paths, key=key)
 
-        User picks any one ``<base>_cell_<K>.png`` file; siblings for the
-        other cells are located by stripping the suffix and re-applying
-        each index. The OAM-inverse decode is delegated to
-        ``cell_png_io.import_per_cell_to_tiles``; this method handles
-        file discovery, palette-rebuild dispatch, and undo wrapping.
+    def _on_import_per_cell_pngs(self) -> None:
+        """Import one PNG per frame (multi-select).
+
+        Select exactly one file per cell; they're ordered by the trailing
+        number in each name. Honours the "Build new OAM layout on import"
+        checkbox: on → rebuild a fresh OAM sized to the frames; off → paint
+        the frames into the sprite's existing OAM rectangles.
         """
         if self._current_decoded is None or self._current_group is None:
             return
         d = self._current_decoded
+        n_cells = len(d.ncer.cells)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"Import {n_cells} frame PNGs (one per cell, order 0..{n_cells - 1})",
+            "", "PNG (*.png)",
+        )
+        if not paths:
+            return
+        if len(paths) != n_cells:
+            QMessageBox.critical(
+                self, "Wrong number of frames",
+                f"This sprite has {n_cells} cells — select exactly {n_cells} "
+                f"frame PNGs (you selected {len(paths)}).",
+            )
+            return
+        paths = self._order_frame_files(paths)
+        pngs: List[QImage] = []
+        for p in paths:
+            im = QImage(p)
+            if im.isNull():
+                QMessageBox.critical(self, "Import failed", f"Could not read {p}.")
+                return
+            pngs.append(im)
+        if self._build_oam_on_import_cb.isChecked():
+            self._build_new_oam_from_images(pngs)
+        else:
+            self._paint_per_cell_into_layout(pngs, d)
+
+    def _paint_per_cell_into_layout(
+        self, pngs: List[QImage], d: btchr.BtchrDigimon,
+    ) -> None:
+        """Paint per-cell frames into the sprite's existing OAM rectangles
+        (no reshape). Delegates the OAM-inverse decode to
+        ``cell_png_io.import_per_cell_to_tiles``; handles palette-rebuild
+        dispatch and undo wrapping."""
+        if self._current_group is None:
+            return
         layout = self._cell_layout()
         if layout is None:
             QMessageBox.critical(
@@ -2002,40 +2413,18 @@ class BtchrBrowser(QWidget):
             )
             return
         _, max_w, max_h = layout
-        n_cells = len(d.ncer.cells)
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import per-cell PNGs (pick any cell)",
-            "", "PNG (*.png)",
-        )
-        if not path:
-            return
-        m = re.match(r"^(.*)_cell_(\d+)\.png$", path, re.IGNORECASE)
-        if not m:
+        bad = [
+            f"{im.width()}×{im.height()}"
+            for im in pngs if (im.width(), im.height()) != (max_w, max_h)
+        ]
+        if bad:
             QMessageBox.critical(
-                self, "Bad filename",
-                "Per-cell PNGs must follow the pattern "
-                "'<name>_cell_<N>.png'.\n"
-                f"Got: {os.path.basename(path)}",
+                self, "Frame size mismatch",
+                f"Painting into the current layout needs every frame at "
+                f"{max_w}×{max_h} px (the sprite's cell size). Enable \"Build "
+                "new OAM layout on import\" to import differently-sized frames.",
             )
             return
-        base = m.group(1)
-        pngs: List[QImage] = []
-        for ci in range(n_cells):
-            sibling = f"{base}_cell_{ci}.png"
-            if not os.path.exists(sibling):
-                QMessageBox.critical(
-                    self, "Missing cell PNG",
-                    f"Expected file not found:\n{sibling}",
-                )
-                return
-            cell_img = QImage(sibling)
-            if cell_img.isNull():
-                QMessageBox.critical(
-                    self, "Import failed",
-                    f"Could not read {sibling}.",
-                )
-                return
-            pngs.append(cell_img)
 
         # Palette decision — same checkbox semantics as the composite path.
         # ``rebuild_palette`` path delegates to the shared helper so the
@@ -2110,6 +2499,301 @@ class BtchrBrowser(QWidget):
             self._session,
             replacements,
             description=desc,
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+
+    # ---- palette (live grid + inline editor) ---------------------------
+
+    def _sync_palette_grid(self) -> None:
+        """Feed the palette grid + inline editor the current sprite's 256-colour
+        NCLR. Called after every (re)decode so bank edits / undo reflect live."""
+        self._preview_palette = None  # any live recolour preview is now stale
+        d = self._current_decoded
+        if d is None:
+            self._palette_grid.set_palette([])
+            self._palette_editor.set_slot(-1)
+            return
+        self._palette_grid.set_palette(list(d.palette))
+        self._pal_scroll.setFixedHeight(
+            min(self._palette_grid.height() + 2, PALETTE_SCROLL_MAX_H)
+        )
+        sel = self._palette_grid.selected()
+        self._palette_editor.set_slot(
+            sel, self._palette_grid.color_at(sel) if sel >= 0 else (0, 0, 0)
+        )
+        # Re-snapshot the batch adjuster from the (possibly re-coloured) palette
+        # so an Apply lands one undo step and the next delta starts clean.
+        self._refresh_palette_adjuster()
+
+    def _refresh_palette_adjuster(self) -> None:
+        """Feed the batch adjuster the current multi-selection (slot 0 excluded —
+        it's transparent, so recolouring its RGB is pointless)."""
+        self._palette_grid.set_preview(None)  # drop any stale transform tint
+        slots = [s for s in self._palette_grid.selected_slots() if s != 0]
+        colors = [self._palette_grid.color_at(s) for s in slots]
+        self._palette_adjuster.set_selection(slots, colors)
+
+    def _reflow_palette(self) -> None:
+        """Fit as many swatches per row as the palette pane's width allows
+        (≥ the minimum), then re-cap the scroll height to the new grid height."""
+        avail = self._pal_scroll.viewport().width()
+        cols = max(PALETTE_COLS_MIN, avail // PALETTE_SWATCH)
+        self._palette_grid.set_cols(cols)
+        self._pal_scroll.setFixedHeight(
+            min(self._palette_grid.height() + 2, PALETTE_SCROLL_MAX_H)
+        )
+
+    def _pick_slot_from_rgb(self, rgb: Tuple[int, int, int]) -> None:
+        """Eyedropper: select the palette slot matching a clicked sprite pixel.
+        The rendered pixel IS a palette colour, so an exact match is expected;
+        fall back to nearest if the click landed on a blended/overlay pixel."""
+        d = self._current_decoded
+        if d is None:
+            return
+        target = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        match = next(
+            (i for i, c in enumerate(d.palette) if tuple(c) == target), None
+        )
+        if match is None:
+            match = min(
+                range(len(d.palette)),
+                key=lambda i: sum(
+                    (a - b) ** 2 for a, b in zip(d.palette[i], target)
+                ),
+            )
+        if not self._show_palette_cb.isChecked():
+            self._show_palette_cb.setChecked(True)  # reveal so the pick is seen
+        self._palette_grid.select_slot(match)
+        x, y = self._palette_grid.slot_top_left(match)
+        self._pal_scroll.ensureVisible(x, y, 0, 40)
+
+    def _render_palette(self) -> List[Tuple[int, int, int]]:
+        """Palette the cell preview renders with — the live batch-adjust preview
+        while dragging, else the sprite's committed NCLR."""
+        if self._preview_palette is not None:
+            return self._preview_palette
+        return self._current_decoded.palette if self._current_decoded else []
+
+    def _on_palette_preview(self, overrides: Dict[int, Tuple[int, int, int]]) -> None:
+        """Batch adjuster preview: tint the swatches AND live-recolour the sprite
+        (throttled) without committing. Empty ``overrides`` clears both."""
+        self._palette_grid.set_preview(overrides)
+        d = self._current_decoded
+        if d is None:
+            return
+        if overrides:
+            pal = list(d.palette)
+            for slot, rgb in overrides.items():
+                if 0 <= slot < len(pal):
+                    pal[slot] = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            self._preview_palette = pal
+        else:
+            self._preview_palette = None
+        self._cell_pixmaps = []  # palette changed → re-render the composed cells
+        if not self._live_preview_timer.isActive():
+            self._live_preview_timer.start()
+
+    # ---- borrow palette (scroll other groups' palettes, preview, then copy) --
+
+    def _build_borrow_palette_section(self) -> QVBoxLayout:
+        box = QVBoxLayout()
+        box.setSpacing(3)
+        title = QLabel("Borrow palette")
+        title.setStyleSheet("font-weight: bold;")
+        box.addWidget(title)
+        hint = QLabel("Scroll another sprite's palette onto this one, then apply.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 10px;")
+        box.addWidget(hint)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(QLabel("From #"))
+        self._borrow_spin = QSpinBox()
+        self._borrow_spin.setRange(0, max(0, self._n_groups - 1))
+        self._borrow_spin.setToolTip(
+            "Preview this sprite under another group's palette (non-destructive). "
+            "\"Use this palette\" copies it in as one undo step."
+        )
+        self._borrow_spin.valueChanged.connect(self._on_borrow_changed)
+        row.addWidget(self._borrow_spin, 1)
+        box.addLayout(row)
+        # Battle sprites map pixels to slots tuned to their own palette, so a
+        # raw copy scrambles the colours — match by brightness so the shading
+        # survives. On by default here (off for icons/overworld, which carry
+        # foreign palettes fine).
+        self._borrow_match_cb = QCheckBox("Match by brightness")
+        self._borrow_match_cb.setChecked(True)
+        self._borrow_match_cb.setToolTip(wrap_tooltip(
+            "Remap each of this sprite's slots to the source colour of nearest "
+            "brightness (dark stays dark, highlights stay light) so a borrowed "
+            "palette reads coherently. Off = raw slot-for-slot copy."
+        ))
+        self._borrow_match_cb.toggled.connect(
+            lambda _=False: self._on_borrow_changed(self._borrow_spin.value())
+        )
+        box.addWidget(self._borrow_match_cb)
+        self._borrow_name = QLabel("")
+        self._borrow_name.setWordWrap(True)
+        self._borrow_name.setStyleSheet("font-size: 10px;")
+        box.addWidget(self._borrow_name)
+        self._borrow_apply_btn = QPushButton("Use this palette")
+        self._borrow_apply_btn.setEnabled(False)
+        self._borrow_apply_btn.clicked.connect(self._on_borrow_apply)
+        box.addWidget(self._borrow_apply_btn)
+        return box
+
+    def _group_palette(self, g: int) -> Optional[List[Tuple[int, int, int]]]:
+        """The 256-colour NCLR palette of group ``g`` (entry 2), or None."""
+        if not (0 <= g < self._n_groups):
+            return None
+        try:
+            nclr_raw = sprite.decompress_rle30(
+                self._pak.entries[g * btchr.GROUP_SIZE + 2]
+            )
+            palettes, _ = sprite.parse_nclr(nclr_raw)
+            return list(palettes[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _group_pixel_counts(self, g: int) -> Optional[List[int]]:
+        """Per-slot pixel usage of group ``g``'s sprite (its 8bpp NCGR tiles),
+        used to weight the borrow match toward the source's dominant colours.
+        Cached — borrow-scrolling revisits the same groups."""
+        if g in self._group_counts_cache:
+            return self._group_counts_cache[g]
+        counts: Optional[List[int]] = None
+        try:
+            ncgr_raw = sprite.decompress_rle30(
+                self._pak.entries[g * btchr.GROUP_SIZE + 1]
+            )
+            tile_bytes, *_ = sprite.parse_ncgr(ncgr_raw)
+            counts = [0] * 256
+            for b in tile_bytes:
+                counts[b] += 1
+        except (ValueError, IndexError):
+            counts = None
+        self._group_counts_cache[g] = counts
+        return counts
+
+    def _reset_borrow(self) -> None:
+        """Return the borrow spinner to the current group (= preview own palette)
+        and clear any borrow preview. Called on (re)selection."""
+        if self._current_group is None:
+            return
+        self._borrow_spin.blockSignals(True)
+        self._borrow_spin.setValue(self._current_group)
+        self._borrow_spin.blockSignals(False)
+        self._borrow_name.setText("")
+        self._borrow_apply_btn.setEnabled(False)
+
+    def _borrowed_palette(self, g: int) -> Optional[List[Tuple[int, int, int]]]:
+        """Source group ``g``'s palette as it would land on THIS sprite —
+        brightness-matched to the sprite's own slots when the toggle is on,
+        else a raw copy."""
+        src = self._group_palette(g)
+        if src is None:
+            return None
+        if self._borrow_match_cb.isChecked() and self._current_decoded is not None:
+            return intensity_matched_palette(
+                list(self._current_decoded.palette), src,
+                source_counts=self._group_pixel_counts(g),
+            )
+        return src
+
+    def _on_borrow_changed(self, g: int) -> None:
+        """Live-preview the current sprite under group ``g``'s palette (no
+        commit). Selecting the current group clears the preview."""
+        if self._current_group is None:
+            return
+        if g == self._current_group:
+            self._preview_palette = None
+            self._borrow_name.setText("")
+            self._borrow_apply_btn.setEnabled(False)
+        else:
+            pal = self._borrowed_palette(g)
+            if pal is None:
+                return
+            self._preview_palette = pal
+            name = self._name_for_group(g)
+            self._borrow_name.setText(
+                f"0x{g:04x}" + (f" — {name}" if name else "")
+            )
+            self._borrow_apply_btn.setEnabled(True)
+        self._cell_pixmaps = []
+        self._refresh_preview()
+
+    def _on_borrow_apply(self) -> None:
+        """Copy the previewed group's palette into this sprite's NCLR — one undo
+        step (reuses the batch write). Then clear the borrow preview."""
+        if self._current_group is None:
+            return
+        g = self._borrow_spin.value()
+        if g == self._current_group:
+            return
+        pal = self._borrowed_palette(g)
+        if pal is None:
+            return
+        self._apply_palette_colors({i: c for i, c in enumerate(pal)})
+        # _apply_palette_colors → refresh re-decodes + _sync_palette_grid, which
+        # clears _preview_palette; snap the spinner back to self.
+        self._reset_borrow()
+
+    def _apply_palette_colors(self, mapping: Dict[int, Tuple[int, int, int]]) -> None:
+        """Recolour several NCLR slots in one undoable step (the batch adjuster's
+        Apply). Same NCLR rebuild as :meth:`_apply_palette_color`, just many
+        slots at once."""
+        if self._current_decoded is None or self._current_group is None:
+            return
+        palette = list(self._current_decoded.palette)
+        changed = 0
+        for slot, rgb in mapping.items():
+            new = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            if 0 <= slot < len(palette) and palette[slot] != new:
+                palette[slot] = new
+                changed += 1
+        if changed == 0:
+            return  # no net change (e.g. hue-rotating black) — no empty undo step
+        group = self._current_group
+        nclr_raw = sprite.decompress_rle30(
+            self._pak.entries[self._nclr_entry_idx(group)]
+        )
+        new_nclr = sprite.build_nclr_from_template(nclr_raw, {0: palette})
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(BTCHR_PAK, self._nclr_entry_idx(group),
+              sprite.compress_rle30(new_nclr))],
+            description=f"Adjust BTCHR palette 0x{group:04x} ({changed} colours)",
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+
+    def _apply_palette_color(self, slot: int, rgb: Tuple[int, int, int]) -> None:
+        """Recolor one palette slot of the sprite's NCLR (5-bit BGR555-quantised
+        on save) and push an undoable ReplaceSpriteCommand. Only the NCLR
+        changes — the CHR indices still point at the same slot."""
+        if self._current_decoded is None or self._current_group is None:
+            return
+        palette = list(self._current_decoded.palette)
+        if not (0 <= slot < len(palette)):
+            return
+        palette[slot] = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        group = self._current_group
+        nclr_raw = sprite.decompress_rle30(
+            self._pak.entries[self._nclr_entry_idx(group)]
+        )
+        new_nclr = sprite.build_nclr_from_template(nclr_raw, {0: palette})
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(BTCHR_PAK, self._nclr_entry_idx(group),
+              sprite.compress_rle30(new_nclr))],
+            description=f"Edit BTCHR palette 0x{group:04x} slot {slot}",
             on_change=self._refresh_after_pak_change,
         )
         if self._undo_stack is not None:
@@ -2229,6 +2913,418 @@ class BtchrBrowser(QWidget):
             QMessageBox.critical(
                 self, "Export failed", f"Could not write {path}: {exc}"
             )
+
+    @staticmethod
+    def _palette_from_cell_images(imgs: List[QImage]):
+        """Median-cut a shared 256-colour palette from every cell image's
+        opaque pixels (all cells share one NCLR). Returns None if fully
+        transparent."""
+        total_h = sum(im.height() for im in imgs)
+        max_w = max((im.width() for im in imgs), default=0)
+        if max_w == 0 or total_h == 0:
+            return None
+        stack = QImage(max_w, total_h, QImage.Format_RGBA8888)
+        stack.fill(qRgba(0, 0, 0, 0))
+        painter = QPainter(stack)
+        y = 0
+        for im in imgs:
+            painter.drawImage(0, y, im)
+            y += im.height()
+        painter.end()
+        built = build_palette_from_png(stack, total_slots=256)
+        return None if built is None else list(built)
+
+    def _split_cells_sheet(self, sheet: QImage, n_cells: int) -> Optional[List[QImage]]:
+        """Split one composite cells-sheet into ``n_cells`` uniform slot images.
+
+        Grid layout follows the ``btchr_columns`` tEXt chunk that
+        ``Export cells sheet`` writes; absent that, a single row of
+        ``n_cells``. Returns None (after an error dialog) if the sheet doesn't
+        divide into a whole grid of 8-aligned slots."""
+        if sheet.isNull():
+            QMessageBox.critical(self, "Import failed", "Could not read the sheet PNG.")
+            return None
+        txt = sheet.text("btchr_columns")
+        try:
+            columns = max(1, min(n_cells, int(txt))) if txt else n_cells
+        except ValueError:
+            columns = n_cells
+        rows = (n_cells + columns - 1) // columns
+        if sheet.width() % columns or sheet.height() % rows:
+            QMessageBox.critical(
+                self, "Can't split sheet",
+                f"A {n_cells}-cell sheet is read as a {columns}×{rows} grid, but "
+                f"{sheet.width()}×{sheet.height()} px doesn't divide evenly. Use a "
+                f"grid exported from 'Export cells sheet', or pick {n_cells} "
+                "separate images instead.",
+            )
+            return None
+        sw, sh = sheet.width() // columns, sheet.height() // rows
+        if sw % 8 or sh % 8:
+            QMessageBox.critical(
+                self, "Bad slot size",
+                f"Each cell slot works out to {sw}×{sh} px — both must be "
+                "multiples of 8.",
+            )
+            return None
+        return [
+            sheet.copy((k % columns) * sw, (k // columns) * sh, sw, sh)
+            for k in range(n_cells)
+        ]
+
+    def _on_import_custom_cells(self) -> None:
+        """Legacy "Import cells → new OAM" entry point (button hidden; folded
+        into the Import dropdown + Build-OAM checkbox). Accepts one composite
+        cells-sheet PNG (split into the cells' grid) or one PNG per cell, then
+        delegates to :meth:`_build_new_oam_from_images`."""
+        if self._current_decoded is None or self._current_group is None:
+            return
+        n_cells = len(self._current_decoded.ncer.cells)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"Import 1 cells-sheet PNG or {n_cells} per-cell PNGs "
+            f"(cell order 0..{n_cells - 1})",
+            "", "PNG (*.png)",
+        )
+        if not paths:
+            return
+        if len(paths) == 1 and n_cells > 1:
+            imgs = self._split_cells_sheet(QImage(paths[0]), n_cells)
+            if imgs is None:
+                return
+        elif len(paths) == n_cells:
+            imgs = [QImage(p) for p in self._order_frame_files(paths)]
+        else:
+            QMessageBox.critical(
+                self, "Wrong number of images",
+                f"This sprite has {n_cells} cells — select one composite sheet "
+                f"PNG or exactly {n_cells} per-cell PNGs (you selected "
+                f"{len(paths)}).",
+            )
+            return
+        self._build_new_oam_from_images(imgs)
+
+    # ---- raw source-file (Nitro) IO ------------------------------------
+    # (entry index, label, extension). Order: the four standard Nitro files an
+    # external tool edits, then the mini-header. Entry 0 = mini-header, 1 =
+    # NCGR, 2 = NCLR, 3 = NCER, 4 = NANR.
+    _SOURCE_COMPONENTS = (
+        (1, "NCGR", "NCGR"),
+        (2, "NCLR", "NCLR"),
+        (3, "NCER", "NCER"),
+        (4, "NANR", "NANR"),
+        (0, "Mini-header", "bin"),
+    )
+
+    def _on_export_source(self, idx: int, name: str, ext: str) -> None:
+        """Write one PAK component out as its decompressed standard Nitro file,
+        editable in NitroPaint etc."""
+        if self._current_group is None:
+            return
+        group = self._current_group
+        raw = sprite.decompress_rle30(
+            self._pak.entries[group * btchr.GROUP_SIZE + idx]
+        )
+        stem = name.lower().replace("-", "")
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Export {name}", f"btchr_0x{group:04x}_{stem}.{ext}",
+            f"{name} (*.{ext});;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "wb") as fh:
+                fh.write(raw)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export failed", f"Could not write {path}: {exc}")
+
+    def _on_import_source(self, idx: int, name: str, ext: str) -> None:
+        """Replace one PAK component from a standard Nitro file, then re-derive
+        the mini-header fs/flag + btchrsize so the sprite stays loadable
+        (``btchrspr.rebuild_from_entries``). One undo step."""
+        if self._current_decoded is None or self._current_group is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Import {name}", "", f"{name} (*.{ext});;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            QMessageBox.critical(self, "Import failed", f"Could not read {path}: {exc}")
+            return
+        group = self._current_group
+        cur = [
+            bytes(self._pak.entries[group * btchr.GROUP_SIZE + i]) for i in range(5)
+        ]
+        digimon_id = self._session.current_chrsize_word(group) & 0xFFFF
+        try:
+            spr = btchrspr.rebuild_from_entries(cur, digimon_id, {idx: data})
+        except Exception as exc:  # noqa: BLE001 — surface any codec error to the user
+            QMessageBox.critical(
+                self, "Import failed",
+                f"Could not rebuild the sprite from this {name}:\n{exc}",
+            )
+            return
+        if not self._confirm_vram_budget(spr):
+            return
+        cmd = PortBtchrSpriteCommand(
+            self._session, group, spr,
+            description=f"Import {name} into BTCHR 0x{group:04x}",
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+        self._chrsize_rows = _load_chrsize_rows_live(self._session)
+
+    def _confirm_vram_budget(self, spr: btchrspr.BtchrSprite) -> bool:
+        """Warn (Yes/No) when a to-be-applied sprite overflows a VRAM budget —
+        the party-viewer per-cell cap and/or the multi-sprite tile budget.
+        Returns True to proceed. Shared by the image-build and source-import
+        paths."""
+        warnings = []
+        if spr.source_tpf > btchrspr.PARTY_VIEWER_TPF_CAP:
+            warnings.append(
+                f"• {spr.source_tpf} tiles/cell exceeds the "
+                f"{btchrspr.PARTY_VIEWER_TPF_CAP}-tile party-viewer VRAM cap — "
+                "expect garbled art in the party viewer / gallery. Run "
+                "\"Compress OAM\" to shrink it, or reduce the frame size."
+            )
+        if spr.ncgr_tile_count > btchrspr.TILE_COUNT_WARN_THRESHOLD:
+            warnings.append(
+                f"• {spr.ncgr_tile_count} NCGR tiles is above the "
+                f"{btchrspr.TILE_COUNT_WARN_THRESHOLD}-tile non-boss budget — it "
+                "renders in single-sprite screens but may vanish or crash in "
+                "multi-sprite screens (starter pack, two-enemy battles)."
+            )
+        if not warnings:
+            return True
+        reply = QMessageBox.warning(
+            self, "Sprite over VRAM budget",
+            "\n\n".join(warnings) + "\n\nApply anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _build_new_oam_from_images(self, imgs: List[QImage]) -> None:
+        """Rebuild the current sprite with a fresh OAM layout sized to ``imgs``
+        (via ``btchrspr.build_from_cells``) — one cell per image, preserving
+        the animation cell count. Frames must be 8-px multiples and all the
+        same size (the engine's shared-slot invariant). Shared by the Import
+        dropdown (Build-OAM on) and the legacy custom-cells button."""
+        if self._current_group is None:
+            return
+        conv: List[QImage] = []
+        dims: List[Tuple[int, int]] = []
+        for img in imgs:
+            if img.isNull():
+                QMessageBox.critical(self, "Import failed", "Could not read a PNG.")
+                return
+            if img.width() % 8 or img.height() % 8:
+                QMessageBox.critical(
+                    self, "Bad frame size",
+                    "Every frame's dimensions must be multiples of 8 px "
+                    f"(got {img.width()}×{img.height()}).",
+                )
+                return
+            conv.append(img.convertToFormat(QImage.Format_RGBA8888))
+            dims.append((img.width(), img.height()))
+        if len(set(dims)) > 1:
+            sizes = ", ".join(f"{w}×{h}" for w, h in sorted(set(dims)))
+            QMessageBox.critical(
+                self, "Frames differ in size",
+                f"All frames must be the same size to build an OAM layout "
+                f"(got {sizes}).",
+            )
+            return
+        imgs = conv
+
+        palette = self._palette_from_cell_images(imgs)
+        if palette is None:
+            QMessageBox.critical(
+                self, "No opaque pixels",
+                "Every imported frame is fully transparent — nothing to build a "
+                "palette from.",
+            )
+            return
+        # Quantise each cell against the shared palette (index 0 = transparent).
+        cell_indexed: List[bytes] = []
+        for img, (w, h) in zip(imgs, dims):
+            buf = bytearray(w * h)
+            for yy in range(h):
+                for xx in range(w):
+                    c = img.pixelColor(xx, yy)
+                    buf[yy * w + xx] = (
+                        0 if c.alpha() < 128
+                        else nearest_idx_opaque(c.red(), c.green(), c.blue(), palette)
+                    )
+            cell_indexed.append(bytes(buf))
+
+        group = self._current_group
+        template = [
+            bytes(self._pak.entries[group * btchr.GROUP_SIZE + i]) for i in range(5)
+        ]
+        try:
+            spr = btchrspr.build_from_cells(cell_indexed, dims, palette, template)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Import failed", str(exc))
+            return
+
+        if not self._confirm_vram_budget(spr):
+            return
+
+        cmd = PortBtchrSpriteCommand(
+            self._session, group, spr,
+            description=f"Import frames (new OAM) into BTCHR 0x{group:04x}",
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+        self._chrsize_rows = _load_chrsize_rows_live(self._session)
+
+    def _on_compress_oam(self) -> None:
+        """Re-cover the selected sprite with occupied-only OAM coverage — same
+        pixels, tighter (union) tile bank (``btchrspr.compress_existing``). When
+        it can't shrink the footprint it still offers to apply, because the
+        re-cover regenerates a clean union layout — a way to reset a sprite left
+        in an odd state by earlier edits without reimporting a .btchrspr."""
+        if self._current_group is None:
+            return
+        group = self._current_group
+        entries = [
+            bytes(self._pak.entries[group * btchr.GROUP_SIZE + i]) for i in range(5)
+        ]
+        try:
+            spr, old_fs, new_fs = btchrspr.compress_existing(entries)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self, "Can't compress", f"This sprite can't be re-covered:\n{exc}"
+            )
+            return
+        if new_fs < old_fs:
+            saved = old_fs - new_fs
+            pct = 100 * saved // old_fs
+            prompt = (
+                f"Re-cover BTCHR 0x{group:04x} with occupied-only OAM.\n\n"
+                f"footprint_scale: {old_fs} → {new_fs} tiles/cell  "
+                f"(−{saved}, −{pct}%)\n\n"
+                "Pixels are unchanged — the sprite just needs less VRAM, which "
+                "can let it fit budgets it currently overflows (party pool, wild "
+                "spawns). Applies as one undoable step.\n\nApply?"
+            )
+            default = QMessageBox.Yes
+        else:
+            # No reduction, but re-covering rebuilds a clean union OAM layout at
+            # the same pixels — offer it (don't refuse) so a sprite left smaller-
+            # but-odd by an earlier edit (e.g. an experimental cover) can be
+            # reset here instead of reimporting a .btchrspr.
+            change = f"+{new_fs - old_fs}" if new_fs != old_fs else "unchanged"
+            prompt = (
+                f"BTCHR 0x{group:04x} is already occupied-only — re-covering "
+                f"won't shrink it (footprint_scale {old_fs} → {new_fs}, "
+                f"{change}).\n\nIt rebuilds a clean union OAM layout at the same "
+                "pixels, which resets a sprite left in an odd state by earlier "
+                "edits. Re-cover anyway?"
+            )
+            default = QMessageBox.No
+        reply = QMessageBox.question(
+            self, "Compress OAM", prompt,
+            QMessageBox.Yes | QMessageBox.No, default,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        cmd = PortBtchrSpriteCommand(
+            self._session, group, spr,
+            description=(
+                f"Compress OAM of BTCHR 0x{group:04x} ({old_fs}→{new_fs} tpf)"
+            ),
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+        self._chrsize_rows = _load_chrsize_rows_live(self._session)
+
+    def _on_compress_oam_fit(self) -> None:
+        """Lossless union re-cover; if it still overflows 512, trim the fewest
+        faint edge pixels needed to fit and confirm the cost
+        (``btchrspr.compress_existing_fit``)."""
+        if self._current_group is None:
+            return
+        group = self._current_group
+        entries = [
+            bytes(self._pak.entries[group * btchr.GROUP_SIZE + i]) for i in range(5)
+        ]
+        try:
+            result = btchrspr.compress_existing_fit(entries, target=512)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self, "Can't compress", f"This sprite can't be re-covered:\n{exc}"
+            )
+            return
+        if result is None:
+            QMessageBox.information(
+                self, "Can't fit ≤512",
+                f"BTCHR 0x{group:04x} can't reach ≤512 tiles/cell even after "
+                "trimming faint edges — its biggest single frame carries too "
+                "much solid content. Only reducing the artwork would fit it.",
+            )
+            return
+        spr, old_fs, new_fs, min_opaque, dropped = result
+        if new_fs >= old_fs:
+            QMessageBox.information(
+                self, "Already tight",
+                f"BTCHR 0x{group:04x} is already at {old_fs} tiles/cell — nothing "
+                "to reclaim.",
+            )
+            return
+        saved = old_fs - new_fs
+        pct = 100 * saved // old_fs
+        if min_opaque == 1:
+            body = (
+                f"footprint_scale: {old_fs} → {new_fs} tiles/cell (−{saved}, "
+                f"−{pct}%), lossless — fits the 512 party-viewer cap.\n\nApply?"
+            )
+        else:
+            body = (
+                f"footprint_scale: {old_fs} → {new_fs} tiles/cell (−{saved}, "
+                f"−{pct}%) — now ≤512 (party-viewer cap).\n\nTo fit, it trims "
+                f"{dropped} faint edge pixel(s) (tiles with < {min_opaque} opaque "
+                f"pixels). Everything else is unchanged.\n\nApply?"
+            )
+        reply = QMessageBox.question(
+            self, "Compress OAM (fit ≤512)", body,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        desc = (
+            f"Compress OAM (fit ≤512) of BTCHR 0x{group:04x} ({old_fs}→{new_fs} tpf"
+            + (f", −{dropped}px" if min_opaque > 1 else "") + ")"
+        )
+        cmd = PortBtchrSpriteCommand(
+            self._session, group, spr, description=desc,
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+        self._chrsize_rows = _load_chrsize_rows_live(self._session)
+
+    def reload_after_external_edit(self) -> None:
+        """Redecode after a session-level edit made outside this widget (e.g.
+        the header-bar 'Compress All Battle Sprite OAMs' batch). Reloads the
+        chrsize cache first so the new footprints show, then re-renders."""
+        self._chrsize_rows = _load_chrsize_rows_live(self._session)
+        self._refresh_after_pak_change()
 
     def _on_import_btchrspr(self) -> None:
         """Replay a .btchrspr onto the selected group.
@@ -2872,6 +3968,7 @@ class BtchrBrowser(QWidget):
         if self._tabs.currentIndex() == 1:
             self._refresh_sheet_preview()
             self._sheet_dirty = False
+        self._sync_palette_grid()
         self._picker.set_current_color(self._current_decoded.palette[0])
         # Header may have just been rewritten by an animation edit;
         # repopulate the table + flattened track from the fresh decode.

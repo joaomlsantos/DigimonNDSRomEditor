@@ -414,6 +414,40 @@ def render_one_cell_qimage(ctx: CellPngContext, cell_idx: int) -> Optional[QImag
     return img
 
 
+def render_cell_tight_qimage(ctx: CellPngContext, cell_idx: int) -> Optional[QImage]:
+    """One cell rendered to *its own* bbox size (no union padding).
+
+    Unlike :func:`render_one_cell_qimage` (which sizes the canvas to the
+    union of every cell so per-cell PNGs tile together), this trims to the
+    single cell — what a thumbnail/preview of just that cell wants.
+    """
+    if not (0 <= cell_idx < len(ctx.ncer.cells)):
+        return None
+    cell = ctx.ncer.cells[cell_idx]
+    xmin, ymin, xmax, ymax = btchr.cell_bbox(cell)
+    w = xmax - xmin
+    h = ymax - ymin
+    if w <= 0 or h <= 0:
+        return None
+    img = make_indexed_canvas(w, h, ctx.palette)
+    paint_cell_indexed(img, ctx, cell, 0, 0, xmin, ymin)
+    return img
+
+
+def first_nonempty_cell_index(ncer_obj: ncer_mod.Ncer) -> Optional[int]:
+    """Index of the first cell with any OAMs, or ``None`` if all empty.
+
+    Portrait / battle-mini SPR entries pack several cells (e.g. a
+    left+right pair of the same face); the game shows one, so previews
+    render just this cell. Mirrors the battle-sprite path, which skips a
+    blank/transition cell 0 in favour of the first cell that draws.
+    """
+    for i, cell in enumerate(ncer_obj.cells):
+        if cell.oams:
+            return i
+    return None
+
+
 def spr_index_footprint(cel_pak, index: int) -> Optional[Tuple[int, int]]:
     """Return the ``(width, height)`` sprite footprint (largest cell OAM bbox)
     for SPR_* entry ``index``, or ``None`` if out of range / unparseable /
@@ -433,6 +467,7 @@ def spr_index_footprint(cel_pak, index: int) -> Optional[Tuple[int, int]]:
 
 def render_spr_index_qimage(
     chr_pak, pal_pak, cel_pak, index: int, *, palette_bank: int = 0,
+    first_cell_only: bool = False,
 ) -> Optional[QImage]:
     """Composite the SPR_* sprite at ``index`` into one row of cells.
 
@@ -442,6 +477,10 @@ def render_spr_index_qimage(
     (concatenate 4bpp banks when the CHR is 8bpp, else use ``palette_bank``).
     Returns ``None`` for an out-of-range index or an entry that fails to
     parse / has no palette or cells.
+
+    ``first_cell_only`` renders just the first non-empty cell (portrait /
+    battle-mini previews, which pack a duplicate pair) instead of the whole
+    cell strip.
     """
     if not (0 <= index < len(chr_pak.entries)):
         return None
@@ -473,6 +512,11 @@ def render_spr_index_qimage(
         palette=list(palette),
         is_8bpp=chr_8bpp,
     )
+    if first_cell_only:
+        cell_idx = first_nonempty_cell_index(ncer_obj)
+        if cell_idx is None:
+            return None
+        return render_cell_tight_qimage(ctx, cell_idx)
     return render_cells_qimage(ctx, len(ncer_obj.cells))
 
 

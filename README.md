@@ -47,7 +47,7 @@ The information presented in these pages refers to the USA roms (serial codes NT
 The following data is currently editable:
 
 **Digimon Data**
-- Base Digimon: species, stat type, base stats, resistances, traits, movesets
+- Base Digimon: species, stat type, base stats, resistances, element affinity (STAB), traits, movesets
 - Enemy Digimon: base data for wild digimon and fixed digimon encounters, sprite/name reskins for fixed enemies and bosses, exp yields
 - Moves: element type, effects, power, targets
 - Starter Packs
@@ -75,6 +75,9 @@ PS: This section also includes a view-only Evolution Trees feature, which shows 
 - ARM9 strings
 - Overlay strings
 - MSG.PAK strings
+
+**Tools**
+- Damage Calculator (battle damage ranges for an attacker/move/defender, ported from the reverse-engineered battle formula)
 
 **QoL Toggles**
 - Increase text speed

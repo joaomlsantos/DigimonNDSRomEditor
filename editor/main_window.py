@@ -14,12 +14,14 @@ from typing import Optional, Tuple
 from PySide6.QtCore import QItemSelectionModel, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QStandardItem, QStandardItemModel, QUndoStack
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QSplitter,
     QTreeView,
     QVBoxLayout,
@@ -52,6 +54,8 @@ from .widgets.armor_digivolution_editor import (
 )
 from .widgets.base_digimon_editor import BaseDigimonEditor, base_digimon_issues
 from .widgets.consumable_editor import ConsumableEditor, consumable_issues
+from .widgets.damage_calculator import build_damage_calculator
+from .widgets.traits_editor import TraitsEditor
 from .widgets.digivolution_tree_editor import DigivolutionTreeEditor
 from .widgets.dna_digivolution_editor import (
     DNADigivolutionEditor,
@@ -74,8 +78,14 @@ from .widgets.habitats_editor import HabitatsWorldmapEditor
 from .widgets.move_editor import MoveEditor, move_issues
 from .widgets.qol_editor import QolEditor
 from .widgets.quest_editor import QuestEditor
-from .widgets.btchr_browser import BtchrBrowser
+from .commands import BatchCompressBtchrCommand
+from .widgets.btchr_browser import (
+    BtchrBrowser,
+    compute_btchr_group_labels,
+    scan_compressible_btchr,
+)
 from .widgets.btmap_browser import BtmapBrowser
+from .widgets.cutscenes_tab import battle_vram_issues
 from .widgets.map_browser import MapBrowser
 from .widgets.mchr_browser import MchrBrowser
 from .widgets.sound_editor import SoundEditor
@@ -120,6 +130,7 @@ NAV_GROUPS = [
         ("Base Digimon", "base_digimon"),
         ("Enemy Digimon", "enemy_digimon"),
         ("Moves", "moves"),
+        ("Traits", "traits"),
         ("Starter Packs", "starters"),
     ]),
     ("Digivolutions", [
@@ -155,6 +166,9 @@ NAV_GROUPS = [
     ]),
     ("Sound", [
         ("BGMs", "sound_editor"),
+    ]),
+    ("Tools", [
+        ("Damage Calculator", "damage_calculator"),
     ]),
     ("Settings", [
         ("QoL Toggles", "qol_settings"),
@@ -258,6 +272,11 @@ class MainWindow(QMainWindow):
         self.action_save_project_as = QAction("Save Project &As…", self)
         self.action_save_project_as.triggered.connect(self._on_save_project_as)
 
+        self.action_compress_all_oam = QAction(
+            "Compress All Battle Sprite &OAMs…", self,
+        )
+        self.action_compress_all_oam.triggered.connect(self._on_compress_all_oam)
+
         self.action_about = QAction("&About…", self)
         self.action_about.triggered.connect(self._show_about)
 
@@ -294,6 +313,9 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(self.action_show_unknowns)
         edit_menu.addAction(self.action_allow_cell_shared)
+
+        tools_menu = menubar.addMenu("&Tools")
+        tools_menu.addAction(self.action_compress_all_oam)
 
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction(self.action_about)
@@ -396,6 +418,83 @@ class MainWindow(QMainWindow):
         self.action_save.setEnabled(has_session)
         self.action_save_as.setEnabled(has_session)
         self.action_save_project_as.setEnabled(has_session)
+        self.action_compress_all_oam.setEnabled(has_session)
+
+    def _on_compress_all_oam(self) -> None:
+        """Global op (Tools menu): re-cover every battle sprite to its occupied
+        tiles and apply the ones that shrink as one undo step. Same pixels —
+        the payoff is the shared wild-spawn VRAM budget (Σfs≤1440), so lighter
+        sprites let more digimon co-spawn."""
+        if self.session is None:
+            return
+        progress = QProgressDialog(
+            "Re-covering battle sprites…", "Cancel", 0, 0, self,
+        )
+        progress.setWindowTitle("Compress All Battle Sprite OAMs")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def on_progress(done: int, total: int) -> None:
+            if progress.maximum() != total:
+                progress.setMaximum(total)
+            progress.setValue(done)
+            QApplication.processEvents()
+
+        result = scan_compressible_btchr(
+            self.session,
+            should_cancel=progress.wasCanceled,
+            on_progress=on_progress,
+        )
+        progress.reset()
+        if result is None:      # cancelled mid-scan — apply nothing
+            return
+        ports, stats = result
+        if not ports:
+            QMessageBox.information(
+                self, "Nothing to compress",
+                f"No battle sprite has reclaimable OAM slack "
+                f"({stats['tight']} already tight, {stats['declined']} "
+                f"empty/oversized).",
+            )
+            return
+
+        labels = compute_btchr_group_labels(self.session)
+        savers = sorted(stats["savers"], reverse=True)
+        top = "\n".join(
+            f"  • {labels[g] if g < len(labels) else f'0x{g:04x}'}  "
+            f"−{saved} tiles/cell"
+            for saved, g in savers[:8]
+        )
+        saved_total = stats["old_sum"] - stats["new_sum"]
+        pct = 100 * saved_total // stats["old_sum"]
+        reply = QMessageBox.question(
+            self, "Compress All Battle Sprite OAMs",
+            f"{len(ports)} sprites shrink — footprint_scale Σ "
+            f"{stats['old_sum']} → {stats['new_sum']} tiles/cell "
+            f"(−{saved_total}, −{pct}%).\n"
+            f"Skipped: {stats['tight']} already tight, {stats['declined']} "
+            f"empty/oversized.\n\nBiggest savings:\n{top}\n\n"
+            f"Pixels are unchanged — sprites just cost less VRAM, so wild "
+            f"encounters (Σfs≤1440) can co-spawn more digimon. Applies as one "
+            f"undoable step.\n\nApply all?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        cmd = BatchCompressBtchrCommand(
+            self.session, ports,
+            description=f"Compress OAM of {len(ports)} battle sprites",
+            on_change=self._refresh_open_btchr_browser,
+        )
+        self.undo_stack.push(cmd)
+
+    def _refresh_open_btchr_browser(self) -> None:
+        """If the BTCHR browser is the current editor, redecode it after the
+        batch mutated the session's PAK/chrsize behind its back."""
+        content = self.centralWidget().widget(1)
+        if isinstance(content, BtchrBrowser):
+            content.reload_after_external_edit()
 
     def _confirm_discard_changes(self) -> bool:
         """Prompt before discarding unsaved edits.
@@ -795,6 +894,11 @@ class MainWindow(QMainWindow):
             # Same channel for DAT/map/* field-map file overrides — paint
             # tool edits (walkability, tilemap) round-trip via here.
             session.apply_map_file_edits(project.get("map_edits", []))
+            # Resized wild-encounter areas (add/remove slot) — replace the
+            # parsed area bytes so the next ROM save splices the records back.
+            session.apply_wild_encounter_area_edits(
+                project.get("wild_encounter_area_edits", [])
+            )
             # Per-entry overlay5 overrides (Events tab x/y drags). The
             # entries are same-length, so this doesn't grow overlay5;
             # the next save splices them in through the overlay5 path.
@@ -858,6 +962,7 @@ class MainWindow(QMainWindow):
                         skip_map_splice=True,
                         skip_overlay5_splice=True,
                         skip_sound_splice=True,
+                        skip_wild_encounter_splice=True,
                     )
                 ),
                 qol=self.session.qol,
@@ -870,6 +975,7 @@ class MainWindow(QMainWindow):
                 bgm_swap_edits=self.session.bgm_swap_edits(),
                 bgm_addition_edits=self.session.bgm_addition_edits(),
                 bgm_label_edits=self.session.bgm_label_edits(),
+                wild_encounter_area_edits=self.session.wild_encounter_area_edits(),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Failed to save project", str(exc))
@@ -988,6 +1094,7 @@ class MainWindow(QMainWindow):
             session.farm_training_pens, session.sprite_pak("DAT/SPR_CEL.PAK"),
         ))
         reg.register(lambda: string_issues(session.string_regions))
+        reg.register(lambda: battle_vram_issues(session))
         reg.notify_changed()
         self.undo_stack.clear()
         # Drop any open editor — it still references the previous session's
@@ -1160,6 +1267,10 @@ class MainWindow(QMainWindow):
             )
         if key == "moves":
             return MoveEditor(self.session.moves, self.undo_stack, self.session)
+        if key == "traits":
+            return TraitsEditor(self.session.traits, self.undo_stack, self.session)
+        if key == "damage_calculator":
+            return build_damage_calculator(self.session)
         if key == "standard_digivolutions":
             widget = StandardDigivolutionEditor(self.session.standard_digivolutions, self.undo_stack, self.session)
             widget.treeRequested.connect(self.navigate_to_digivolution_tree)
@@ -1291,6 +1402,9 @@ class MainWindow(QMainWindow):
         `record_id` is optional; non-record-scoped issues just open the
         editor without a select-by-id step.
         """
+        if editor_key == "cutscene_battle":
+            self.navigate_to_cutscene_chain_ix(record_id)
+            return
         widget = self._build_editor_for(editor_key)
         if widget is None:
             return
@@ -1359,6 +1473,24 @@ class MainWindow(QMainWindow):
         self.set_content(widget)
         self._highlight_nav_row("map_browser")
         widget.navigate_to_cutscene_chain(map_id, chain_ix)
+
+    def navigate_to_cutscene_chain_ix(self, chain_ix: Optional[int]) -> None:
+        """Validation-footer click → open the Cutscenes tab at ``chain_ix``.
+
+        Derives the map from the chain's source entry (the footer only carries
+        the chain index). Falls back to just opening the Field Maps browser
+        when the chain is missing / unmapped."""
+        chains = self.session.cutscene_index().chains if self.session else ()
+        if chain_ix is not None and 0 <= chain_ix < len(chains):
+            from digimon_core import overlay5 as ov5
+            map_id = ov5.map_id_for(chains[chain_ix].source_entry_ix)
+            if map_id is not None:
+                self.navigate_to_cutscene_chain(map_id, chain_ix)
+                return
+        widget = self._build_editor_for("map_browser")
+        if widget is not None:
+            self.set_content(widget)
+            self._highlight_nav_row("map_browser")
 
     def navigate_to_encounter_reward(self, slot_index: int) -> None:
         """Wild-encounter reward_slot → open the encounter-rewards editor at

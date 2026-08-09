@@ -11,11 +11,12 @@ Layout:
 * right: preview pane + frame navigation + per-sprite palette index spinner
   + width-tiles override + Export/Import PNG buttons
 
-The palette spinner is the load-bearing control here. CHR→PAL mapping is
-1:1 for sprites 0..662 but irregular past that (sprite 663 → PAL 664,
-sprites 754+ → PAL sprite+16, others still unresolved). The spinner lets
-users pin the correct PAL index per sprite until the mapping table is
-worked out.
+The per-sprite palette index defaults to the sprite's canonical palette,
+resolved from the ARM9 overworld-sprite table
+(``session.mchr_pal_for_chr`` / :func:`loaders.loadMchrChrToPalMap`). CHR→PAL
+is 1:1 for sprites 0..662, then drifts past 0x0297 because 13 sprites carry
+2-3 recolor palettes (e.g. CHR 0x2ed → PAL 0x2fb). The spinner still lets
+users pin an alternate palette (e.g. a multi-palette sprite's other recolor).
 
 PNG round-trip format:
 * Frames PNG — indexed-8 strip, width = ``n_frames × frame_w``, alpha=0 on
@@ -33,16 +34,27 @@ import re
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QUndoStack, qRgba
+from PySide6.QtGui import (
+    QColor,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTransform,
+    QUndoStack,
+    qRgba,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -57,8 +69,21 @@ from PySide6.QtWidgets import (
 
 from digimon_core import mchr, mchr_anm, pak, sprite
 
-from ..commands import ReplaceSpriteCommand
-from ._png_palette import build_palette_from_png, nearest_idx_opaque
+from ..commands import ReplaceSpriteCommand, SetMchrOwPalCommand
+from ._png_palette import (
+    build_palette_from_png,
+    intensity_matched_palette,
+    nearest_idx_opaque,
+)
+from .palette_batch_adjuster import PaletteBatchAdjuster
+from .palette_editor import PaletteEditor
+from .palette_grid import PaletteGrid
+from .palette_toolkit import (
+    DEFAULT_COLS_MIN,
+    DEFAULT_SCROLL_MAX_H,
+    DEFAULT_SWATCH,
+    PaletteToolkit,
+)
 from .record_list_panel import RecordListPanel
 from .transparent_picker import TransparentColorPicker
 
@@ -153,6 +178,10 @@ class MchrBrowser(QWidget):
         self._current_idx: Optional[int] = None
         self._current_frame: int = 0
         self._current_palette_idx: int = 0
+        self._current_ow_id: int = 0  # canonical ow-id whose palette the spinner assigns
+        # Non-None while the batch adjuster drags: the current palette with the
+        # selected slots recoloured, for a live preview without committing.
+        self._preview_palette: Optional[mchr.Palette] = None
 
         # Animation playback state (MCHR_ANM). ``_anim_flat`` is one frame
         # per output tick; the timer advances ``_anim_pos`` and paints the
@@ -165,6 +194,7 @@ class MchrBrowser(QWidget):
         self._anim_fps: int = 60
         self._anim_editing_frame: int = -1
         self._anim_table_loading: bool = False
+        self._anim_params_loading: bool = False
         # ``None`` lets render_frame_rgba use the NDS-OAM heuristic; we only
         # set this when the user moves the override spinner off zero.
         self._width_tiles_override: Optional[int] = None
@@ -274,11 +304,15 @@ class MchrBrowser(QWidget):
         if self._undo_stack is None:
             self._dup_frame_btn.setVisible(False)
 
-        # Palette index — the key control. Default tracks sprite index for
-        # 0..662 (vanilla 1:1 mapping); past that the user pins it manually
-        # until we figure out the real mapping table.
+        # Palette index — which MCHR_PAL the sprite is viewed/edited under
+        # (canonical by default). To give it another palette, use the Borrow-
+        # palette section (preview + copy the colours in).
         self._palette_spin = QSpinBox()
         self._palette_spin.setRange(0, max(0, self._pal_pak.count - 1))
+        self._palette_spin.setToolTip(
+            "Which palette to render this sprite under and edit. Copy another "
+            "palette in via the Borrow-palette section below."
+        )
         self._palette_spin.valueChanged.connect(self._on_palette_changed)
 
         # Width-tiles override: 0 means "use NDS-OAM heuristic". 1..16 forces
@@ -349,32 +383,50 @@ class MchrBrowser(QWidget):
             "Off: index against the existing MCHR_PAL (colours may posterize)."
         )
 
-        # Three columns: frames strip, per-frame PNGs, palette PNG. All
-        # six buttons pinned to the widest label so Export/Import line up.
-        sheet_btns = (self._export_btn, self._import_btn)
-        per_frame_btns = (self._export_per_frame_btn, self._import_per_frame_btn)
-        pal_btns = (self._export_pal_btn, self._import_pal_btn)
+        # "Export…" / "Import…" dropdowns front every mode, mirroring Battle
+        # Sprites / Icons. The individual buttons stay in code (nothing deleted)
+        # — they just back the menu rows and aren't laid out.
+        self._export_menu = QMenu(self)
+        self._export_menu.addAction(
+            "Sprite sheet (all frames, one PNG)…", self._on_export_png)
+        self._export_menu.addAction(
+            "Individual frames (one PNG each)…", self._on_export_per_frame_pngs)
+        self._export_menu.addSeparator()
+        self._export_menu.addAction("Palette PNG…", self._on_export_palette_png)
+        self._export_as_btn = QPushButton("Export…")
+        self._export_as_btn.setMenu(self._export_menu)
+
+        self._import_menu = QMenu(self)
+        self._import_menu.addAction(
+            "Sprite sheet (all frames, one PNG)…", self._on_import_png)
+        self._import_menu.addAction(
+            "Individual frames (one PNG each)…", self._on_import_per_frame_pngs)
+        self._import_menu.addSeparator()
+        self._import_menu.addAction("Palette PNG…", self._on_import_palette_png)
+        self._import_as_btn = QPushButton("Import…")
+        self._import_as_btn.setMenu(self._import_menu)
+
+        for _superseded in (
+            self._export_btn, self._import_btn,
+            self._export_per_frame_btn, self._import_per_frame_btn,
+            self._export_pal_btn, self._import_pal_btn,
+        ):
+            _superseded.setParent(self)
+            _superseded.setVisible(False)
+
+        io_btns = (self._import_as_btn, self._export_as_btn)
         max_btn_w = max(
-            b.sizeHint().width() for b in sheet_btns + per_frame_btns + pal_btns
+            w.sizeHint().width()
+            for w in (*io_btns, self._import_pal_with_sheet_cb)
         )
-        for b in sheet_btns + per_frame_btns + pal_btns:
-            b.setMinimumWidth(max_btn_w)
-        sheet_col = QVBoxLayout()
-        sheet_col.setSpacing(4)
-        sheet_col.addWidget(self._export_btn)
-        sheet_col.addWidget(self._import_btn)
-        sheet_col.addWidget(self._import_pal_with_sheet_cb)
-        sheet_col.addStretch(1)
-        per_frame_col = QVBoxLayout()
-        per_frame_col.setSpacing(4)
-        per_frame_col.addWidget(self._export_per_frame_btn)
-        per_frame_col.addWidget(self._import_per_frame_btn)
-        per_frame_col.addStretch(1)
-        pal_col = QVBoxLayout()
-        pal_col.setSpacing(4)
-        pal_col.addWidget(self._export_pal_btn)
-        pal_col.addWidget(self._import_pal_btn)
-        pal_col.addStretch(1)
+        for b in io_btns:
+            b.setFixedWidth(max_btn_w)
+        io_col = QVBoxLayout()
+        io_col.setSpacing(4)
+        io_col.addWidget(self._import_as_btn)
+        io_col.addWidget(self._export_as_btn)
+        io_col.addWidget(self._import_pal_with_sheet_cb)
+        io_col.addStretch(1)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -403,11 +455,7 @@ class MchrBrowser(QWidget):
         controls_row = QHBoxLayout()
         controls_row.addLayout(controls)
         controls_row.addSpacing(16)
-        controls_row.addLayout(sheet_col)
-        controls_row.addSpacing(16)
-        controls_row.addLayout(per_frame_col)
-        controls_row.addSpacing(16)
-        controls_row.addLayout(pal_col)
+        controls_row.addLayout(io_col)
         controls_row.addSpacing(16)
         controls_row.addLayout(meta_form)
         controls_row.addStretch(1)
@@ -418,17 +466,24 @@ class MchrBrowser(QWidget):
         # `_apply_transparent_color` callback. The widget itself just
         # provides UI + click capture on the bound preview.
         self._picker = TransparentColorPicker(
-            on_color_picked=self._apply_transparent_color
+            on_color_picked=self._apply_transparent_color,
+            on_slot_picked=lambda rgb: self._palette_toolkit.pick_slot_from_rgb(rgb),
         )
         self._picker.bind_preview(self._image_label, self._preview_source)
         right_layout.addWidget(self._picker)
 
+        palette_col = self._build_palette_sidebar()
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._list)
         splitter.addWidget(right)
+        splitter.addWidget(palette_col)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([220, 800])
+        splitter.setStretchFactor(2, 0)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([220, 780, self._pal_min_w])
+        splitter.splitterMoved.connect(lambda *_: self._palette_toolkit.reflow())
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -440,9 +495,10 @@ class MchrBrowser(QWidget):
         self._current_idx = ix
         self._session.remember_selection(self._CURSOR_KEY, ix)
         self._current_frame = 0
-        # Default palette tracks sprite index — correct for 0..662, an
-        # informed guess past that until the user picks a better one.
-        default_pal = min(ix, self._pal_pak.count - 1)
+        # Palette to view/edit — the sprite's canonical MCHR_PAL. The spinner
+        # lets you preview other palettes; the Borrow-palette section copies one
+        # in (persisted as palette content, not an ARM9 reassignment).
+        default_pal = self._session.mchr_pal_for_chr(ix)
         self._current_palette_idx = default_pal
         # Block signals during programmatic set so we only refresh once.
         self._palette_spin.blockSignals(True)
@@ -458,6 +514,8 @@ class MchrBrowser(QWidget):
         self._width_spin.setValue(remembered if remembered is not None else 0)
         self._width_spin.blockSignals(False)
         self._refresh_meta_and_preview()
+        self._palette_toolkit.sync()
+        self._reset_borrow()
         self._stop_anim_playback()
         self._refresh_anim_panel()
 
@@ -498,8 +556,50 @@ class MchrBrowser(QWidget):
         self._undo_stack.push(cmd)
 
     def _on_palette_changed(self, value: int) -> None:
+        # Preview/edit target only — pick which MCHR_PAL the sprite renders
+        # under and which the editor targets. Persisting a different palette is
+        # done by copying it in via the Borrow-palette section (palette content,
+        # saved normally) — not an ARM9 reassignment.
         self._current_palette_idx = value
         self._refresh_preview_only()
+        self._palette_toolkit.sync()
+
+    # Dormant: the ARM9 ow-table reassignment path (superseded by Borrow-palette
+    # per the user's preference for direct preview+confirm). Kept per
+    # hide-never-delete; not wired to any live control.
+    def _on_reset_ow_pal(self) -> None:
+        """Revert this sprite's overworld palette to vanilla — the table is
+        identity by design, so vanilla == the ow-id itself. No-op (no undo
+        entry) when it's already vanilla."""
+        if self._current_idx is None or self._undo_stack is None:
+            return
+        ow_id = self._current_ow_id
+        if self._session.mchr_effective_ow_pal(ow_id) == ow_id:
+            return
+        self._undo_stack.push(SetMchrOwPalCommand(
+            self._session, ow_id, ow_id,
+            description=(
+                f"Revert overworld palette for 0x{self._current_idx:04x} "
+                "to vanilla"
+            ),
+            on_change=self._resync_ow_palette,
+            mergeable=False,
+        ))
+
+    def _resync_ow_palette(self) -> None:
+        """Reflect the current ow-id's effective (possibly undone/redone)
+        palette in the spinner + preview, without re-pushing a command."""
+        if self._current_idx is None:
+            return
+        eff = self._session.mchr_effective_ow_pal(self._current_ow_id)
+        if eff == self._current_palette_idx:
+            return
+        self._current_palette_idx = eff
+        self._palette_spin.blockSignals(True)
+        self._palette_spin.setValue(eff)
+        self._palette_spin.blockSignals(False)
+        self._refresh_preview_only()
+        self._palette_toolkit.sync()
 
     def _on_width_changed(self, value: int) -> None:
         self._width_tiles_override = value if value > 0 else None
@@ -558,13 +658,18 @@ class MchrBrowser(QWidget):
             self._picker.set_current_color(None)
             return
 
-        wt_override = self._width_tiles_override
+        # While the batch adjuster drags, render the previewed colours instead
+        # of the committed ones (no write until Apply).
+        render_palette = (
+            self._preview_palette if self._preview_palette is not None else palette
+        )
+        wt_override = self._effective_width_tiles()
         if self._show_all_frames:
-            pixmap = self._render_frame_strip(entry, palette, wt_override)
+            pixmap = self._render_frame_strip(entry, render_palette, wt_override)
         else:
             frame_i = min(self._current_frame, entry.frame_count - 1)
             pixmap = self._render_single_frame(
-                entry.frames[frame_i], palette, wt_override
+                entry.frames[frame_i], render_palette, wt_override
             )
         # Render at 4× nominal to make 16×32 sprites comfortably visible
         # in a 256+ minimum preview pane; QImage's nearest-neighbor scaling
@@ -604,6 +709,199 @@ class MchrBrowser(QWidget):
             self._preview_pix_size,
         )
 
+    # ---- palette editor (grid + inline editor + batch recolour) --------
+
+    def _build_palette_sidebar(self) -> QWidget:
+        """Build the right-hand palette pane and its :class:`PaletteToolkit`.
+        MCHR palettes are a flat 16-colour bank (slot 0 transparent), selected
+        by ``_current_palette_idx`` — no per-file banks, so slots map straight
+        to palette indices."""
+        self._palette_grid = PaletteGrid(cols=DEFAULT_COLS_MIN, swatch=DEFAULT_SWATCH)
+        self._palette_grid.setToolTip(
+            "This sprite's 16-colour palette. Click a swatch to edit it, or "
+            "shift-click / drag a box to select several and shift them together "
+            "with the H/S/L sliders. Slot 0 is transparent."
+        )
+        self._palette_editor = PaletteEditor()
+        self._palette_adjuster = PaletteBatchAdjuster()
+        self._eyedropper_btn = QPushButton("Eyedropper")
+        self._eyedropper_btn.setCheckable(True)
+        self._eyedropper_btn.setToolTip(
+            "Then click a pixel on the sprite preview to select its palette slot."
+        )
+
+        col = QWidget()
+        cl = QVBoxLayout(col)
+        cl.setContentsMargins(4, 4, 4, 4)
+        cl.setSpacing(6)
+        header = QHBoxLayout()
+        title = QLabel("Palette")
+        title.setStyleSheet("font-weight: bold;")
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self._eyedropper_btn)
+        cl.addLayout(header)
+        self._pal_scroll = QScrollArea()
+        self._pal_scroll.setWidget(self._palette_grid)
+        self._pal_scroll.setWidgetResizable(False)
+        self._pal_scroll.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self._pal_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._pal_scroll.setMinimumWidth(self._palette_grid.width() + 20)
+        self._pal_scroll.setFixedHeight(
+            min(self._palette_grid.height() + 2, DEFAULT_SCROLL_MAX_H)
+        )
+        cl.addWidget(self._pal_scroll)
+        cl.addWidget(self._palette_editor)
+        cl.addWidget(self._palette_adjuster)
+        cl.addLayout(self._build_borrow_palette_section())
+        cl.addStretch(1)
+        self._pal_min_w = self._palette_grid.width() + 30
+        col.setMinimumWidth(self._pal_min_w)
+
+        self._palette_toolkit = PaletteToolkit(
+            self, self._palette_grid, self._palette_editor, self._palette_adjuster,
+            get_palette=self._palette_get,
+            write_palette=self._palette_write,
+            set_preview_palette=self._palette_set_preview,
+            refresh_preview=self._refresh_preview_only,
+            picker=self._picker,
+            eyedropper_btn=self._eyedropper_btn,
+            scroll=self._pal_scroll,
+        )
+        return col
+
+    def _palette_get(self) -> List[Tuple[int, int, int]]:
+        pal = _decoded_palette(self._pal_pak, self._current_palette_idx)
+        return [tuple(c) for c in pal] if pal else []
+
+    def _palette_set_preview(self, pal) -> None:
+        self._preview_palette = pal
+
+    def _palette_write(self, mapping) -> None:
+        """Commit N palette slots into the current MCHR_PAL entry, one undo
+        step. Slots are flat 0..15 — no bank translation."""
+        if self._current_idx is None:
+            return
+        palette = _decoded_palette(self._pal_pak, self._current_palette_idx)
+        if palette is None:
+            return
+        new_palette = list(palette)
+        changed = 0
+        for slot, rgb in mapping.items():
+            new = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            if 0 <= slot < len(new_palette) and \
+                    self._snap5(new_palette[slot]) != self._snap5(new):
+                new_palette[slot] = new
+                changed += 1
+        if changed == 0:
+            return
+        encoded = mchr.encode_palette_bgr555(new_palette)
+        noun = "colour" if changed == 1 else "colours"
+        cmd = ReplaceSpriteCommand(
+            self._session,
+            [(MCHR_PAL, self._current_palette_idx, sprite.compress_rle30(encoded))],
+            description=(
+                f"Edit MCHR palette 0x{self._current_palette_idx:04x} "
+                f"({changed} {noun})"
+            ),
+            on_change=self._after_palette_write,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+
+    def _after_palette_write(self) -> None:
+        self._refresh_preview_only()
+        self._palette_toolkit.sync()
+
+    # ---- borrow palette (scroll another palette, preview, then copy in) ------
+
+    def _build_borrow_palette_section(self) -> QVBoxLayout:
+        box = QVBoxLayout()
+        box.setSpacing(3)
+        title = QLabel("Borrow palette")
+        title.setStyleSheet("font-weight: bold;")
+        box.addWidget(title)
+        hint = QLabel("Scroll another palette onto this sprite, then apply.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 10px;")
+        box.addWidget(hint)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(QLabel("From #"))
+        self._borrow_spin = QSpinBox()
+        self._borrow_spin.setRange(0, max(0, self._pal_pak.count - 1))
+        self._borrow_spin.setToolTip(
+            "Preview this sprite under another MCHR_PAL entry (non-destructive). "
+            "\"Use this palette\" copies it into this sprite's palette."
+        )
+        self._borrow_spin.valueChanged.connect(self._on_borrow_changed)
+        row.addWidget(self._borrow_spin, 1)
+        box.addLayout(row)
+        # Off by default — overworld sprites carry foreign palettes well.
+        self._borrow_match_cb = QCheckBox("Match by brightness")
+        self._borrow_match_cb.setChecked(False)
+        self._borrow_match_cb.setToolTip(
+            "Remap each slot to the source colour of nearest brightness so the "
+            "shading survives. Off = raw slot-for-slot copy."
+        )
+        self._borrow_match_cb.toggled.connect(
+            lambda _=False: self._on_borrow_changed(self._borrow_spin.value())
+        )
+        box.addWidget(self._borrow_match_cb)
+        self._borrow_apply_btn = QPushButton("Use this palette")
+        self._borrow_apply_btn.setEnabled(False)
+        self._borrow_apply_btn.clicked.connect(self._on_borrow_apply)
+        box.addWidget(self._borrow_apply_btn)
+        return box
+
+    def _borrowed_palette(self, idx: int) -> Optional[List[Tuple[int, int, int]]]:
+        """MCHR_PAL[idx] as it would land on this sprite — brightness-matched to
+        the current palette when the toggle is on, else a raw copy."""
+        src = _decoded_palette(self._pal_pak, idx)
+        if src is None:
+            return None
+        if self._borrow_match_cb.isChecked():
+            own = self._palette_get()
+            if own:
+                return intensity_matched_palette(own, [tuple(c) for c in src])
+        return [tuple(c) for c in src]
+
+    def _reset_borrow(self) -> None:
+        if self._current_idx is None:
+            return
+        self._borrow_spin.blockSignals(True)
+        self._borrow_spin.setValue(self._current_palette_idx)
+        self._borrow_spin.blockSignals(False)
+        self._borrow_apply_btn.setEnabled(False)
+
+    def _on_borrow_changed(self, idx: int) -> None:
+        if self._current_idx is None:
+            return
+        if idx == self._current_palette_idx:
+            self._preview_palette = None
+            self._borrow_apply_btn.setEnabled(False)
+        else:
+            pal = self._borrowed_palette(idx)
+            if pal is None:
+                return
+            self._preview_palette = pal
+            self._borrow_apply_btn.setEnabled(True)
+        self._refresh_preview_only()
+
+    def _on_borrow_apply(self) -> None:
+        if self._current_idx is None:
+            return
+        idx = self._borrow_spin.value()
+        if idx == self._current_palette_idx:
+            return
+        pal = self._borrowed_palette(idx)
+        if pal is None:
+            return
+        self._palette_write({i: c for i, c in enumerate(pal)})
+        self._reset_borrow()
+
     # ---- rendering ------------------------------------------------------
 
     @staticmethod
@@ -611,17 +909,32 @@ class MchrBrowser(QWidget):
         frame_bytes: bytes,
         palette: mchr.Palette,
         width_tiles_override: Optional[int],
+        hflip: bool = False,
     ) -> QPixmap:
         rgba, w, h = mchr.render_frame_rgba(
             frame_bytes, palette, width_tiles=width_tiles_override,
         )
         img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888).copy()
-        return QPixmap.fromImage(img)
+        pm = QPixmap.fromImage(img)
+        if hflip:
+            pm = pm.transformed(QTransform().scale(-1, 1))
+        return pm
+
+    def _effective_width_tiles(self) -> Optional[int]:
+        """Width (in tiles) to render at: the user's explicit override, else
+        the sprite's authoritative OAM width from MCHR_ANM (fixes the
+        genuinely-wide sprites), else ``None`` → ``pick_tile_grid``."""
+        if self._width_tiles_override is not None:
+            return self._width_tiles_override
+        if self._current_idx is None:
+            return None
+        return self._session.mchr_width_tiles_for_chr(self._current_idx)
 
     def _frame_dims(self, entry: mchr.MchrEntry) -> Tuple[int, int]:
-        """Return ``(frame_w_px, frame_h_px)`` for the current width override."""
-        if self._width_tiles_override is not None:
-            wt = self._width_tiles_override
+        """Return ``(frame_w_px, frame_h_px)`` for the effective width."""
+        wt_eff = self._effective_width_tiles()
+        if wt_eff is not None:
+            wt = wt_eff
             ht = (entry.tiles_per_frame + wt - 1) // wt
         else:
             wt, ht = mchr.pick_tile_grid(entry.tiles_per_frame)
@@ -633,9 +946,10 @@ class MchrBrowser(QWidget):
         """Assemble the Animation preview tab: a play surface on the left,
         the animation picker + editable frame list on the right.
 
-        Each frame record carries a frame index + duration (both editable)
-        plus a block of position/OAM params that are still unidentified —
-        those are preserved verbatim and not surfaced for editing."""
+        Each frame record carries a frame index + duration (both editable),
+        an ``hflip`` facing-mirror bit, and four still-unidentified params —
+        all five are per-animation (constant within an animation in vanilla),
+        so they're surfaced as a per-animation control group, not per-frame."""
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(max(1, 1000 // self._anim_fps))
         self._anim_timer.timeout.connect(self._on_anim_tick)
@@ -683,8 +997,7 @@ class MchrBrowser(QWidget):
         self._anim_remove_btn.setEnabled(False)
 
         note = QLabel(
-            "Frame = MCHR_CHR frame index · Duration = ticks.\n"
-            "Per-frame position/OAM params are preserved unchanged."
+            "Frame = MCHR_CHR frame index · Duration = ticks."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888; font-size: 11px;")
@@ -710,6 +1023,7 @@ class MchrBrowser(QWidget):
         ep_layout.addWidget(self._anim_table, 1)
         if self._undo_stack is not None:
             ep_layout.addLayout(step_row)
+        ep_layout.addWidget(self._build_anim_params_group())
         ep_layout.addWidget(note)
 
         anim_split = QSplitter(Qt.Horizontal)
@@ -724,6 +1038,123 @@ class MchrBrowser(QWidget):
         tab_layout.setContentsMargins(8, 8, 8, 8)
         tab_layout.addWidget(anim_split, 1)
         return tab
+
+    def _build_anim_params_group(self) -> QGroupBox:
+        """Per-animation record fields. All five (hflip + p0..p3) are constant
+        within an animation in vanilla, so they're edited once for the whole
+        animation — a change writes that field onto every frame of the current
+        animation (one undo step). ``hflip`` is the confirmed facing-mirror;
+        p0..p3 are still unidentified, exposed as raw u16s for experimentation."""
+        box = QGroupBox("This animation")
+        form = QFormLayout(box)
+        form.setContentsMargins(8, 6, 8, 6)
+        form.setVerticalSpacing(4)
+
+        editable = self._undo_stack is not None
+        self._anim_hflip_cb = QCheckBox("Mirror horizontally (facing)")
+        self._anim_hflip_cb.setToolTip(
+            "Draw this animation horizontally flipped — the overworld "
+            "left/right facing bit (record field 4)."
+        )
+        self._anim_hflip_cb.setEnabled(editable)
+        self._anim_hflip_cb.toggled.connect(self._on_anim_hflip_toggled)
+        form.addRow(self._anim_hflip_cb)
+
+        self._anim_param_spins: List[QSpinBox] = []
+        for k in range(4):
+            sp = QSpinBox()
+            sp.setRange(0, 0xFFFF)
+            sp.setEnabled(editable)
+            sp.setToolTip(
+                "Raw record field — semantics not yet identified (likely draw "
+                "offset / OAM attribute). Preserved verbatim unless changed."
+            )
+            sp.valueChanged.connect(
+                lambda v, k=k: self._on_anim_param_changed(k, v)
+            )
+            form.addRow(f"Param {k}", sp)
+            self._anim_param_spins.append(sp)
+
+        self._anim_param_varies_lbl = QLabel(
+            "⚠ these differ between this animation's frames — editing a field "
+            "sets it on all of them."
+        )
+        self._anim_param_varies_lbl.setWordWrap(True)
+        self._anim_param_varies_lbl.setStyleSheet("color: #c80; font-size: 10px;")
+        self._anim_param_varies_lbl.setVisible(False)
+        form.addRow(self._anim_param_varies_lbl)
+        return box
+
+    def _refresh_anim_params(self) -> None:
+        """Load the current animation's field values into the param controls,
+        flagging any field that isn't uniform across the animation's frames."""
+        anim = self._current_animation()
+        has = anim is not None and bool(anim.frames)
+        editable = self._undo_stack is not None and has
+        widgets = [self._anim_hflip_cb, *self._anim_param_spins]
+        self._anim_params_loading = True
+        for w in widgets:
+            w.blockSignals(True)
+        varies = False
+        if has:
+            self._anim_hflip_cb.setChecked(bool(anim.frames[0].hflip))
+            if len({1 if f.hflip else 0 for f in anim.frames}) > 1:
+                varies = True
+            for k, sp in enumerate(self._anim_param_spins):
+                sp.setValue(anim.frames[0].params[k])
+                if len({f.params[k] for f in anim.frames}) > 1:
+                    varies = True
+        else:
+            self._anim_hflip_cb.setChecked(False)
+            for sp in self._anim_param_spins:
+                sp.setValue(0)
+        for w in widgets:
+            w.setEnabled(editable)
+            w.blockSignals(False)
+        self._anim_param_varies_lbl.setVisible(varies)
+        self._anim_params_loading = False
+
+    def _on_anim_hflip_toggled(self, checked: bool) -> None:
+        self._apply_field_to_anim(4, 1 if checked else 0, "mirror")
+
+    def _on_anim_param_changed(self, k: int, value: int) -> None:
+        self._apply_field_to_anim(k, value, f"param {k}")
+
+    def _apply_field_to_anim(self, k: int, value: int, label: str) -> None:
+        """Write record field ``k`` = ``value`` onto every frame of the current
+        animation, then commit as one undoable change."""
+        if self._anim_params_loading or self._undo_stack is None:
+            return
+        if self._current_idx is None:
+            return
+        anim = self._current_animation()
+        if anim is None or not anim.frames:
+            return
+        value &= 0xFFFF
+        if all(fr.params[k] == value for fr in anim.frames):
+            return
+        for fr in anim.frames:
+            p = list(fr.params)
+            p[k] = value
+            fr.params = (p[0], p[1], p[2], p[3], p[4])
+        self._push_anim_change(
+            f"Set MCHR 0x{self._current_idx:04x} anim {self._anim_idx} {label}"
+        )
+        self._update_anim_combo_label(self._anim_idx)
+
+    def _update_anim_combo_label(self, ai: int) -> None:
+        """Refresh one animation's picker label (the ◀ mirrored tag tracks the
+        hflip field)."""
+        if self._anim is None or not (0 <= ai < len(self._anim.animations)):
+            return
+        idx = self._anim_combo.findData(ai)
+        if idx < 0:
+            return
+        self._anim_combo.blockSignals(True)
+        self._anim_combo.setItemText(
+            idx, self._anim_label_for(ai, self._anim.animations[ai])
+        )
+        self._anim_combo.blockSignals(False)
 
     def _refresh_anim_panel(self) -> None:
         """Parse the current sprite's MCHR_ANM entry, repopulate the picker
@@ -780,7 +1211,8 @@ class MchrBrowser(QWidget):
     @staticmethod
     def _anim_label_for(ai: int, anim: "mchr_anm.MchrAnimation") -> str:
         n = len(anim.frames)
-        return f"Anim {ai} — {n} frame{'s' if n != 1 else ''}"
+        mirror = " ◀ mirrored" if anim.frames and anim.frames[0].hflip else ""
+        return f"Anim {ai} — {n} frame{'s' if n != 1 else ''}{mirror}"
 
     def _current_animation(self) -> Optional["mchr_anm.MchrAnimation"]:
         if self._anim is None:
@@ -800,6 +1232,7 @@ class MchrBrowser(QWidget):
             self._anim_table.setItem(r, 1, QTableWidgetItem(str(fr.duration)))
         self._anim_table.blockSignals(False)
         self._anim_table_loading = False
+        self._refresh_anim_params()
         self._recompute_anim_flat()
         self._update_anim_step_buttons()
 
@@ -884,7 +1317,8 @@ class MchrBrowser(QWidget):
             )
             return
         pm = self._render_single_frame(
-            entry.frames[fr.frame], palette, self._width_tiles_override
+            entry.frames[fr.frame], palette, self._effective_width_tiles(),
+            hflip=fr.hflip,
         )
         scaled = pm.scaled(
             pm.width() * 4, pm.height() * 4,
@@ -1025,6 +1459,7 @@ class MchrBrowser(QWidget):
             self._refresh_anim_panel()
             return
         anim = self._anim.animations[self._anim_idx]
+        self._update_anim_combo_label(self._anim_idx)
         if self._anim_table.rowCount() == len(anim.frames):
             self._anim_table_loading = True
             self._anim_table.blockSignals(True)
@@ -1035,6 +1470,7 @@ class MchrBrowser(QWidget):
                         it.setText(text)
             self._anim_table.blockSignals(False)
             self._anim_table_loading = False
+            self._refresh_anim_params()
             self._recompute_anim_flat()
             self._update_anim_step_buttons()
             self._show_current_anim_frame_static()
@@ -1627,9 +2063,10 @@ class MchrBrowser(QWidget):
             for i, (r, g, b) in enumerate(palette)
         ]
         img.setColorTable(ctable)
+        wt_eff = self._effective_width_tiles()
         for fi, fb in enumerate(entry.frames):
             indices, w, h = mchr.decode_frame_to_indices(
-                fb, self._width_tiles_override
+                fb, wt_eff
             )
             x0 = fi * fw
             for y in range(h):

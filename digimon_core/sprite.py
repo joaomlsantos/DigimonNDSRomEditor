@@ -315,6 +315,23 @@ def build_ncgr_from_template(tile_bytes: bytes, template_raw: bytes) -> bytes:
     return bytes(out)
 
 
+def set_ncgr_boundary(raw: bytes, boundary_bytes: int) -> bytes:
+    """Patch the NCGR RAHC OBJ tile-mapping boundary (``RAHC+0x12``).
+
+    Verified across all 415 vanilla BTCHR groups: this byte is ``shift << 4``
+    where ``boundary = 32 << shift`` (0x20 = 128, 0x30 = 256). It must agree
+    with the NCER mapping (``ncer.set_ncer_boundary``) — the engine reads the
+    boundary per-sprite, and a mismatch makes it fetch tiles at the wrong
+    stride (garbled cells). ``build_ncgr_from_template`` preserves the
+    template's byte, so a caller that rebuilt a bigger sprite must re-set it.
+    """
+    raw = bytearray(maybe_decompress(raw))
+    rahc = find_block(raw, b"RAHC")
+    shift = (boundary_bytes // 32).bit_length() - 1  # 128→2, 256→3
+    raw[rahc + 0x12] = (raw[rahc + 0x12] & 0x0F) | ((shift & 0xF) << 4)
+    return bytes(raw)
+
+
 def build_nclr(palette: Palette, bpp4: bool, include_pcmp: bool = True) -> bytes:
     """Build an uncompressed NCLR with one palette bank. Optionally append
     an identity PCMP block (vanilla DWDD NCLRs ship one).
