@@ -8,6 +8,7 @@ node will be wired to a real editor widget in subsequent milestones.
 from __future__ import annotations
 
 import os
+import shutil
 from collections import namedtuple
 from typing import Optional, Tuple
 
@@ -84,6 +85,7 @@ from .widgets.btchr_browser import (
     compute_btchr_group_labels,
     scan_compressible_btchr,
 )
+from .widgets.bg_browser import BgBrowser
 from .widgets.btmap_browser import BtmapBrowser
 from .widgets.cutscenes_tab import battle_vram_issues
 from .widgets.map_browser import MapBrowser
@@ -162,6 +164,7 @@ NAV_GROUPS = [
         ("Overworld Sprites", "mchr_browser"),
         ("Battle Sprites", "btchr_browser"),
         ("Battle Backgrounds", "btmap_browser"),
+        ("UI Backgrounds", "bg_browser"),
         ("Field Maps", "map_browser"),
     ]),
     ("Sound", [
@@ -195,6 +198,10 @@ class MainWindow(QMainWindow):
 
         self.session: Optional[RomSession] = None
         self._last_nav_key: Optional[str] = None
+        # The Field Maps browser is cached so its view state (selected map /
+        # tab / handler / NPC / cutscene selection) survives switching to
+        # another editor and back. Dropped + rebuilt on session change.
+        self._map_browser: Optional[QWidget] = None
         self.undo_stack = QUndoStack(self)
         self.undo_stack.cleanChanged.connect(self._refresh_status)
         # Whenever the model mutates, ask the validation registry to recompute
@@ -377,15 +384,21 @@ class MainWindow(QMainWindow):
         splitter: QSplitter = self.centralWidget()  # type: ignore[assignment]
         with span("teardown_old"):
             old = splitter.widget(1)
-            # Editors that own pooled resources (e.g. SpriteMapRow's
-            # pooled sprite pickers) detach them here so Qt's
-            # parent-deletes-children rule doesn't drag pooled widgets
-            # down with the editor.
-            teardown = getattr(old, "aboutToTeardown", None)
-            if callable(teardown):
-                teardown()
-            old.setParent(None)
-            old.deleteLater()
+            if old is not None and old is not widget:
+                if old is self._map_browser:
+                    # Cached editor — detach but keep it alive so its view
+                    # state survives; don't tear down its pooled resources.
+                    old.setParent(None)
+                else:
+                    # Editors that own pooled resources (e.g. SpriteMapRow's
+                    # pooled sprite pickers) detach them here so Qt's
+                    # parent-deletes-children rule doesn't drag pooled widgets
+                    # down with the editor.
+                    teardown = getattr(old, "aboutToTeardown", None)
+                    if callable(teardown):
+                        teardown()
+                    old.setParent(None)
+                    old.deleteLater()
         with span("addWidget_new"):
             splitter.addWidget(widget)
             splitter.setSizes([180, 1100])
@@ -894,6 +907,9 @@ class MainWindow(QMainWindow):
             # Same channel for DAT/map/* field-map file overrides — paint
             # tool edits (walkability, tilemap) round-trip via here.
             session.apply_map_file_edits(project.get("map_edits", []))
+            # DAT/bg/* menu-background overrides (PNG import). Uncompressed
+            # on the ROM, so the next save writes them back verbatim.
+            session.apply_bg_file_edits(project.get("bg_edits", []))
             # Resized wild-encounter areas (add/remove slot) — replace the
             # parsed area bytes so the next ROM save splices the records back.
             session.apply_wild_encounter_area_edits(
@@ -960,6 +976,7 @@ class MainWindow(QMainWindow):
                         skip_sprite_splice=True,
                         skip_btmap_splice=True,
                         skip_map_splice=True,
+                        skip_bg_splice=True,
                         skip_overlay5_splice=True,
                         skip_sound_splice=True,
                         skip_wild_encounter_splice=True,
@@ -971,6 +988,7 @@ class MainWindow(QMainWindow):
                 btchr_appended_sidecars=self.session.btchr_appended_sidecars(),
                 btmap_edits=self.session.btmap_file_edits(),
                 map_edits=self.session.map_file_edits(),
+                bg_edits=self.session.bg_file_edits(),
                 overlay5_entry_edits=self.session.overlay5_entry_edits(),
                 bgm_swap_edits=self.session.bgm_swap_edits(),
                 bgm_addition_edits=self.session.bgm_addition_edits(),
@@ -1039,8 +1057,23 @@ class MainWindow(QMainWindow):
             # a stale or broken file.
             self._remove_from_recent(self._recent_roms, path)
             return
+        self._ensure_rom_backup(path)
         self._push_recent(self._recent_roms, path)
         self._install_session(session)
+
+    @staticmethod
+    def _ensure_rom_backup(path: str) -> None:
+        """One-time ``<rom>.bak`` snapshot of the ROM as loaded, so an
+        unintended save from a prior session can always be reverted. Never
+        overwrites an existing .bak — the first snapshot (the pristine loaded
+        state) is kept. Best-effort; a failed copy never blocks the load."""
+        bak = path + ".bak"
+        if os.path.exists(bak):
+            return
+        try:
+            shutil.copy2(path, bak)
+        except OSError:
+            pass
 
     def _install_session(self, session: RomSession) -> None:
         """Common post-construction wiring shared by ROM-open and project-open
@@ -1097,6 +1130,16 @@ class MainWindow(QMainWindow):
         reg.register(lambda: battle_vram_issues(session))
         reg.notify_changed()
         self.undo_stack.clear()
+        # The cached Field Maps browser still references the previous session's
+        # model objects — tear it down and drop it so the next visit rebuilds
+        # against the new session.
+        if self._map_browser is not None:
+            teardown = getattr(self._map_browser, "aboutToTeardown", None)
+            if callable(teardown):
+                teardown()
+            self._map_browser.setParent(None)
+            self._map_browser.deleteLater()
+            self._map_browser = None
         # Drop any open editor — it still references the previous session's
         # model objects, which serialize_all() would no longer write back.
         placeholder = QLabel("Pick a section on the left to begin editing.")
@@ -1320,8 +1363,13 @@ class MainWindow(QMainWindow):
             return BtchrBrowser(self.session, self.undo_stack)
         if key == "btmap_browser":
             return BtmapBrowser(self.session, self.undo_stack)
+        if key == "bg_browser":
+            return BgBrowser(self.session, self.undo_stack)
         if key == "map_browser":
-            return MapBrowser(self.session, self.undo_stack)
+            # Cached so field-map view state persists across editor switches.
+            if self._map_browser is None:
+                self._map_browser = MapBrowser(self.session, self.undo_stack)
+            return self._map_browser
         if key == "sound_editor":
             return SoundEditor(self.session, self.undo_stack)
         if key.startswith("strings_bucket:"):

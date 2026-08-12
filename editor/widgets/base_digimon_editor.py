@@ -6,9 +6,9 @@ from typing import Dict, List, Optional, Tuple
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
-    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -24,6 +24,7 @@ from digimon_core.stat_progression import (
 
 from .._perf import span
 from .digimon_list_panel import DigimonListPanel
+from .flow_layout import FlowLayout, make_height_for_width
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
     BoundBitCheckBox,
@@ -34,6 +35,7 @@ from .form_helpers import (
     BoundSpinBox,
     add_unknown_form_row,
     make_form,
+    stat_cell,
     wrap_in_scroll,
     move_choices,
     trait_choices,
@@ -132,6 +134,18 @@ _AFFINITY_FIELDS: List[Tuple[int, str]] = [
 _GROWTH_EMPHASIS_RATIO = 1.15
 
 
+def _inline_labeled(text: str, field: QWidget) -> QWidget:
+    """A ``label: field`` pair as one compact widget, for use as a single
+    FlowLayout item (so a header strip of these wraps as a unit)."""
+    wrap = QWidget()
+    row = QHBoxLayout(wrap)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    row.addWidget(QLabel(text))
+    row.addWidget(field)
+    return wrap
+
+
 def _cross_type_mean_gains() -> Dict[str, float]:
     """Per-stat mean of average per-level gain across all DigimonType rows.
 
@@ -196,15 +210,46 @@ class BaseDigimonEditor(QWidget):
                 self._list_panel.refresh_all_labels()
 
             with span("splitter+layout"):
+                # Inline Compare / Swap: a second (B) digimon shown beside this
+                # form, revealed by the toolbar toggle. "A" is the current
+                # selection (read live via the getter). Imported here (not at
+                # module top) to break the import cycle — data_compare_editor
+                # imports this module's field-group lists.
+                from .data_compare_editor import CompareSwapPanel
+                self._compare_panel = CompareSwapPanel(
+                    self._session, self._undo_stack, a_is_enemy=False,
+                    get_a_record=lambda: self._entries.get(self._current_id),
+                )
+                self._compare_panel.setVisible(False)
+                right_split = QSplitter(Qt.Horizontal)
+                right_split.addWidget(self._detail)
+                right_split.addWidget(self._compare_panel)
+                right_split.setStretchFactor(0, 1)
+                right_split.setStretchFactor(1, 1)
+                right_split.setSizes([600, 480])
+
                 splitter = QSplitter(Qt.Horizontal, self)
                 splitter.addWidget(self._list_panel)
-                splitter.addWidget(self._detail)
+                splitter.addWidget(right_split)
                 splitter.setStretchFactor(0, 0)
                 splitter.setStretchFactor(1, 1)
                 splitter.setSizes([260, 740])
 
+                self._compare_toggle = QPushButton("⇄ Compare / Swap")
+                self._compare_toggle.setCheckable(True)
+                self._compare_toggle.setToolTip(
+                    "Show a second digimon beside this one to compare, swap, or "
+                    "copy its data.")
+                self._compare_toggle.toggled.connect(self._on_compare_toggled)
+                bar = QHBoxLayout()
+                bar.setContentsMargins(4, 2, 4, 2)
+                bar.addWidget(self._compare_toggle)
+                bar.addStretch(1)
+
                 layout = QVBoxLayout(self)
                 layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(0)
+                layout.addLayout(bar)
                 layout.addWidget(splitter)
 
             # repopulate after undo/redo so the form reflects the model
@@ -222,6 +267,11 @@ class BaseDigimonEditor(QWidget):
 
     def select_by_id(self, digimon_id: int) -> bool:
         return self._list_panel.select_by_id(digimon_id)
+
+    def _on_compare_toggled(self, on: bool) -> None:
+        self._compare_panel.setVisible(on)
+        if on:
+            self._compare_panel.sync_a()
 
     def aboutToTeardown(self) -> None:
         """Called by main_window.set_content before this editor is destroyed.
@@ -242,6 +292,9 @@ class BaseDigimonEditor(QWidget):
         font.setPointSize(font.pointSize() + 3)
         font.setBold(True)
         self._title.setFont(font)
+        # Wrap instead of forcing the whole detail pane to the title's full
+        # single-line width on a narrow screen.
+        self._title.setWordWrap(True)
 
         self._id_spin = BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True)
         self._species_combo = BoundEnumCombo(first, "species", model.Species, self._undo_stack)
@@ -338,12 +391,13 @@ class BaseDigimonEditor(QWidget):
             else:
                 misc_form.addRow(label, spin)
 
-        # Pair Traits and Moves in a single row to halve the vertical space.
-        trait_move_row = QHBoxLayout()
-        trait_move_row.setContentsMargins(0, 0, 0, 0)
-        trait_move_row.setSpacing(4)
-        trait_move_row.addWidget(traits_box, 1)
-        trait_move_row.addWidget(moves_box, 1)
+        # Pair Traits and Moves side by side when there's room; a FlowLayout
+        # drops Moves below Traits once the pane is too narrow to hold both.
+        trait_move_wrap = QWidget()
+        tm_flow = FlowLayout(trait_move_wrap, margin=0, h_spacing=8, v_spacing=6)
+        tm_flow.addWidget(traits_box)
+        tm_flow.addWidget(moves_box)
+        make_height_for_width(trait_move_wrap)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -355,7 +409,7 @@ class BaseDigimonEditor(QWidget):
         content_layout.addWidget(stats_box)
         content_layout.addWidget(res_box)
         content_layout.addWidget(affinity_box)
-        content_layout.addLayout(trait_move_row)
+        content_layout.addWidget(trait_move_wrap)
         content_layout.addWidget(misc_box)
         content_layout.addStretch(1)
 
@@ -366,70 +420,40 @@ class BaseDigimonEditor(QWidget):
             spin.valueChanged.connect(lambda _v: self._refresh_used_by_label())
 
         with span("wrap_in_scroll"):
-            return wrap_in_scroll(content)
+            return wrap_in_scroll(content, reflow=True)
 
     def _build_stats_box(self, first: model.BaseDataDigimon) -> QWidget:
-        """Stats box laid out as a horizontal table — one column per
-        stat with the editable value in a single row underneath the
-        stat-name header. Level sits on its own header row above the
-        table since it gates the progression formula (mirrors the
-        enemy editor's layout).
+        """Stats box as a wrapping grid of per-stat cells.
+
+        Each stat is a self-contained cell — bold name, editable value,
+        and its muted per-level growth beneath — laid out in a
+        :class:`FlowLayout` so the eight cells wrap onto a second row
+        when the pane narrows instead of forcing a horizontal scrollbar.
+        Level + StatType sit on a header row above, and the active
+        StatType's growth caption sits between (the per-stat ``+gain``
+        values live in the cells).
         """
         box = QGroupBox("Stats")
         outer = QVBoxLayout(box)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(4)
 
-        top_row = QHBoxLayout()
-        top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.setSpacing(8)
-        top_row.addWidget(QLabel("Level"))
         level_spin = BoundSpinBox(
             first, "level", 1, self._undo_stack,
             warn_above=_LEVEL_CAP, warn_message=_CAP_MESSAGE_LEVEL,
         )
         self._misc_widgets["level"] = level_spin
-        top_row.addWidget(level_spin)
-        top_row.addSpacing(16)
-        top_row.addWidget(QLabel("StatType"))
-        top_row.addWidget(self._type_combo)
-        top_row.addStretch(1)
-        outer.addLayout(top_row)
+        header_wrap = QWidget()
+        header_flow = FlowLayout(header_wrap, margin=0, h_spacing=16, v_spacing=4)
+        header_flow.addWidget(_inline_labeled("Level", level_spin))
+        header_flow.addWidget(_inline_labeled("StatType", self._type_combo))
+        make_height_for_width(header_wrap)
+        outer.addWidget(header_wrap)
 
-        table = QGridLayout()
-        table.setContentsMargins(0, 4, 0, 0)
-        table.setHorizontalSpacing(8)
-        table.setVerticalSpacing(2)
-
-        # Column 0 is the row-label column ("Current" / "Growth"),
-        # matching the enemy editor's Current/Expected/Range layout.
-        # Stat columns start at 1.
-        for ix, (attr, label, _w, _h, _cap, _msg) in enumerate(_STAT_FIELDS):
-            header = QLabel(label)
-            header.setAlignment(Qt.AlignCenter)
-            header.setStyleSheet("font-weight: bold;")
-            table.addWidget(header, 0, 1 + ix)
-
-        cur_lbl = QLabel("Current")
-        cur_lbl.setStyleSheet("color: palette(mid);")
-        table.addWidget(cur_lbl, 1, 0)
-        for ix, (attr, label, width, hex_disp, warn_cap, warn_msg) in enumerate(_STAT_FIELDS):
-            spin = BoundSpinBox(
-                first, attr, width, self._undo_stack,
-                hex_display=hex_disp, warn_above=warn_cap, warn_message=warn_msg,
-            )
-            spin.setAlignment(Qt.AlignCenter)
-            self._stat_widgets[attr] = spin
-            table.addWidget(spin, 1, 1 + ix)
-
-        # Per-level avg gain row — muted, centred. Evasion and Aptitude
-        # don't grow, so their cells stay as em-dashes. Whichever stats
-        # the active StatType specializes in get an accent color (see
-        # _refresh_growth_preview) so the archetype's identity reads at
-        # a glance — that's the whole reason to expose the row.
-        # Reads "<StatType> Growth" (e.g. "ATTACKER Growth") and
-        # re-renders as the combo changes — keeps the connection
-        # between archetype and per-level gains explicit at a glance.
+        # Caption naming the active StatType's growth. Reads "<StatType>
+        # Growth" (e.g. "ATTACKER Growth") and re-renders as the combo
+        # changes; the per-stat +gain numbers it describes live in the
+        # cells below.
         self._growth_row_label = QLabel("Growth")
         self._growth_row_label.setStyleSheet("color: palette(mid);")
         self._growth_row_label.setToolTip(
@@ -437,28 +461,27 @@ class BaseDigimonEditor(QWidget):
             "Specialized stats (notably above the cross-type average) "
             "are highlighted."
         )
-        table.addWidget(self._growth_row_label, 2, 0)
+        outer.addWidget(self._growth_row_label)
 
-        # Pin column 0 to the widest possible label so swapping
-        # "<StatType> Growth" text doesn't reflow the spinboxes when
-        # switching between digimon with different StatTypes.
-        fm = self._growth_row_label.fontMetrics()
-        widest = max(
-            (fm.horizontalAdvance(f"{t.name} Growth") for t in model.DigimonType),
-            default=fm.horizontalAdvance("Current"),
-        )
-        table.setColumnMinimumWidth(0, widest + 8)
-        for ix, (attr, _l, _w, _h, _cap, _msg) in enumerate(_STAT_FIELDS):
+        flow_wrap = QWidget()
+        flow = FlowLayout(flow_wrap, margin=0, h_spacing=12, v_spacing=6)
+        for attr, label, width, hex_disp, warn_cap, warn_msg in _STAT_FIELDS:
+            spin = BoundSpinBox(
+                first, attr, width, self._undo_stack,
+                hex_display=hex_disp, warn_above=warn_cap, warn_message=warn_msg,
+            )
+            spin.setAlignment(Qt.AlignCenter)
+            self._stat_widgets[attr] = spin
+            # Muted per-level gain; Evasion / Aptitude don't grow so they
+            # stay as em-dashes. Specialized stats get an accent color via
+            # _refresh_growth_preview so the archetype reads at a glance.
             gain_lbl = QLabel("—")
-            gain_lbl.setAlignment(Qt.AlignCenter)
             gain_lbl.setStyleSheet("color: palette(mid);")
             self._gain_labels[attr] = gain_lbl
-            table.addWidget(gain_lbl, 2, 1 + ix)
-
-        # Anchor flush-left; QGridLayout otherwise even-distributes the
-        # leftover horizontal slack across all columns.
-        table.setColumnStretch(1 + len(_STAT_FIELDS), 1)
-        outer.addLayout(table)
+            flow.addWidget(stat_cell(label, spin, [gain_lbl]))
+        make_height_for_width(flow_wrap)
+        outer.addWidget(flow_wrap)
+        make_height_for_width(box)
 
         # Re-render the gain row whenever StatType changes — the combo
         # is the sole input, so this is the cheapest live-update hook.
@@ -524,33 +547,22 @@ class BaseDigimonEditor(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(4)
 
-        table = QGridLayout()
-        table.setContentsMargins(0, 0, 0, 0)
-        table.setHorizontalSpacing(8)
-        table.setVerticalSpacing(2)
-
-        for ix, (attr, label) in enumerate(_RES_FIELDS):
-            header = QLabel(label)
-            header.setAlignment(Qt.AlignCenter)
-            header.setStyleSheet("font-weight: bold;")
-            table.addWidget(header, 0, ix)
-
+        flow_wrap = QWidget()
+        flow = FlowLayout(flow_wrap, margin=0, h_spacing=12, v_spacing=6)
         self._res_mult_labels: Dict[str, QLabel] = {}
-        for ix, (attr, label) in enumerate(_RES_FIELDS):
+        for attr, label in _RES_FIELDS:
             spin = BoundSpinBox(first, attr, 2, self._undo_stack)
             spin.setAlignment(Qt.AlignCenter)
             self._res_widgets[attr] = spin
             spin.valueChanged.connect(self._refresh_res_multipliers)
-            table.addWidget(spin, 1, ix)
             mult = QLabel("")
-            mult.setAlignment(Qt.AlignCenter)
             mult.setStyleSheet("color: palette(mid);")
             mult.setToolTip("Damage multiplier vs this element (500 = ×1.00, 1000 = ×0.50).")
             self._res_mult_labels[attr] = mult
-            table.addWidget(mult, 2, ix)
-
-        table.setColumnStretch(len(_RES_FIELDS), 1)
-        outer.addLayout(table)
+            flow.addWidget(stat_cell(label, spin, [mult]))
+        make_height_for_width(flow_wrap)
+        outer.addWidget(flow_wrap)
+        make_height_for_width(box)
         return box
 
     def _refresh_res_multipliers(self, *_):
@@ -572,24 +584,15 @@ class BaseDigimonEditor(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(4)
 
-        table = QGridLayout()
-        table.setContentsMargins(0, 0, 0, 0)
-        table.setHorizontalSpacing(8)
-        table.setVerticalSpacing(2)
-
-        for bit, label in _AFFINITY_FIELDS:
-            header = QLabel(label)
-            header.setAlignment(Qt.AlignCenter)
-            header.setStyleSheet("font-weight: bold;")
-            table.addWidget(header, 0, bit)
-
+        flow_wrap = QWidget()
+        flow = FlowLayout(flow_wrap, margin=0, h_spacing=12, v_spacing=6)
         for bit, label in _AFFINITY_FIELDS:
             check = BoundBitCheckBox(first, "element_affinity", bit, self._undo_stack)
             self._affinity_checks[bit] = check
-            table.addWidget(check, 1, bit, Qt.AlignCenter)
-
-        table.setColumnStretch(len(_AFFINITY_FIELDS), 1)
-        outer.addLayout(table)
+            flow.addWidget(stat_cell(label, check))
+        make_height_for_width(flow_wrap)
+        outer.addWidget(flow_wrap)
+        make_height_for_width(box)
         return box
 
     # ---- selection / refresh --------------------------------------------
@@ -650,6 +653,9 @@ class BaseDigimonEditor(QWidget):
         # we set up in _build_stats_box doesn't fire here.
         self._refresh_growth_preview()
         self._refresh_used_by_label()
+        # Keep the inline Compare/Swap panel's button state in sync with A.
+        if getattr(self, "_compare_panel", None) is not None:
+            self._compare_panel.sync_a()
 
     def _refresh_form(self, _index: int) -> None:
         target = self._entries.get(self._current_id)

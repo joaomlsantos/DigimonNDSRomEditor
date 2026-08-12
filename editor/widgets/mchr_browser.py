@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QMessageBox,
+    QFrame,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -84,6 +85,8 @@ from .palette_toolkit import (
     DEFAULT_SWATCH,
     PaletteToolkit,
 )
+from .flow_layout import FlowLayout, make_height_for_width
+from .form_helpers import ReflowHeightSync
 from .record_list_panel import RecordListPanel
 from .transparent_picker import TransparentColorPicker
 
@@ -277,7 +280,7 @@ class MchrBrowser(QWidget):
 
         self._scroll = QScrollArea()
         self._scroll.setWidget(self._image_label)
-        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidgetResizable(False)
         self._scroll.setAlignment(Qt.AlignCenter)
 
         # Frame navigation: single-frame view by default (spinner picks the
@@ -446,20 +449,25 @@ class MchrBrowser(QWidget):
         self._anim_tab_index = self._preview_tabs.count() - 1
         self._preview_tabs.setTabEnabled(self._anim_tab_index, False)
         self._preview_tabs.currentChanged.connect(self._on_preview_tab_changed)
-        right_layout.addWidget(self._preview_tabs, 1)
+        # Added to a vertical splitter with the controls below (end of this
+        # block) so the preview keeps the space and the controls scroll.
 
         # Single row under the preview: nav controls, then the two
         # button columns, then the metadata block, then stretch. Keeps
         # everything that fits on one line and pushes the metadata to
         # the right edge of the pane.
-        controls_row = QHBoxLayout()
-        controls_row.addLayout(controls)
-        controls_row.addSpacing(16)
-        controls_row.addLayout(io_col)
-        controls_row.addSpacing(16)
-        controls_row.addLayout(meta_form)
-        controls_row.addStretch(1)
-        right_layout.addLayout(controls_row)
+        # Flow the control groups so they wrap onto a second row when the pane
+        # narrows, instead of the panels side by side pinning a wide floor.
+        def _panel(inner_layout) -> QWidget:
+            holder = QWidget()
+            holder.setLayout(inner_layout)
+            return holder
+
+        controls_row_w = QWidget()
+        controls_flow = FlowLayout(controls_row_w, margin=0, h_spacing=16, v_spacing=8)
+        for inner in (controls, io_col, meta_form):
+            controls_flow.addWidget(_panel(inner))
+        make_height_for_width(controls_row_w)
 
         # Transparent-colour picker. The apply step is MCHR-specific
         # (4bpp nibble remap + MCHR_PAL write-back) so we pass our own
@@ -470,20 +478,62 @@ class MchrBrowser(QWidget):
             on_slot_picked=lambda rgb: self._palette_toolkit.pick_slot_from_rgb(rgb),
         )
         self._picker.bind_preview(self._image_label, self._preview_source)
-        right_layout.addWidget(self._picker)
+
+        # Controls + picker go in a scroll under the preview, split vertically
+        # so the pane is compressible top-to-bottom (controls scroll instead of
+        # the window growing tall as the panels wrap).
+        controls_container = QWidget()
+        cc_layout = QVBoxLayout(controls_container)
+        cc_layout.setContentsMargins(0, 0, 0, 0)
+        cc_layout.addWidget(controls_row_w)
+        cc_layout.addWidget(self._picker)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QFrame.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_scroll.setWidget(controls_container)
+        ReflowHeightSync(controls_container)
+
+        mid_split = QSplitter(Qt.Vertical)
+        mid_split.addWidget(self._preview_tabs)
+        mid_split.addWidget(controls_scroll)
+        mid_split.setStretchFactor(0, 1)
+        mid_split.setStretchFactor(1, 0)
+        mid_split.setCollapsible(0, False)
+        mid_split.setSizes([440, 280])
+        right_layout.addWidget(mid_split)
 
         palette_col = self._build_palette_sidebar()
+        # Palette tab: the frame preview (for reference) on the left + the
+        # palette editor on the right, so recolouring keeps the image on
+        # screen. The preview mirrors the Frames render (_refresh_preview_only).
+        # The editor side scrolls so its tall panel doesn't pin the tab widget's
+        # minimum height.
+        self._palette_preview_label = QLabel("Select a sprite to preview.")
+        self._palette_preview_label.setAlignment(Qt.AlignCenter)
+        pal_prev_scroll = QScrollArea()
+        pal_prev_scroll.setWidgetResizable(False)
+        pal_prev_scroll.setAlignment(Qt.AlignCenter)
+        pal_prev_scroll.setWidget(self._palette_preview_label)
+        pal_edit_scroll = QScrollArea()
+        pal_edit_scroll.setWidgetResizable(True)
+        pal_edit_scroll.setFrameShape(QFrame.NoFrame)
+        pal_edit_scroll.setWidget(palette_col)
+        palette_tab = QSplitter(Qt.Horizontal)
+        palette_tab.addWidget(pal_prev_scroll)
+        palette_tab.addWidget(pal_edit_scroll)
+        palette_tab.setStretchFactor(0, 1)
+        palette_tab.setStretchFactor(1, 0)
+        palette_tab.setSizes([380, 300])
+        self._palette_tab_index = self._preview_tabs.addTab(palette_tab, "Palette")
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._list)
         splitter.addWidget(right)
-        splitter.addWidget(palette_col)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([220, 780, self._pal_min_w])
-        splitter.splitterMoved.connect(lambda *_: self._palette_toolkit.reflow())
+        splitter.setSizes([220, 900])
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -642,10 +692,23 @@ class MchrBrowser(QWidget):
 
         self._refresh_preview_only()
 
+    def _mirror_palette_preview(self, *, pixmap=None, text=None) -> None:
+        """Keep the Palette-tab reference image in step with the Frames render
+        so recolouring on the Palette tab shows the sprite live."""
+        lbl = getattr(self, "_palette_preview_label", None)
+        if lbl is None:
+            return
+        if pixmap is not None:
+            lbl.setPixmap(pixmap)
+            lbl.adjustSize()
+        else:
+            lbl.setText(text)
+
     def _refresh_preview_only(self) -> None:
         if self._current_idx is None:
             self._preview_src_qimage = None
             self._picker.set_current_color(None)
+            self._mirror_palette_preview(text="Select a sprite to preview.")
             return
         entry = _decoded_entry(self._chr_pak, self._current_idx)
         if entry is None:
@@ -656,6 +719,7 @@ class MchrBrowser(QWidget):
             self._image_label.setText("(palette decode failed)")
             self._preview_src_qimage = None
             self._picker.set_current_color(None)
+            self._mirror_palette_preview(text="(palette decode failed)")
             return
 
         # While the batch adjuster drags, render the previewed colours instead
@@ -689,10 +753,11 @@ class MchrBrowser(QWidget):
             painter.drawRect(cur * (fw + 1) * 4, 0, fw * 4 - 1, scaled.height() - 1)
             painter.end()
         self._image_label.setPixmap(scaled)
+        self._mirror_palette_preview(pixmap=scaled)
         # Force the QScrollArea to honor the pixmap's size so a wide
         # "show all frames" strip gets a horizontal scroll bar instead
         # of being silently clipped.
-        self._image_label.setMinimumSize(scaled.size())
+        self._image_label.adjustSize()
 
         # Cache source for the eyedropper.
         self._preview_src_qimage = pixmap.toImage()
@@ -959,7 +1024,7 @@ class MchrBrowser(QWidget):
         self._anim_label.setMinimumSize(256, 256)
         self._anim_scroll = QScrollArea()
         self._anim_scroll.setWidget(self._anim_label)
-        self._anim_scroll.setWidgetResizable(True)
+        self._anim_scroll.setWidgetResizable(False)
         self._anim_scroll.setAlignment(Qt.AlignCenter)
 
         self._anim_combo = QComboBox()
@@ -1262,6 +1327,10 @@ class MchrBrowser(QWidget):
             self._show_current_anim_frame_static()
         elif self._anim_timer.isActive():
             self._stop_anim_playback()
+        if idx == getattr(self, "_palette_tab_index", -1):
+            # Render the current sprite into the tab's reference preview + reflow.
+            self._refresh_preview_only()
+            self._palette_toolkit.reflow()
 
     def _on_anim_play_toggled(self, checked: bool) -> None:
         if not checked:
@@ -1325,7 +1394,7 @@ class MchrBrowser(QWidget):
             Qt.KeepAspectRatio, Qt.FastTransformation,
         )
         self._anim_label.setPixmap(scaled)
-        self._anim_label.setMinimumSize(scaled.size())
+        self._anim_label.adjustSize()
 
     def _on_anim_row_selected(self) -> None:
         rows = self._anim_table.selectionModel().selectedRows()

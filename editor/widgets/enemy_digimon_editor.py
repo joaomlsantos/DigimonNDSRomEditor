@@ -14,9 +14,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import (
     QCheckBox,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QScrollArea,
     QSplitter,
     QVBoxLayout,
@@ -33,6 +33,7 @@ from digimon_core.stat_progression import (
 
 from .._perf import span
 from .digimon_list_panel import DigimonListPanel
+from .flow_layout import FlowLayout, make_height_for_width
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
     BoundBitCheckBox,
@@ -44,6 +45,7 @@ from .form_helpers import (
     add_unknown_grid_field,
     make_form,
     move_choices,
+    stat_cell,
     trait_choices,
     trait_effect_summary,
     wrap_in_scroll,
@@ -134,6 +136,27 @@ _MISC_FIELDS: List[Tuple[str, str, int, bool]] = [
 ]
 
 
+def scripted_area_label(session, digimon_id: int) -> str:
+    """Area name of the first scripted (BATTLE) event this species appears in
+    — ``map N`` / ``entry NNNN`` fallback — or "" if none.
+
+    Reads through :meth:`session.first_battle_location` (the cutscene index is
+    lazily built + cached, so this is a dict lookup after the first call).
+    Shared by the enemy list and the inline compare picker so both read
+    ``Name [location]``. Failures degrade silently to no tag.
+    """
+    try:
+        loc = session.first_battle_location(digimon_id)
+    except Exception:  # noqa: BLE001 — headless / partial sessions
+        return ""
+    if loc is None:
+        return ""
+    if loc.map_id is not None:
+        area = map_labels.area_name(loc.map_id)
+        if area and area != "?":
+            return area
+        return f"map {loc.map_id}"
+    return f"entry {loc.source_entry_ix:04d}"
 
 
 class EnemyDigimonEditor(QWidget):
@@ -191,15 +214,44 @@ class EnemyDigimonEditor(QWidget):
                 self._list_panel.refresh_all_labels()
 
             with span("splitter+layout"):
+                # Inline Compare / Swap (see base editor). "A" is the current
+                # enemy selection. Deferred import breaks the cycle
+                # (data_compare_editor imports this module's field lists).
+                from .data_compare_editor import CompareSwapPanel
+                self._compare_panel = CompareSwapPanel(
+                    self._session, self._undo_stack, a_is_enemy=True,
+                    get_a_record=lambda: self._entries.get(self._current_id),
+                )
+                self._compare_panel.setVisible(False)
+                right_split = QSplitter(Qt.Horizontal)
+                right_split.addWidget(self._detail)
+                right_split.addWidget(self._compare_panel)
+                right_split.setStretchFactor(0, 1)
+                right_split.setStretchFactor(1, 1)
+                right_split.setSizes([600, 480])
+
                 splitter = QSplitter(Qt.Horizontal, self)
                 splitter.addWidget(self._list_panel)
-                splitter.addWidget(self._detail)
+                splitter.addWidget(right_split)
                 splitter.setStretchFactor(0, 0)
                 splitter.setStretchFactor(1, 1)
                 splitter.setSizes([260, 740])
 
+                self._compare_toggle = QPushButton("⇄ Compare / Swap")
+                self._compare_toggle.setCheckable(True)
+                self._compare_toggle.setToolTip(
+                    "Show a second digimon beside this one to compare, swap, or "
+                    "copy its data.")
+                self._compare_toggle.toggled.connect(self._on_compare_toggled)
+                bar = QHBoxLayout()
+                bar.setContentsMargins(4, 2, 4, 2)
+                bar.addWidget(self._compare_toggle)
+                bar.addStretch(1)
+
                 layout = QVBoxLayout(self)
                 layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(0)
+                layout.addLayout(bar)
                 layout.addWidget(splitter)
 
             undo_stack.indexChanged.connect(self._refresh_form)
@@ -215,6 +267,11 @@ class EnemyDigimonEditor(QWidget):
 
     def select_by_id(self, digimon_id: int) -> bool:
         return self._list_panel.select_by_id(digimon_id)
+
+    def _on_compare_toggled(self, on: bool) -> None:
+        self._compare_panel.setVisible(on)
+        if on:
+            self._compare_panel.sync_a()
 
     def aboutToTeardown(self) -> None:
         """Called by main_window.set_content before this editor is destroyed.
@@ -233,6 +290,7 @@ class EnemyDigimonEditor(QWidget):
         font.setPointSize(font.pointSize() + 3)
         font.setBold(True)
         self._title.setFont(font)
+        self._title.setWordWrap(True)
 
         self._id_spin = BoundSpinBox(first, "id", 2, self._undo_stack, hex_display=True, read_only=True)
         self._species_combo = BoundEnumCombo(first, "species", model.Species, self._undo_stack)
@@ -243,27 +301,28 @@ class EnemyDigimonEditor(QWidget):
         # (id + species) don't waste the horizontal space they leave empty,
         # and the cross-references live near the id that indexes them.
         identity_box = QGroupBox("Identity")
-        identity_row = QHBoxLayout(identity_box)
-        identity_row.setContentsMargins(6, 4, 6, 4)
-        identity_row.setSpacing(12)
+        # Flow so the cross-reference lists drop below the id/species form when
+        # the pane is too narrow to hold them side by side.
+        identity_flow = FlowLayout(identity_box, margin=6, h_spacing=12, v_spacing=6)
+        make_height_for_width(identity_box)
 
         identity_form_wrap = QWidget()
         identity_form = make_form(identity_form_wrap)
         identity_form.addRow("ID", self._id_spin)
         identity_form.addRow("Species", self._species_combo)
-        identity_row.addWidget(identity_form_wrap, 1)
+        identity_flow.addWidget(identity_form_wrap)
 
         # Right side — two side-by-side cross-reference sections, each
         # populated per-selection and capped by a scroll wrapper so an enemy
         # with many occurrences doesn't stretch the Identity box past the id
         # form on the left; short lists render inline without a scrollbar.
         appears_wrap = QWidget()
-        appears_layout = QHBoxLayout(appears_wrap)
-        appears_layout.setContentsMargins(0, 0, 0, 0)
-        appears_layout.setSpacing(12)
+        appears_flow = FlowLayout(appears_wrap, margin=0, h_spacing=12, v_spacing=6)
+        make_height_for_width(appears_wrap)
 
         def _appears_section(title: str, link_slot) -> Tuple[QWidget, QLabel]:
             col = QWidget()
+            col.setMinimumWidth(220)
             col_layout = QVBoxLayout(col)
             col_layout.setContentsMargins(0, 0, 0, 0)
             col_layout.setSpacing(2)
@@ -291,9 +350,9 @@ class EnemyDigimonEditor(QWidget):
         scripted_col, self._appears_in_label = _appears_section(
             "Appears in scripted events", self._on_appears_in_link,
         )
-        appears_layout.addWidget(wild_col, 1)
-        appears_layout.addWidget(scripted_col, 1)
-        identity_row.addWidget(appears_wrap, 2)
+        appears_flow.addWidget(wild_col)
+        appears_flow.addWidget(scripted_col)
+        identity_flow.addWidget(appears_wrap)
 
         with span("SpriteMapRow"):
             self._sprite_row = SpriteMapRow(
@@ -396,15 +455,15 @@ class EnemyDigimonEditor(QWidget):
                 misc_grid.addWidget(QLabel(label), row, 2)
                 misc_grid.addWidget(spin, row, 3)
 
-        # Traits and Moves are short forms; pair them in a horizontal row so
-        # they share the available width instead of stacking. Move Usage
-        # Probabilities sit alongside Moves since they're a per-move companion.
-        trait_move_row = QHBoxLayout()
-        trait_move_row.setContentsMargins(0, 0, 0, 0)
-        trait_move_row.setSpacing(4)
-        trait_move_row.addWidget(traits_box, 1)
-        trait_move_row.addWidget(moves_box, 1)
-        trait_move_row.addWidget(weights_box, 1)
+        # Traits / Moves / Move-usage sit side by side when there's room; a
+        # FlowLayout wraps them onto the next row as the pane narrows instead
+        # of clipping off the right edge.
+        trait_move_wrap = QWidget()
+        tm_flow = FlowLayout(trait_move_wrap, margin=0, h_spacing=8, v_spacing=6)
+        tm_flow.addWidget(traits_box)
+        tm_flow.addWidget(moves_box)
+        tm_flow.addWidget(weights_box)
+        make_height_for_width(trait_move_wrap)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -416,7 +475,7 @@ class EnemyDigimonEditor(QWidget):
         content_layout.addWidget(stats_box)
         content_layout.addWidget(res_box)
         content_layout.addWidget(affinity_box)
-        content_layout.addLayout(trait_move_row)
+        content_layout.addWidget(trait_move_wrap)
         content_layout.addWidget(exp_box)
         content_layout.addWidget(misc_box)
         content_layout.addStretch(1)
@@ -440,7 +499,7 @@ class EnemyDigimonEditor(QWidget):
             spin.valueChanged.connect(lambda _v: self._refresh_base_resistances())
 
         with span("wrap_in_scroll"):
-            return wrap_in_scroll(content)
+            return wrap_in_scroll(content, reflow=True)
 
     # ---- selection / refresh --------------------------------------------
 
@@ -504,6 +563,9 @@ class EnemyDigimonEditor(QWidget):
         self._refresh_base_resistances()
         self._refresh_wild_appears(digimon_id)
         self._refresh_appears_in(digimon_id)
+        # Keep the inline Compare/Swap panel's button state in sync with A.
+        if getattr(self, "_compare_panel", None) is not None:
+            self._compare_panel.sync_a()
 
     def _refresh_wild_appears(self, digimon_id: int) -> None:
         """Populate the 'Appears in Wild Encounters' section for ``digimon_id``.
@@ -784,7 +846,11 @@ class EnemyDigimonEditor(QWidget):
         scripted_label = self._scripted_area_label(digimon_id)
         icons = ("🌿" if wild_label else "") + ("⚔" if scripted_label else "")
         encounter = wild_label or scripted_label
-        return (icons, f"0x{digimon_id:03x}", own_name, disp, encounter)
+        # Scripted-event enemies read as "Name [Event location]" right in the
+        # Name column so they're identifiable (and filter-searchable) by where
+        # they appear — e.g. "Kokuwamon [Thriller Ruins]".
+        name_col = f"{own_name} [{scripted_label}]" if scripted_label else own_name
+        return (icons, f"0x{digimon_id:03x}", name_col, disp, encounter)
 
     def _wild_area_label(self, digimon_id: int) -> str:
         """Name of the first wild-encounter area that stocks this species,
@@ -799,27 +865,9 @@ class EnemyDigimonEditor(QWidget):
         return self._session.wild_encounter_area_label(area_ix)
 
     def _scripted_area_label(self, digimon_id: int) -> str:
-        """Area name of the first scripted (BATTLE) event this species
-        appears in — ``entry NNNN`` for non-map locations — or empty
-        string otherwise.
-
-        Reads through :meth:`session.first_battle_location`; the cutscene
-        index is lazily built and cached, so this fires per label without
-        re-walking overlay5. Failures degrade silently to no tag rather
-        than blocking the list from rendering.
-        """
-        try:
-            loc = self._session.first_battle_location(digimon_id)
-        except Exception:  # noqa: BLE001 — headless / partial sessions
-            return ""
-        if loc is None:
-            return ""
-        if loc.map_id is not None:
-            area = map_labels.area_name(loc.map_id)
-            if area and area != "?":
-                return area
-            return f"map {loc.map_id}"
-        return f"entry {loc.source_entry_ix:04d}"
+        """Area name of the first scripted (BATTLE) event this species appears
+        in — see :func:`scripted_area_label`."""
+        return scripted_area_label(self._session, digimon_id)
 
     def _refresh_list_label_for_current(self, _index: int = 0) -> None:
         if self._current_id < 0:
@@ -886,61 +934,26 @@ class EnemyDigimonEditor(QWidget):
         self._expected_header.setWordWrap(True)
         outer.addWidget(self._expected_header)
 
-        # Stat table. Column 0 is the row label ("Current" / "Expected" /
-        # "Range"); columns 1..N are stats in _STAT_FIELDS order.
-        table = QGridLayout()
-        table.setContentsMargins(0, 4, 0, 0)
-        table.setHorizontalSpacing(8)
-        table.setVerticalSpacing(2)
-
-        # Row 0 leaves the (0,0) corner empty; header labels start at col 1.
-        for ix, (attr, label) in enumerate(_STAT_FIELDS):
-            col = 1 + ix
-            header = QLabel(label)
-            header.setAlignment(Qt.AlignCenter)
-            header.setStyleSheet("font-weight: bold;")
-            table.addWidget(header, 0, col)
-
-        # Row 1: "Current" row of editable spinboxes.
-        cur_lbl = QLabel("Current")
-        cur_lbl.setStyleSheet("color: palette(mid);")
-        table.addWidget(cur_lbl, 1, 0)
-        for ix, (attr, label) in enumerate(_STAT_FIELDS):
+        # One wrapping cell per stat: bold name, editable current value, and
+        # the muted expected / (range) beneath. Cells reflow onto a second row
+        # when the pane narrows instead of the 7-column table scrolling. Evasion
+        # has no level-up curve, so its expected / range cells stay em-dashes.
+        flow_wrap = QWidget()
+        flow = FlowLayout(flow_wrap, margin=0, h_spacing=12, v_spacing=6)
+        for attr, label in _STAT_FIELDS:
             spin = BoundSpinBox(first, attr, 2, self._undo_stack)
-            # Centre the displayed value so it lines up with the
-            # centred Expected / Range labels in the column underneath.
             spin.setAlignment(Qt.AlignCenter)
             self._stat_widgets[attr] = spin
-            table.addWidget(spin, 1, 1 + ix)
-
-        # Row 2: expected-avg readout. Evasion has no curve → "—".
-        exp_lbl = QLabel("Expected")
-        exp_lbl.setStyleSheet("color: palette(mid);")
-        table.addWidget(exp_lbl, 2, 0)
-        for ix, (attr, label) in enumerate(_STAT_FIELDS):
             value_lbl = QLabel("—")
-            value_lbl.setAlignment(Qt.AlignCenter)
+            value_lbl.setStyleSheet("color: palette(mid);")
             self._expected_value_labels[attr] = value_lbl
-            table.addWidget(value_lbl, 2, 1 + ix)
-
-        # Row 3: (min–max) for the same column. Muted, smaller-feeling.
-        rng_lbl = QLabel("Range")
-        rng_lbl.setStyleSheet("color: palette(mid);")
-        table.addWidget(rng_lbl, 3, 0)
-        for ix, (attr, label) in enumerate(_STAT_FIELDS):
             range_lbl = QLabel("")
-            range_lbl.setAlignment(Qt.AlignCenter)
             range_lbl.setStyleSheet("color: palette(mid);")
             self._expected_range_labels[attr] = range_lbl
-            table.addWidget(range_lbl, 3, 1 + ix)
-
-        # Without a trailing stretch column, QGridLayout distributes
-        # leftover horizontal space evenly across all columns, leaving
-        # a visible gap between the row-label column and the first stat.
-        # Anchor the table left by pushing the slack into a phantom
-        # column past the last stat.
-        table.setColumnStretch(1 + len(_STAT_FIELDS), 1)
-        outer.addLayout(table)
+            flow.addWidget(stat_cell(label, spin, [value_lbl, range_lbl]))
+        make_height_for_width(flow_wrap)
+        outer.addWidget(flow_wrap)
+        make_height_for_width(box)
 
         # HP buff toggle parked below the table — affects what the
         # Expected / Range rows show but isn't a per-encounter knob the
@@ -971,54 +984,29 @@ class EnemyDigimonEditor(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(4)
 
-        table = QGridLayout()
-        table.setContentsMargins(0, 0, 0, 0)
-        table.setHorizontalSpacing(8)
-        table.setVerticalSpacing(2)
-
-        # Header row.
-        for ix, (attr, label) in enumerate(_RES_FIELDS):
-            header = QLabel(label)
-            header.setAlignment(Qt.AlignCenter)
-            header.setStyleSheet("font-weight: bold;")
-            table.addWidget(header, 0, 1 + ix)
-
-        # Current row.
-        cur_lbl = QLabel("Current")
-        cur_lbl.setStyleSheet("color: palette(mid);")
-        table.addWidget(cur_lbl, 1, 0)
-        for ix, (attr, label) in enumerate(_RES_FIELDS):
+        # One wrapping cell per element: bold name, editable Current value, the
+        # matched Base record's value (muted) and the damage ×multiplier. Cells
+        # reflow onto a second row when the pane narrows.
+        flow_wrap = QWidget()
+        flow = FlowLayout(flow_wrap, margin=0, h_spacing=12, v_spacing=6)
+        self._res_mult_labels = {}
+        for attr, label in _RES_FIELDS:
             spin = BoundSpinBox(first, attr, 2, self._undo_stack)
             spin.setAlignment(Qt.AlignCenter)
             self._res_widgets[attr] = spin
             spin.valueChanged.connect(self._refresh_res_multipliers)
-            table.addWidget(spin, 1, 1 + ix)
-
-        # Base row — read-only readout from the matching base record.
-        base_lbl = QLabel("Base")
-        base_lbl.setStyleSheet("color: palette(mid);")
-        table.addWidget(base_lbl, 2, 0)
-        for ix, (attr, label) in enumerate(_RES_FIELDS):
-            value_lbl = QLabel("—")
-            value_lbl.setAlignment(Qt.AlignCenter)
-            self._base_res_labels[attr] = value_lbl
-            table.addWidget(value_lbl, 2, 1 + ix)
-
-        # Multiplier row — damage taken vs each element for the Current value.
-        mult_lbl = QLabel("×")
-        mult_lbl.setStyleSheet("color: palette(mid);")
-        table.addWidget(mult_lbl, 3, 0)
-        self._res_mult_labels = {}
-        for ix, (attr, label) in enumerate(_RES_FIELDS):
-            m = QLabel("")
-            m.setAlignment(Qt.AlignCenter)
-            m.setStyleSheet("color: palette(mid);")
-            m.setToolTip("Damage multiplier vs this element (500 = ×1.00, 1000 = ×0.50).")
-            self._res_mult_labels[attr] = m
-            table.addWidget(m, 3, 1 + ix)
-
-        table.setColumnStretch(1 + len(_RES_FIELDS), 1)
-        outer.addLayout(table)
+            base_lbl = QLabel("—")
+            base_lbl.setStyleSheet("color: palette(mid);")
+            base_lbl.setToolTip("Matched base record's resistance for this element.")
+            self._base_res_labels[attr] = base_lbl
+            mult = QLabel("")
+            mult.setStyleSheet("color: palette(mid);")
+            mult.setToolTip("Damage multiplier vs this element (500 = ×1.00, 1000 = ×0.50).")
+            self._res_mult_labels[attr] = mult
+            flow.addWidget(stat_cell(label, spin, [base_lbl, mult]))
+        make_height_for_width(flow_wrap)
+        outer.addWidget(flow_wrap)
+        make_height_for_width(box)
         return box
 
     def _refresh_res_multipliers(self, *_):
@@ -1046,21 +1034,15 @@ class EnemyDigimonEditor(QWidget):
         note.setWordWrap(True)
         outer.addWidget(note)
 
-        table = QGridLayout()
-        table.setContentsMargins(0, 0, 0, 0)
-        table.setHorizontalSpacing(8)
-        table.setVerticalSpacing(2)
-        for col, (bit, label) in enumerate(_AFFINITY_FIELDS):
-            header = QLabel(label)
-            header.setAlignment(Qt.AlignCenter)
-            header.setStyleSheet("font-weight: bold;")
-            table.addWidget(header, 0, col)
-        for col, (bit, label) in enumerate(_AFFINITY_FIELDS):
+        flow_wrap = QWidget()
+        flow = FlowLayout(flow_wrap, margin=0, h_spacing=12, v_spacing=6)
+        for bit, label in _AFFINITY_FIELDS:
             check = BoundBitCheckBox(first, "element_affinity", bit, self._undo_stack)
             self._affinity_checks[bit] = check
-            table.addWidget(check, 1, col, Qt.AlignCenter)
-        table.setColumnStretch(len(_AFFINITY_FIELDS), 1)
-        outer.addLayout(table)
+            flow.addWidget(stat_cell(label, check))
+        make_height_for_width(flow_wrap)
+        outer.addWidget(flow_wrap)
+        make_height_for_width(box)
         return box
 
     def _refresh_expected_stats(self) -> None:

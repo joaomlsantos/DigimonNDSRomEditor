@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QFrame,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -69,7 +70,8 @@ from .cell_export_policy import (
     allow_shared_tile_exports,
     register_change_callback as _register_cell_policy_callback,
 )
-from .form_helpers import wrap_tooltip
+from .flow_layout import FlowLayout, make_height_for_width
+from .form_helpers import ReflowHeightSync, wrap_tooltip
 from .cell_png_io import (
     CellPngContext,
     CellPngError,
@@ -377,7 +379,7 @@ class SpriteBrowser(QWidget):
 
         self._scroll = QScrollArea()
         self._scroll.setWidget(self._image_label)
-        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidgetResizable(False)
         self._scroll.setAlignment(Qt.AlignCenter)
 
         # Cells tab: OAM-composed preview, one slot per cell on a
@@ -390,7 +392,7 @@ class SpriteBrowser(QWidget):
         self._cells_label.setMinimumSize(256, 256)
         self._cells_scroll = QScrollArea()
         self._cells_scroll.setWidget(self._cells_label)
-        self._cells_scroll.setWidgetResizable(True)
+        self._cells_scroll.setWidgetResizable(False)
         self._cells_scroll.setAlignment(Qt.AlignCenter)
         self._cells_columns_spin = QSpinBox()
         self._cells_columns_spin.setRange(1, 32)
@@ -707,14 +709,19 @@ class SpriteBrowser(QWidget):
         cells_layout.addLayout(cells_footer)
 
         self._preview_tabs = QTabWidget()
-        self._preview_tabs.addTab(tiles_tab, "Tiles")
+        # Cells first + default — it's the OAM-composed sprite the user cares
+        # about; Tiles is the raw-strip fallback.
         self._preview_tabs.addTab(cells_tab, "Cells")
+        self._cells_tab_index = self._preview_tabs.count() - 1
+        self._preview_tabs.addTab(tiles_tab, "Tiles")
         self._preview_tabs.addTab(self._build_anim_tab(), "Animation")
         self._anim_tab_index = self._preview_tabs.count() - 1
         # Disabled until a sprite with real animation is selected.
         self._preview_tabs.setTabEnabled(self._anim_tab_index, False)
+        self._preview_tabs.setCurrentIndex(self._cells_tab_index)
         self._preview_tabs.currentChanged.connect(self._on_preview_tab_changed)
-        right_layout.addWidget(self._preview_tabs, 1)
+        # Added to a vertical splitter with the controls below (see end of
+        # _build_ui) so the preview keeps the space and the controls scroll.
         # Import/Export dropdowns (every PNG mode + native NCGR+NCLR live
         # inside), then the standalone structural actions. All pinned to one
         # width so they read as an aligned group.
@@ -739,15 +746,39 @@ class SpriteBrowser(QWidget):
         actions_col.addWidget(self._duplicate_entry_btn)
         actions_col.addWidget(self._add_cell_btn)
         actions_col.addStretch(1)
-        controls_row = QHBoxLayout()
-        controls_row.addLayout(controls)
-        controls_row.addSpacing(16)
-        controls_row.addLayout(io_col)
-        controls_row.addSpacing(12)
-        controls_row.addLayout(actions_col)
-        controls_row.addStretch(1)
-        controls_row.addLayout(meta_form)
-        right_layout.addLayout(controls_row)
+        # Flow the control groups so they wrap onto a second row when the pane
+        # narrows, instead of the four panels side by side pinning a ~1900px
+        # floor that stops the whole browser from shrinking.
+        def _panel(inner_layout) -> QWidget:
+            holder = QWidget()
+            holder.setLayout(inner_layout)
+            return holder
+
+        controls_row_w = QWidget()
+        controls_flow = FlowLayout(controls_row_w, margin=0, h_spacing=16, v_spacing=8)
+        for inner in (controls, io_col, actions_col, meta_form):
+            controls_flow.addWidget(_panel(inner))
+        make_height_for_width(controls_row_w)
+
+        # Controls (incl. the metadata footer) go in a scroll area under the
+        # preview, split vertically so the pane is compressible top-to-bottom:
+        # the user can shrink the controls area and it scrolls instead of the
+        # whole window growing tall as the panels wrap.
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QFrame.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_scroll.setWidget(controls_row_w)
+        ReflowHeightSync(controls_row_w)
+
+        mid_split = QSplitter(Qt.Vertical)
+        mid_split.addWidget(self._preview_tabs)
+        mid_split.addWidget(controls_scroll)
+        mid_split.setStretchFactor(0, 1)
+        mid_split.setStretchFactor(1, 0)
+        mid_split.setCollapsible(0, False)
+        mid_split.setSizes([480, 300])
+        right_layout.addWidget(mid_split)
 
         # List column: index list on top, "+ Add Entry" toolbar below.
         # Placement mirrors BTCHR — the button sits under the list because
@@ -810,18 +841,35 @@ class SpriteBrowser(QWidget):
             scroll=self._palette_scroll,
         )
 
+        # Palette tab: the sprite preview (for reference) on the left + the
+        # palette editor on the right, so recolouring keeps the image on
+        # screen. The preview mirrors the Cells composite (_set_cells_display).
+        # The editor side scrolls so its tall 256-colour panel doesn't pin the
+        # tab widget's minimum height.
+        self._palette_preview_label = QLabel("Select a sprite to preview.")
+        self._palette_preview_label.setAlignment(Qt.AlignCenter)
+        pal_prev_scroll = QScrollArea()
+        pal_prev_scroll.setWidgetResizable(False)
+        pal_prev_scroll.setAlignment(Qt.AlignCenter)
+        pal_prev_scroll.setWidget(self._palette_preview_label)
+        pal_edit_scroll = QScrollArea()
+        pal_edit_scroll.setWidgetResizable(True)
+        pal_edit_scroll.setFrameShape(QFrame.NoFrame)
+        pal_edit_scroll.setWidget(palette_col)
+        palette_tab = QSplitter(Qt.Horizontal)
+        palette_tab.addWidget(pal_prev_scroll)
+        palette_tab.addWidget(pal_edit_scroll)
+        palette_tab.setStretchFactor(0, 1)
+        palette_tab.setStretchFactor(1, 0)
+        palette_tab.setSizes([420, 300])
+        self._palette_tab_index = self._preview_tabs.addTab(palette_tab, "Palette")
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(list_col)
         splitter.addWidget(right)
-        splitter.addWidget(palette_col)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
-        splitter.setSizes([220, 760, 260])
-        # Collapsible so the user can reclaim the width when they don't need
-        # the palette open.
-        splitter.setCollapsible(2, True)
-        splitter.splitterMoved.connect(lambda *_: self._palette_toolkit.reflow())
+        splitter.setSizes([220, 900])
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -862,7 +910,7 @@ class SpriteBrowser(QWidget):
         # Re-render lazily — only paint if the user is actually viewing
         # the Cells tab.
         self._cells_dirty = True
-        if self._preview_tabs.currentIndex() == 1:
+        if self._cells_preview_visible():
             self._refresh_cells_preview()
         self._refresh_anim_panel()
 
@@ -874,7 +922,7 @@ class SpriteBrowser(QWidget):
         # Cells render uses the same effective palette — bank changes
         # invalidate it. Width changes don't (cells layout is OAM-driven).
         self._cells_dirty = True
-        if self._preview_tabs.currentIndex() == 1:
+        if self._cells_preview_visible():
             self._refresh_cells_preview()
 
     def _on_width_changed(self, w: int) -> None:
@@ -892,13 +940,40 @@ class SpriteBrowser(QWidget):
             # Left the Animation tab — stop playback so the timer isn't
             # updating a hidden surface.
             self._stop_anim_playback()
+        if idx == getattr(self, "_palette_tab_index", -1):
+            # Render the current sprite into the tab's reference preview, then
+            # reflow the grid to the pane width.
+            self._refresh_cells_preview()
+            self._palette_toolkit.reflow()
 
     def _on_cells_columns_changed(self, value: int) -> None:
         if self._current_idx is not None:
             self._cells_columns_overrides[self._current_idx] = value
         self._cells_dirty = True
-        if self._preview_tabs.currentIndex() == 1:
+        if self._cells_preview_visible():
             self._refresh_cells_preview()
+
+    def _cells_preview_visible(self) -> bool:
+        """True when the Cells composite is on screen — either the Cells tab or
+        the Palette tab (whose reference preview mirrors the same render)."""
+        idx = self._preview_tabs.currentIndex()
+        return idx == self._cells_tab_index or idx == getattr(
+            self, "_palette_tab_index", -1
+        )
+
+    def _set_cells_display(self, *, pixmap=None, text=None) -> None:
+        """Update the Cells-tab label and the Palette-tab reference preview
+        together, so recolouring on the Palette tab keeps the image live."""
+        labels = [self._cells_label]
+        pal = getattr(self, "_palette_preview_label", None)
+        if pal is not None:
+            labels.append(pal)
+        for lbl in labels:
+            if pixmap is not None:
+                lbl.setPixmap(pixmap)
+                lbl.adjustSize()
+            else:
+                lbl.setText(text)
 
     def _refresh_cells_preview(self) -> None:
         """Render the OAM-composed cells grid into the Cells tab.
@@ -914,12 +989,12 @@ class SpriteBrowser(QWidget):
         self._cells_dirty = False
         self._refresh_conflict_label()
         if self._current_idx is None:
-            self._cells_label.setText("Select a sprite to preview.")
+            self._set_cells_display(text="Select a sprite to preview.")
             return
         ctx = self._cell_ctx(for_preview=True)
         layout = self._cell_layout()
         if ctx is None or layout is None:
-            self._cells_label.setText("(no cells)")
+            self._set_cells_display(text="(no cells)")
             return
         n_cells = len(ctx.ncer.cells)
         sel = max(0, min(self._cell_view_spin.value(), n_cells - 1))
@@ -944,7 +1019,7 @@ class SpriteBrowser(QWidget):
             self._cells_columns_spin.blockSignals(False)
             img = shared_render_cells_qimage(ctx, columns)
         if img is None:
-            self._cells_label.setText("(empty render)")
+            self._set_cells_display(text="(empty render)")
             return
         pm = QPixmap.fromImage(img)
         scale = 1
@@ -966,19 +1041,18 @@ class SpriteBrowser(QWidget):
                 max_w * scale - 1, max_h * scale - 1,
             )
             painter.end()
-        self._cells_label.setPixmap(pm)
-        self._cells_label.setMinimumSize(pm.size())
+        self._set_cells_display(pixmap=pm)
 
     def _on_cell_view_changed(self, _value: int) -> None:
         # Re-render the Cells tab (single-cell view or grid highlight) when
         # the selected cell changes.
         self._cells_dirty = True
-        if self._preview_tabs.currentIndex() == 1:
+        if self._cells_preview_visible():
             self._refresh_cells_preview()
 
     def _on_cells_show_all_toggled(self, _checked: bool) -> None:
         self._cells_dirty = True
-        if self._preview_tabs.currentIndex() == 1:
+        if self._cells_preview_visible():
             self._refresh_cells_preview()
 
     def _recompute_current_conflicts(self) -> None:
@@ -1222,6 +1296,7 @@ class SpriteBrowser(QWidget):
         if self._show_oam_overlay:
             self._paint_oam_gap_overlay(pix, bit_depth, w, h)
         self._image_label.setPixmap(pix)
+        self._image_label.adjustSize()
         # Stash dimensions for click→source-pixel mapping in the picker.
         self._preview_src_size = (w, h)
         self._preview_pixmap_size = (pix.width(), pix.height())
@@ -2677,7 +2752,7 @@ class SpriteBrowser(QWidget):
         self._anim_label.setMinimumSize(256, 256)
         self._anim_scroll = QScrollArea()
         self._anim_scroll.setWidget(self._anim_label)
-        self._anim_scroll.setWidgetResizable(True)
+        self._anim_scroll.setWidgetResizable(False)
         self._anim_scroll.setAlignment(Qt.AlignCenter)
 
         self._anim_seq_combo = QComboBox()
@@ -2880,7 +2955,7 @@ class SpriteBrowser(QWidget):
             self._preview_tabs.currentIndex() == self._anim_tab_index
         )
         if not can_animate and was_on_anim_tab:
-            self._preview_tabs.setCurrentIndex(1)  # fall back to Cells
+            self._preview_tabs.setCurrentIndex(self._cells_tab_index)  # fall back to Cells
         self._preview_tabs.setTabEnabled(self._anim_tab_index, can_animate)
 
         self._anim_seq_idx = 0
@@ -3106,7 +3181,7 @@ class SpriteBrowser(QWidget):
                 Qt.KeepAspectRatio, Qt.FastTransformation,
             )
         self._anim_label.setPixmap(pm)
-        self._anim_label.setMinimumSize(pm.size())
+        self._anim_label.adjustSize()
 
     # ---- transform editing ----------------------------------------------
 
@@ -3431,8 +3506,12 @@ class SpriteBrowser(QWidget):
         """Re-render whichever preview tab is showing under the current
         ``_preview_palette`` override (batch adjust / borrow). Doesn't touch the
         grid or adjuster selection."""
-        if self._preview_tabs.currentIndex() == 1:  # Cells tab
+        idx = self._preview_tabs.currentIndex()
+        if idx == self._cells_tab_index:  # Cells tab
             self._cells_dirty = False
+            self._refresh_cells_preview()
+        elif idx == getattr(self, "_palette_tab_index", -1):
+            # Palette tab's reference image is the Cells composite.
             self._refresh_cells_preview()
         else:
             self._refresh_preview_only(sync_palette=False)
@@ -3639,6 +3718,6 @@ class SpriteBrowser(QWidget):
         self._recompute_current_conflicts()
         self._refresh_cell_export_button_states()
         self._cells_dirty = True
-        if self._preview_tabs.currentIndex() == 1:
+        if self._cells_preview_visible():
             self._refresh_cells_preview()
         self._refresh_anim_panel()

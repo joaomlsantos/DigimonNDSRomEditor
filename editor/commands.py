@@ -167,6 +167,127 @@ class ReskinSlotCommand(QUndoCommand):
         self._str_entry.value = self._old_str
 
 
+def _rehydrate_record(rec: Any, data_bytes: bytes) -> None:
+    """Re-parse ``rec`` in place from ``data_bytes`` (full record image),
+    preserving its ROM ``offset``. Mutating the same instance keeps every
+    bound editor widget's target reference valid. Works for BaseDataDigimon
+    and EnemyDataDigimon (both parse via ``__init__(bytearray, offset)`` and
+    round-trip through ``getByteArray()``)."""
+    rec.__init__(bytearray(data_bytes), rec.offset)
+
+
+class SwapDigimonRecordCommand(QUndoCommand):
+    """Swap the ENTIRE data of two same-type digimon records, each keeping its
+    own internal id (the u16 at bytes ``[0:2]``). Base↔base or enemy↔enemy only
+    — the two records must be the same class / SIZE. Snapshots both byte images
+    in ``__init__`` (before push() triggers redo) so a single Ctrl+Z reverts."""
+
+    def __init__(self, rec_a: Any, rec_b: Any, description: str,
+                 on_change: Optional[Callable[[], None]] = None):
+        super().__init__(description)
+        self._a = rec_a
+        self._b = rec_b
+        self._on_change = on_change
+        self._a_bytes = bytes(rec_a.getByteArray())
+        self._b_bytes = bytes(rec_b.getByteArray())
+
+    def redo(self) -> None:
+        # a gets b's data but keeps a's id; b gets a's data but keeps b's id.
+        _rehydrate_record(self._a, self._a_bytes[:2] + self._b_bytes[2:])
+        _rehydrate_record(self._b, self._b_bytes[:2] + self._a_bytes[2:])
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        _rehydrate_record(self._a, self._a_bytes)
+        _rehydrate_record(self._b, self._b_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class CopyDigimonRecordCommand(QUndoCommand):
+    """Copy the ENTIRE data of one digimon record onto another (same class),
+    the destination keeping its own id. Snapshots the source image + the
+    destination's prior image in ``__init__`` so undo restores the destination
+    and a later source edit can't change what this command pastes."""
+
+    def __init__(self, dest_rec: Any, source_rec: Any, description: str,
+                 on_change: Optional[Callable[[], None]] = None):
+        super().__init__(description)
+        self._dest = dest_rec
+        self._on_change = on_change
+        src = bytes(source_rec.getByteArray())
+        self._old_bytes = bytes(dest_rec.getByteArray())
+        self._new_bytes = self._old_bytes[:2] + src[2:]  # dest id + source data
+
+    def redo(self) -> None:
+        _rehydrate_record(self._dest, self._new_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        _rehydrate_record(self._dest, self._old_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class SwapDisplayCommand(QUndoCommand):
+    """Swap the display of two id slots — the sprite_map entry (overworld /
+    battle / portrait / mini sprites) + the battle-string value — so a
+    digimon-data swap can carry the sprites + name with it. Each slot keeps its
+    own id; only the display fields move. Self-inverse, so redo == undo."""
+
+    def __init__(self, sprite_a: Any, sprite_b: Any, str_a: Any, str_b: Any,
+                 description: str = "", on_change: Optional[Callable[[], None]] = None):
+        super().__init__(description)
+        self._sa, self._sb = sprite_a, sprite_b
+        self._ta, self._tb = str_a, str_b
+        self._on_change = on_change
+
+    def _swap(self) -> None:
+        self._sa.unknown_0x4, self._sb.unknown_0x4 = self._sb.unknown_0x4, self._sa.unknown_0x4
+        self._sa.main_sprite, self._sb.main_sprite = self._sb.main_sprite, self._sa.main_sprite
+        self._sa.upperscreen_sprites, self._sb.upperscreen_sprites = (
+            self._sb.upperscreen_sprites, self._sa.upperscreen_sprites)
+        self._ta.value, self._tb.value = self._tb.value, self._ta.value
+        if self._on_change is not None:
+            self._on_change()
+
+    def redo(self) -> None:
+        self._swap()
+
+    def undo(self) -> None:
+        self._swap()
+
+
+class CopyDisplayCommand(QUndoCommand):
+    """Copy the display (sprite_map entry + battle-string value) of one id slot
+    onto another; the destination keeps its id. Snapshots the destination's
+    prior display so a single undo restores it."""
+
+    def __init__(self, dest_sprite: Any, src_sprite: Any, dest_str: Any, src_str: Any,
+                 description: str = "", on_change: Optional[Callable[[], None]] = None):
+        super().__init__(description)
+        self._ds, self._dt = dest_sprite, dest_str
+        self._on_change = on_change
+        self._old = (dest_sprite.unknown_0x4, dest_sprite.main_sprite,
+                     dest_sprite.upperscreen_sprites, dest_str.value)
+        self._new = (src_sprite.unknown_0x4, src_sprite.main_sprite,
+                     src_sprite.upperscreen_sprites, src_str.value)
+
+    def _apply(self, vals) -> None:
+        (self._ds.unknown_0x4, self._ds.main_sprite,
+         self._ds.upperscreen_sprites, self._dt.value) = vals
+        if self._on_change is not None:
+            self._on_change()
+
+    def redo(self) -> None:
+        self._apply(self._new)
+
+    def undo(self) -> None:
+        self._apply(self._old)
+
+
 class ReplaceSpriteCommand(QUndoCommand):
     """Atomic replace of one or more SPR_*.PAK entries.
 
@@ -284,6 +405,40 @@ class ReplaceMapFileCommand(QUndoCommand):
 
     def undo(self) -> None:
         self._session.replace_map_file_bytes(self._path, self._old_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+
+class ReplaceBgFileCommand(QUndoCommand):
+    """Atomic swap of one ``DAT/bg/*`` menu-background FAT file's bytes.
+
+    Same shape as :class:`ReplaceMapFileCommand` — used by the menu-background
+    browser's PNG import (three files: NCGR/NSCR/NCLR, wrapped in a macro).
+    ``on_change`` lets the browser re-render after each redo/undo flip.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        path: str,
+        new_bytes: bytes,
+        description: str,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(description)
+        self._session = session
+        self._path = path
+        self._on_change = on_change
+        self._old_bytes = bytes(session.bg_file_bytes(path))
+        self._new_bytes = bytes(new_bytes)
+
+    def redo(self) -> None:
+        self._session.replace_bg_file_bytes(self._path, self._new_bytes)
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        self._session.replace_bg_file_bytes(self._path, self._old_bytes)
         if self._on_change is not None:
             self._on_change()
 

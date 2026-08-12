@@ -232,6 +232,12 @@ class RomSession:
     # see their own edits immediately.
     _dirty_map_files: Dict[str, bytes] = field(default_factory=dict)
 
+    # Same shape again, for ``DAT/bg/*`` menu-background edits (pack-select
+    # / window-frame / title BGs). Unlike btmap/map these files are stored
+    # uncompressed on the ROM, so ``_apply_bg_splice`` writes them verbatim
+    # instead of RLE-30 re-wrapping.
+    _dirty_bg_files: Dict[str, bytes] = field(default_factory=dict)
+
     # Per-entry overrides for overlay5 (script overlay) — keyed by
     # entry index, value is the full replacement entry payload. The
     # Events tab on field maps (PLAN.md §14.9) populates this when the
@@ -613,6 +619,7 @@ class RomSession:
         skip_sprite_splice: bool = False,
         skip_btmap_splice: bool = False,
         skip_map_splice: bool = False,
+        skip_bg_splice: bool = False,
         skip_overlay5_splice: bool = False,
         skip_sound_splice: bool = False,
         skip_wild_encounter_splice: bool = False,
@@ -735,6 +742,10 @@ class RomSession:
         # shift every downstream file in the byte diff.
         if not skip_map_splice:
             self._apply_map_splice(out)
+        # Menu-background edits (DAT/bg/*) — same channel pattern, but the
+        # files are uncompressed on the ROM so the splice writes verbatim.
+        if not skip_bg_splice:
+            self._apply_bg_splice(out)
         # Overlay5 (script overlay) edits — same channel pattern as
         # btmap/map: ROM save splices in place, project save (caller
         # passes ``skip_overlay5_splice=True``) routes per-entry bytes
@@ -841,6 +852,26 @@ class RomSession:
         dirty cache."""
         previous = self.map_file_bytes(path)
         self._dirty_map_files[path] = bytes(new_bytes)
+        return previous
+
+    def bg_file_bytes(self, path: str) -> bytes:
+        """Resolve ``path`` (e.g. ``"DAT/bg/t_menubg01.NSCR"``) to bytes.
+
+        Mirrors :meth:`btmap_file_bytes`: dirty cache first, vanilla FAT
+        fallback. Menu-background files are uncompressed on the ROM, so the
+        bytes are raw Nitro resources (NCGR/NSCR/NCLR) with no RLE-30 wrapper.
+        """
+        cached = self._dirty_bg_files.get(path)
+        if cached is not None:
+            return cached
+        return self.vanilla_file_table().slice(self.original_rom_data, path)
+
+    def replace_bg_file_bytes(self, path: str, new_bytes: bytes) -> bytes:
+        """Install ``new_bytes`` as the override for ``path`` and return the
+        prior bytes — vanilla or a previous edit. Mutates only the dirty
+        cache."""
+        previous = self.bg_file_bytes(path)
+        self._dirty_bg_files[path] = bytes(new_bytes)
         return previous
 
     # ---- overlay5 (script overlay) -----------------------------------------
@@ -1300,6 +1331,45 @@ class RomSession:
             content_delta = len(compressed) - (file_end - file_start)
             aligned_shift = fat.splice_range(
                 out, file_start, file_end, ce, compressed,
+            )
+            fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
+
+    def _apply_bg_splice(self, out: bytearray) -> None:
+        """Splice every dirty ``DAT/bg/*`` menu-background file into the ROM.
+
+        Unlike :meth:`_apply_btmap_splice` / :meth:`_apply_map_splice`, these
+        files are stored **uncompressed** in the FAT — the engine loads them
+        as raw Nitro resources (NCGR/NSCR/NCLR) with no SWI decompress — so
+        the replacement bytes are written verbatim, NOT re-wrapped with
+        RLE-30. ``maybe_decompress`` normalizes any caller that passed
+        already-compressed bytes down to the raw form the ROM expects; the
+        editor's import/rebuild path already emits raw bytes, so it's a no-op
+        there.
+
+        Same descending-offset ordering as the other splices so a grown
+        file's shift doesn't invalidate a lower-offset file's pre-resolved
+        bounds.
+        """
+        if not self._dirty_bg_files:
+            return
+        from digimon_core.sprite import maybe_decompress
+
+        file_table = fnt.FileTable.from_rom(bytes(out))
+        dirty: List[Tuple[int, int, str, bytes]] = []
+        for path, new_bytes in self._dirty_bg_files.items():
+            try:
+                file_start, file_end = file_table.resolve(path)
+            except KeyError:
+                continue
+            payload = maybe_decompress(new_bytes)
+            dirty.append((file_start, file_end, path, payload))
+        for file_start, file_end, _path, payload in sorted(
+            dirty, key=lambda x: x[0], reverse=True,
+        ):
+            idx, _cs, ce = fat.find_container(out, file_start, file_end)
+            content_delta = len(payload) - (file_end - file_start)
+            aligned_shift = fat.splice_range(
+                out, file_start, file_end, ce, payload,
             )
             fat.resize_fat_entry(out, idx, ce, content_delta, aligned_shift)
 
@@ -2794,6 +2864,20 @@ class RomSession:
         for path, data in edits:
             self._dirty_map_files[path] = bytes(data)
 
+    def bg_file_edits(self) -> List[Tuple[str, bytes]]:
+        """Snapshot per-path menu-background overrides for the .romproj
+        ``bg_edits`` channel. Mirrors :meth:`map_file_edits`."""
+        return [
+            (path, bytes(data))
+            for path, data in sorted(self._dirty_bg_files.items())
+        ]
+
+    def apply_bg_file_edits(self, edits: List[Tuple[str, bytes]]) -> None:
+        """Replay menu-background file overrides from a .romproj onto the
+        dirty cache. Each tuple is ``(fat_path, file_bytes)``. Idempotent."""
+        for path, data in edits:
+            self._dirty_bg_files[path] = bytes(data)
+
     def overlay5_entry_edits(self) -> List[Tuple[int, bytes]]:
         """Snapshot per-entry overlay5 overrides for the .romproj
         ``overlay5_edits`` channel.
@@ -3254,12 +3338,14 @@ class RomSession:
         target = path or self.source_path
         if target is None:
             raise ValueError("save() called with no path and no source_path set")
-        # Single rolling .bak so a botched write (or a save the user regrets)
-        # doesn't destroy the previous on-disk copy. Only meaningful when
-        # `target` already exists — first-ever Save As to a new path skips it.
-        # copy2 preserves metadata; failure to back up is logged but doesn't
-        # block the save itself (the user explicitly asked to write).
-        if os.path.exists(target):
+        # One-time .bak: keep the FIRST snapshot (the pristine ROM captured at
+        # load time — see MainWindow._ensure_rom_backup) rather than rolling it
+        # forward on every save. A rolling backup would let this session's own
+        # saves overwrite the very state the user wants to revert to. Only
+        # create it here if it doesn't already exist (covers Save-As-over an
+        # existing file that was never loaded). copy2 preserves metadata; a
+        # failed backup never blocks the save the user explicitly asked for.
+        if os.path.exists(target) and not os.path.exists(target + ".bak"):
             try:
                 shutil.copy2(target, target + ".bak")
             except OSError:

@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QFrame,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -59,7 +60,8 @@ from .collapsible import CollapsibleSection
 from .palette_batch_adjuster import PaletteBatchAdjuster
 from .palette_editor import PaletteEditor
 from .palette_grid import PaletteGrid
-from .form_helpers import add_unknown_form_row, wrap_tooltip
+from .flow_layout import FlowLayout, make_height_for_width
+from .form_helpers import ReflowHeightSync, add_unknown_form_row, wrap_tooltip
 from .cell_png_io import (
     CellPngContext,
     CellPngError,
@@ -375,7 +377,7 @@ class BtchrBrowser(QWidget):
 
         self._scroll = QScrollArea()
         self._scroll.setWidget(self._preview)
-        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidgetResizable(False)
         self._scroll.setAlignment(Qt.AlignCenter)
 
         self._cell_spin = QSpinBox()
@@ -423,7 +425,7 @@ class BtchrBrowser(QWidget):
 
         self._sheet_scroll = QScrollArea()
         self._sheet_scroll.setWidget(self._sheet_preview)
-        self._sheet_scroll.setWidgetResizable(True)
+        self._sheet_scroll.setWidgetResizable(False)
         self._sheet_scroll.setAlignment(Qt.AlignCenter)
 
         # View mode: cells (OAM-composed) vs tiles (raw 8×8 grid). Cells
@@ -845,14 +847,10 @@ class BtchrBrowser(QWidget):
             "garbled tiles for cells past 0."
         ))
         self._meta_cell_size = QLabel("—")
-        self._meta_idle = QLabel("—")
-        self._meta_attack = QLabel("—")
-        self._meta_defend = QLabel("—")
         for lbl in (
             self._meta_name,
             self._meta_cells, self._meta_tiles,
             self._meta_footprint_scale, self._meta_cell_size,
-            self._meta_idle, self._meta_attack, self._meta_defend,
         ):
             lbl.setMinimumWidth(280)
         name_font = self._meta_name.font()
@@ -914,9 +912,8 @@ class BtchrBrowser(QWidget):
         meta_form.addRow("Scan target Y", self._hdr_y_pivot_a_spin)
         add_unknown_form_row(meta_form, "Unknown 0x08", self._hdr_x_pivot_spin)
         add_unknown_form_row(meta_form, "Unknown 0x0A", self._hdr_y_pivot_b_spin)
-        meta_form.addRow("Idle", self._meta_idle)
-        meta_form.addRow("Attack", self._meta_attack)
-        meta_form.addRow("Defend", self._meta_defend)
+        # Idle/Attack/Defend track summaries live in the Animation panel, not
+        # the footer — no need to duplicate them here.
 
         # ---- Cells tab: preview (left) + animation editor (right) ----
         # Cell spinner + show-all-cells toggle moved to the actions row
@@ -1083,8 +1080,8 @@ class BtchrBrowser(QWidget):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(self._tabs, 1)
-        right_layout.addWidget(self._coverage_note)
+        # self._tabs + the scrollable controls below are assembled into a
+        # vertical splitter at the end of this block.
 
         # View toggles: hide the whole palette / animation panel to give the
         # preview the width. Hiding a splitter child hands its space to the
@@ -1092,14 +1089,12 @@ class BtchrBrowser(QWidget):
         # anim_panel exists now; palette_col is wired after it's built below.
         view_col = QVBoxLayout()
         view_col.setSpacing(4)
-        self._show_palette_cb = QCheckBox("Palette")
-        self._show_palette_cb.setChecked(True)
-        self._show_palette_cb.setToolTip("Show/hide the palette sidebar")
+        # Palette moved to its own tab, so the show/hide-palette toggle is
+        # gone; the Animation toggle stays (it hides the Cells-tab anim panel).
         self._show_anim_cb = QCheckBox("Animation")
         self._show_anim_cb.setChecked(True)
         self._show_anim_cb.setToolTip("Show/hide the Cells-tab animation panel")
         self._show_anim_cb.toggled.connect(self._anim_panel.setVisible)
-        view_col.addWidget(self._show_palette_cb)
         view_col.addWidget(self._show_anim_cb)
         view_col.addStretch(1)
 
@@ -1108,20 +1103,44 @@ class BtchrBrowser(QWidget):
         # stretch. Picker drops to its own row below so the transparent
         # colour edit sits visually under the empty space left by the
         # nav controls.
-        actions_row = QHBoxLayout()
-        actions_row.addLayout(cells_controls)
-        actions_row.addSpacing(16)
-        actions_row.addLayout(sheet_col)
-        actions_row.addSpacing(16)
-        actions_row.addLayout(per_cell_col)
-        actions_row.addSpacing(16)
-        actions_row.addLayout(view_col)
-        actions_row.addSpacing(16)
-        actions_row.addLayout(meta_form)
-        actions_row.addStretch(1)
-        right_layout.addLayout(actions_row)
+        # Flow the control groups so they wrap onto a second row when the pane
+        # narrows, instead of the panels side by side pinning a wide floor.
+        def _panel(inner_layout) -> QWidget:
+            holder = QWidget()
+            holder.setLayout(inner_layout)
+            return holder
 
-        right_layout.addWidget(self._picker)
+        actions_row_w = QWidget()
+        actions_flow = FlowLayout(actions_row_w, margin=0, h_spacing=16, v_spacing=8)
+        for inner in (cells_controls, sheet_col, per_cell_col, view_col, meta_form):
+            actions_flow.addWidget(_panel(inner))
+        make_height_for_width(actions_row_w)
+
+        # Everything below the preview tabs (coverage note, control panels,
+        # transparent-colour picker) goes in a scroll area, split vertically
+        # from the tabs so the pane is compressible top-to-bottom instead of
+        # growing tall as the control panels wrap.
+        controls_container = QWidget()
+        cc_layout = QVBoxLayout(controls_container)
+        cc_layout.setContentsMargins(0, 0, 0, 0)
+        cc_layout.addWidget(self._coverage_note)
+        cc_layout.addWidget(actions_row_w)
+        cc_layout.addWidget(self._picker)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QFrame.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_scroll.setWidget(controls_container)
+        ReflowHeightSync(controls_container)
+
+        mid_split = QSplitter(Qt.Vertical)
+        mid_split.addWidget(self._tabs)
+        mid_split.addWidget(controls_scroll)
+        mid_split.setStretchFactor(0, 1)
+        mid_split.setStretchFactor(1, 0)
+        mid_split.setCollapsible(0, False)
+        mid_split.setSizes([480, 300])
+        right_layout.addWidget(mid_split)
 
 
         # `+ Add Entry` sits below the digimon list so it appears next to
@@ -1174,20 +1193,37 @@ class BtchrBrowser(QWidget):
         palette_col_layout.addStretch(1)
         # Never shrink below the full swatch grid (+ vertical scrollbar + margins).
         self._pal_min_w = self._palette_grid.width() + 30
-        self._show_palette_cb.toggled.connect(self._palette_col.setVisible)
-        self._palette_col.setMinimumWidth(self._pal_min_w)
+
+        # Palette tab: the sprite preview (for reference) on the left + the
+        # palette editor on the right, so recolouring keeps the image on
+        # screen. The preview mirrors the Cells render (_refresh_preview). The
+        # editor side scrolls so its tall 256-colour panel doesn't pin the tab
+        # widget's minimum height.
+        self._palette_preview_label = QLabel("Select a sprite to preview.")
+        self._palette_preview_label.setAlignment(Qt.AlignCenter)
+        pal_prev_scroll = QScrollArea()
+        pal_prev_scroll.setWidgetResizable(False)
+        pal_prev_scroll.setAlignment(Qt.AlignCenter)
+        pal_prev_scroll.setWidget(self._palette_preview_label)
+        pal_edit_scroll = QScrollArea()
+        pal_edit_scroll.setWidgetResizable(True)
+        pal_edit_scroll.setFrameShape(QFrame.NoFrame)
+        pal_edit_scroll.setWidget(self._palette_col)
+        palette_tab = QSplitter(Qt.Horizontal)
+        palette_tab.addWidget(pal_prev_scroll)
+        palette_tab.addWidget(pal_edit_scroll)
+        palette_tab.setStretchFactor(0, 1)
+        palette_tab.setStretchFactor(1, 0)
+        palette_tab.setSizes([420, 300])
+        self._palette_tab_index = self._tabs.addTab(palette_tab, "Palette")
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(list_col)
         splitter.addWidget(right)
-        splitter.addWidget(self._palette_col)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([230, 780, self._pal_min_w])
-        # Widening the palette pane reflows more swatches per row.
-        splitter.splitterMoved.connect(lambda *_: self._reflow_palette())
+        splitter.setSizes([230, 900])
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1248,9 +1284,6 @@ class BtchrBrowser(QWidget):
             _, max_w, max_h = layout
             self._meta_cell_size.setText(f"{max_w}×{max_h} px")
         self._load_header_spinboxes(h)
-        self._meta_idle.setText(_format_track(h.idle))
-        self._meta_attack.setText(_format_track(h.attack))
-        self._meta_defend.setText(_format_track(h.defend))
 
         # Sheet width: prefer the user's last pick for this digimon
         # (per-group memory); fall back to a bbox-derived default so
@@ -1513,10 +1546,23 @@ class BtchrBrowser(QWidget):
         painter.end()
         return QPixmap.fromImage(canvas)
 
+    def _mirror_palette_preview(self, *, pixmap=None, text=None) -> None:
+        """Keep the Palette-tab reference image in step with the Cells render
+        so recolouring on the Palette tab shows the sprite live."""
+        lbl = getattr(self, "_palette_preview_label", None)
+        if lbl is None:
+            return
+        if pixmap is not None:
+            lbl.setPixmap(pixmap)
+            lbl.adjustSize()
+        else:
+            lbl.setText(text)
+
     def _refresh_preview(self) -> None:
         if self._current_decoded is None:
             self._cells_src_qimage = None
             self._coverage_note.setVisible(False)
+            self._mirror_palette_preview(text="Select a sprite to preview.")
             return
         self._update_coverage_note()
         if self._show_all_cells.isChecked():
@@ -1528,16 +1574,18 @@ class BtchrBrowser(QWidget):
         if pm is None or pm.isNull():
             self._preview.setText("(empty)")
             self._cells_src_qimage = None
+            self._mirror_palette_preview(text="(empty)")
             return
         scaled = pm.scaled(
             pm.width() * PREVIEW_ZOOM, pm.height() * PREVIEW_ZOOM,
             Qt.KeepAspectRatio, Qt.FastTransformation,
         )
         self._preview.setPixmap(scaled)
+        self._mirror_palette_preview(pixmap=scaled)
         # Force the QScrollArea to honor the pixmap's size so a wide
         # "show all cells" strip gets a horizontal scroll bar instead of
         # being silently clipped.
-        self._preview.setMinimumSize(scaled.size())
+        self._preview.adjustSize()
         # Stash native-size source for the eyedropper. `pm.toImage()` keeps
         # the alpha channel, so picking on transparent cell gutters / cell
         # backgrounds can be skipped cleanly in `_sample_pixel`.
@@ -1799,7 +1847,7 @@ class BtchrBrowser(QWidget):
         # tall narrow sheets (small width + big tile bank) would silently
         # crop. Setting the minimum to the pixmap size forces the scroll
         # area to honor the pixmap's height.
-        self._sheet_preview.setMinimumSize(scaled.size())
+        self._sheet_preview.adjustSize()
         # Cache the native Indexed8 source — sampling reads RGB through
         # `pixelColor` regardless of source format, so this works the same
         # as the RGBA cells preview.
@@ -1845,6 +1893,10 @@ class BtchrBrowser(QWidget):
         if idx == 1 and self._sheet_dirty:
             self._refresh_sheet_preview()
             self._sheet_dirty = False
+        if idx == getattr(self, "_palette_tab_index", -1):
+            # Render the current sprite into the tab's reference preview + reflow.
+            self._refresh_preview()
+            self._reflow_palette()
 
     # ---- tile sheet PNG ------------------------------------------------
 
@@ -2565,8 +2617,8 @@ class BtchrBrowser(QWidget):
                     (a - b) ** 2 for a, b in zip(d.palette[i], target)
                 ),
             )
-        if not self._show_palette_cb.isChecked():
-            self._show_palette_cb.setChecked(True)  # reveal so the pick is seen
+        # Switch to the Palette tab so the picked slot is visible.
+        self._tabs.setCurrentIndex(self._palette_tab_index)
         self._palette_grid.select_slot(match)
         x, y = self._palette_grid.slot_top_left(match)
         self._pal_scroll.ensureVisible(x, y, 0, 40)
@@ -3974,9 +4026,6 @@ class BtchrBrowser(QWidget):
         # repopulate the table + flattened track from the fresh decode.
         h = self._current_decoded.header
         self._load_header_spinboxes(h)
-        self._meta_idle.setText(_format_track(h.idle))
-        self._meta_attack.setText(_format_track(h.attack))
-        self._meta_defend.setText(_format_track(h.defend))
         self._refresh_anim_table()
         # Cell count is stable across an in-place edit, so reload values
         # into the existing rows rather than rebuilding the grid (avoids

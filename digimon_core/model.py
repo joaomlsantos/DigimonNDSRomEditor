@@ -190,12 +190,22 @@ class GameString:
         original_byte_length: int,
         original_terminator: int,
         region_id: str = "",
+        page=None,
+        group=None,
+        msg_id=None,
     ):
         self.offset = offset
         self.text = text
         self.original_byte_length = original_byte_length
         self.original_terminator = original_terminator
         self.region_id = region_id
+        # MSG.PAK page organization (None for ARM9/overlay strings): the PAK
+        # entry index (page), the group index within that page, and the engine
+        # message id — id = (page - 0x22) * 100 + group. Lets the editor group
+        # strings by page and jump to a specific id. See digimon_core.msgpak.
+        self.page = page
+        self.group = group
+        self.msg_id = msg_id
         # Snapshot of `text` at parse time. The validation collector compares
         # the live `text` against this to skip the (expensive) encode pass for
         # unmodified strings — by construction, a parsed string always fits

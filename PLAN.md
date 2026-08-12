@@ -110,20 +110,21 @@ Mapped directly onto the model classes. Navigation tree is grouped (Digimon Data
 5. **Digivolutions → Armor** ✅ — armor digivolutions; per-entry: source digimon, trigger item, target digimon, conditions.
 6. **Digivolutions → DNA** ✅ — DNA recipes: two source digimon + result + conditions.
 7. **Moves** ✅ — `MoveData` table; per-entry MP cost, element, effects, hits, range, level learned.
-8. **Traits** — name-only lookup; used as trait picker dropdowns on the Digimon page. No standalone editor (deferred until trait effects research lands; unchanged from plan).
-9. **Items** ✅ *(beyond plan)* — promoted to real editors because item-data structures got modeled: **Equipment**, **Consumables**, **Farm Items**. Per-entry attribute editing (atk_boost, bit_cost, max_points, etc.).
-10. **Dungeons → Wild Encounters** ✅ — areas labelled via `getCurrentLocation`; per-area header (rate bounds) + per-encounter digimon + reward_slot. `num_encounters` field is hidden until slot insertion/deletion is reverse-engineered.
+8. **Traits** ✅ *(shipped `2acf71f`)* — standalone traits editor, plus the name lookup that feeds the trait picker dropdowns on the Digimon page. Trait effect *descriptions* aren't stored in the ROM (they live in battle code — memory `project_trait_descriptions_not_in_rom`), so there are no hover descriptions.
+9. **Items** ✅ *(beyond plan)* — promoted to real editors because item-data structures got modeled: **Equipment**, **Consumables**, **Farm Items**. Per-entry attribute editing (atk_boost, bit_cost, max_points, etc.). Additional Farm Item attributes identified and the training-pen editor merged in (`e8e976b` / `2acf71f`).
+10. **Dungeons → Wild Encounters** ✅ — areas labelled via `getCurrentLocation`; per-area header (rate bounds) + per-encounter digimon + reward_slot + **per-digimon spawn chance**. Slot count is now editable: areas can be **grown up to 16 encounter slots** (hard cap; vanilla 14) via FAT resize (`2acf71f`; memory `project_wild_encounter_format`). The old "hidden until slot insertion/deletion is reverse-engineered" caveat is resolved.
 11. **Dungeons → Encounter Rewards** ✅ — `EncounterRewardTable` per area: probability × reward (item or money).
 12. **Quests** ✅ — `QuestData`: rewards (money/item/tamer points), unlock conditions, flags.
 13. **Starters** ✅ — the starter packs; pick digimon per pack + starting level (level-vs-aptitude cap validated).
-14. **Farm Terrains** ✅ — `FarmTerrain`: digimon limit, per-species EXP yields.
+14. **Farm Terrains** ✅ — `FarmTerrain`: digimon limit, per-species EXP yields, plus previously-unknown terrain fields identified (`2acf71f`).
 15. **Habitats / Worldmap** ✅ — `HabitatWorldmap` entries: species shown per location, location flags.
 16. **QoL toggles** ✅ — DWDDRandomizer's byte-patches surfaced as checkboxes (text speed, movement speed, scan rate, farm exp, battle perf, version-exclusive areas, …). `RomSession.serialize_all_with_qol()` applies enabled patches on top of model writes at save time.
 17. **Text / Strings** ✅ *(beyond plan)* — in-game text editor with three buckets in the nav tree: **ARM9**, **Overlays**, **MSG.PAK**. Each bucket merges its constituent regions into a single offset-sorted list with substring search; the right pane has a [BR]/[END]/marker-aware text edit + a live "X / Y bytes — Z free" budget meter. **ARM9 / Overlay** strings are at fixed ROM offsets with absolute pointers baked into code, so per-string `original_byte_length` is a hard cap — over-budget edits are flagged in the validation footer and the Save path refuses to write until they're shortened. **MSG.PAK** is parsed as a single full-range region (not the named sub-blocks from the research doc) so dev/debug strings and tail content stay editable, and — because it's a FAT-listed container with its own internal offset table — has **no hard byte cap**: edits that exceed the original slot route through the pak-directory rewrite + FAT-resize path documented in §12. The budget meter on MSG.PAK strings is therefore informational only; no Save gating.
+18. **Battle damage calculator** ✅ *(tool, `2acf71f`)* — computes battle damage between two digimon and surfaces how a defender's **elemental resistances** change the damage taken; a cross-check for balance edits made in the Base/Enemy Data editors. Not a data-domain page — an analysis tool that reads the edited models (see memory `project_trait_battle_application` / `project_stab_affinity_source` for the underlying battle-damage findings).
 
 ### UI patterns shared across pages
 
-- Master list = `QTableView` with sort/filter/search.
+- Master list = `QTableView` with sort/filter/search — sortable columns rolled out to most editor listings (`bb173af`).
 - Detail editor = form layout; ID-typed fields use combos backed by `DIGIMON_ID_TO_STR` / `MOVE_ARRAY_STR` / `ITEM_ID_TO_STR`.
 - Every editable widget is wrapped so its `valueChanged` signal pushes a `Command` onto the undo stack; this is what gives us Ctrl+Z for free across the whole app.
 - "Revert this entry to vanilla" button per page — needs a copy of the originally-loaded model graph kept around (`session.original` vs `session.current`).
@@ -471,6 +472,14 @@ The battle-sprite editor grew alongside §11 but on a **different file format**,
 - **Expansion.** Adding entries works reliably at **+1** but breaks around **+4** (a hidden engine cap, likely a VRAM tile-per-frame budget — memory `project_btchr_extensible.md`, not yet pinned). Appended entries ride the sprite grow machinery; their `chrsize`/`btchrsize` u32 pairs persist through the **`.romproj` v4 `btchr_appended_sidecars`** channel.
 - **Tests.** `test_btchr.py`, `test_btchr_save_roundtrip.py`, `test_btchrspr.py`.
 - **Open.** The ~+4 expansion cap is unpinned; treat additions past +1 as experimental until the budget is located.
+
+### 11.8 Additional graphics tooling — shipped (`207841f`, `2acf71f`)
+
+Landed after phases A–G, spanning the SPR_*, MCHR (overworld), and BTCHR editors:
+
+- **Custom OAM composing.** Cell/OAM composition core (`ncer.py` `set_cell_oams` / `generate_oam_grid` / multicell) recomposes sprites from cells — including the 5-cell BTCHR layout over one concatenated NCGR — with a multi-cell / tilesheet import UI. A **"Compress OAM"** pass shrinks a sprite's tile footprint with no art change (median ~16 % across ~290/409 sprites), crossing VRAM-budget thresholds so reskins fit. Memory: `project_custom_oam_core`, `project_oam_compression`, `project_partyviewer_bigsprite_cap`.
+- **In-app palette editor.** Palettes editable directly in the app (previously needed renaming MCHR_PAL entries to `.NCLR` for NitroPaint — memory `reference_nitropaint_raw_palette`).
+- **Animation editors across all sprite types.** SPR_ANM (NANR — move/effect anims via SRT transforms over reused tile blocks, memory `project_spr_anm_nanr`), MCHR_ANM (overworld — custom non-NANR format, memory `project_mchr_anm_format`), plus static→animatable growth ("+ Duplicate frame" / "+ Add cell", memory `project_sprite_frame_growth`). **`207841f` extended the animation editors to overworld (MCHR) sprites and the Icons/Portraits/UI (SPR_*) editors**, beyond the original SPR-only tab.
 
 ---
 
@@ -998,12 +1007,25 @@ and trip the MOVE_END recogniser. Aggregate counts across the corpus
   reflects this correctly on next reload, but there's no UI affordance
   warning the user before they commit.
 
+## 14.11 Scripted events / cutscenes — overlay5 opcode editing (shipped)
+
+Built out across `7ee47ed` → `bb173af` → `2acf71f` plus the 2026-08 cutscenes push. The **Events/Cutscenes tab** (`editor/widgets/cutscenes_tab.py`) reads overlay5 (the script/cutscene VM) and makes scripted scenes browsable + editable:
+
+- **Dual-mode browser** — a per-map chip/canvas view *and* a cross-map Index listing of every scripted cutscene, coexisting behind one shared detail/edit panel. Memory `project_cutscenes_tab_dual_mode`.
+- **Decoded + editable opcodes** — NPC `OVERWORLD_SPRITE` id/X/Y/dialogue, `MOVE_BEGIN` (who/x/y/speed/type), camera pan / set-anim, item give/remove, and read-only flag/branch (`IF` / `SET VAR` / `FLAG`) surfaced inline with code-like indentation and show/hide labels. Opcode table: `research_docs/claude_notes/overlay5_opcodes.md`; memory `project_overlay5_camera_anim_opcodes`.
+- **Live sprite-anim preview** — sprite thumbnail + anim dropdown + play/stop on the sprite-anim card (anim id = a direct MCHR_ANM index).
+- **Objects grouped by spawn condition** — overworld objects grouped by the flag/handler that gates them, with per-group canvas-visibility toggles; conditional-sprite dialogue recovered via sibling-placement aggregation.
+- **Cross-links** — field-map info tied to its wild encounters; the enemy-digimon editor links to scripted-event appearances (`bb173af`).
+- **Known fix owed** — the `0x06` flag-*check* decode reads the wrong arg (the flag is in `b`, not `a`); see §16.2.
+
+---
+
 ## 15. Plan: Sound editor (donor-SDAT BGM injection)
 
 **Goal.** Replace any of DWDD's BGM slots with a sequence lifted from
 another NDS game's SDAT, under the engine's per-BGM memory budget.
 
-Scope is limited to **SDAT → SDAT** donors. Non-SDAT formats (DSE,
+Scope is limited to **SDAT → SDAT** donors. Donor SDATs can be **scanned directly from a `.nds` ROM** (no pre-extraction step) as well as from a standalone `.sdat` — `d8e0e96`. Non-SDAT formats (DSE,
 SADL/ADX, GBA Sappy, etc.) are out of scope; see §15.7 for the
 investigation notes that closed that line of inquiry.
 
@@ -1384,3 +1406,121 @@ track, so users can extend the soundtrack without losing any vanilla
 BGM. Engine accepts the new slot because INFO+SYMB+FAT all grow
 together and `waveArc` references resolve through the new SWAR's
 freshly-allocated INFO row.
+
+---
+
+## 16. Plan: RAM relocation & save-data expansion (situation point, 2026-08)
+
+Sections §12–§13 handle **ROM-file** capacity (FAT shifts, pak-internal injection, offset-driven loading). This section covers the orthogonal **RAM-side** problem: relocating overlays / arm9 data tables in work RAM, and enlarging the runtime **save-data block** so the game can hold more state (more than 40 stored digimon, more event flags, etc.). It consolidates (a) relocation theory already proven in `research_docs/`, and (b) the flag / save reverse-engineering done in the 2026-08 investigation, then lays out forward options. **Confidence is marked per item** — this area produced several inference errors before the addressing was pinned, so "verified" below means decompiled-and-cross-checked or RA-code-note-confirmed, not pattern-matched.
+
+**Addressing key (load-bearing).** An arm9 function/data RAM address = its ROM/Ghidra file offset **+ 0x1FFC000** (e.g. file `0x32a08` = RAM `0x0202EA08`). ARM9 overlays load at bank bases from the overlay table (ROM `0x135200`): **A `0x021FAB00`** (ov0–1), **B `0x02228020`** (ov2–5), **C `0x02283FC0`** (ov6–9), **D `0x022A4E80`** (ov10–17). A flat file-offset disassembly does **not** resolve overlay→arm9 calls — disassemble each overlay at its RAM base.
+
+### 16.1 Relocation theory already proven (review of existing work)
+
+Two complementary, **battle-confirmed** efforts (patch scripts + logs live in `research_docs/`):
+
+- **Bank-B relocation — DONE / proven.** ov2/3/4/5 moved `0x02228020 → 0x02340000` (DELTA `+0x117FE0`) via `relocate_bankb.py` (pointer-literal rewrite + ARM/Thumb B/BL re-encode + OVT update); battles load with overlay RAM observed at `0x02340000` (`research_docs/overlay5_relocation.md`, `bankB_relocation_log.json`). This **vacates ~355 KB** of the old bank-B slot.
+- **arm9 data-table relocation — proven for one table.** Boot-time FAT-file loader + one hijack + cart-DMA into the vacated bank-B + a single base-pointer literal rewrite; the digimon-name table runs from `0x02228020` at v19 (`research_docs/claude_notes/arm9_relocation_pipeline.md`). Reusable template; ranked candidate queue exists (digiegg next — ROM `0x105440`, `0xB00`).
+- **RAM free-slack — audited.** ~576 KB post-boot free @ `0x0233F7FC–0x023CF9C0`; the relocated bank-B now occupies `0x02340000–~0x0239BFA0` of it, leaving **~200 KB above it** on top of the **~355 KB vacated bank-B**; the safest single always-zero run is the 258 KB span at `0x0233F7FC` (`research_docs/ram_empty_space.md`).
+- **Overlay5 in-place growth — BLOCKED.** ov5 budget fixed at `0x5BFA0`; op `0x0030 CALL_SCRIPT_AT_OFFSET` stores absolute ov5 file offsets, so any chunk-shift breaks cross-script calls, and bank B has zero inter-bank slack (`research_docs/claude_notes/overlay5_resize_constraints.md`). Relocation is the way around it — growing ov5 into freed RAM is **viable but not built**.
+
+### 16.2 Flag & save-block RE (2026-08, verified)
+
+- **Save block.** RAM `0x02135988–0x0213D4B4` = `0x7B2C` (31,532 B). The game loads **one** of two file slots into this range, copies it back verbatim on save, and MD5s `[0x0–0x7B2C]` with the checksum field zeroed (magic `DSDIG2`). **The file is not the constraint — this RAM range is.** Full field map (RA code-note-derived, user-verified): `research_docs/claude_notes/dusk_save_block_map.txt`.
+- **Digimon storage = 40 × `0x164`** at `sav+0x288 … sav+0x3a28` (RAM `0x02135c10 … 0x021393b0`), immediately followed by Tamer Rank — this **is** the 40 cap, physically. Block used out to `sav+0x5458` (~21.6 KB); the **`~0x26d4` (9.9 KB) tail is un-noted** (contents unverified).
+- **Event flags.** Bitfield base RAM `0x0213a188` (`sav+0x4800`); ceiling `5000` is a constant at ROM file `0x32b44`; **story/quest flags begin at `0x0213a1b7` (`sav+0x482f`)** — RA "Event Flags begin here", = flag index 376. Read `FUN_00032b04` (out-of-range → returns 1/true); set `FUN_0002fd2c` / `FUN_00032a08`. Overlay5 opcode `0x06` **checks** a persistent flag (index = `arg & 0x7fff`, expected value = arg's top bit; jump `gate_len` on mismatch); `0x0f` sets/clears. Artifacts: `dusk_event_flag_map.txt`, `dusk_quest_flag_map.txt`.
+- **Quest flags** (already modeled in the §4 Quests editor): 96-record table at ROM `0x1426ac` (RAM `0x02207bac`), `0x44` stride; each quest owns a 10-flag block at `record+0x28` (set via a `k=0..9` loop) plus `+0x2a`/`+0x30`. 4 outlier quests use the `0xD3x` system region.
+- **Editor fix owed.** The Events/Cutscenes panel decodes overlay5 `0x06` with the flag in the wrong arg (it shows `a` = gate_len as "input=="); the flag is in `b` (`b & 0x7fff`, expected = `b >> 15`). Fixing it makes flag *checks* readable alongside the `0x0f` sets.
+
+### 16.3 Save-data expansion — directions (>40 digimon)
+
+Because the array is boxed by Tamer Rank, every option is a **save-format migration**; they differ in *what* moves. All four must keep the expanded data **inside the range the load/save routine copies and MD5s** — parking it in loose RAM won't persist.
+
+1. **Grow the block in place (extend the end).** Base `0x02135988` unchanged; bump the load/save copy length + MD5 length and shift every field *after* the digimon array into the freed tail. Cheapest base-wise, but only viable if RAM at **`0x213D4B4+` is free** (unverified — check `ram_empty_space.md` / a dump).
+2. **Relocate the whole saved range.** Move base + resize to a bigger home (e.g. `~0x0239C000` above the relocated bank-B, or the vacated bank-B). Repoints the base **and every hardcoded sub-field constant** (`0x0213a188`, `0x0213a279`, the digimon accessor base, quest base `0x02207bac`, …) — a bank-B-style pointer sweep — plus resizes load/save/MD5. Highest repointing cost; reuses proven machinery.
+3. **Struct-compaction (in place).** Shrink over-wide fields to reclaim bytes *without* moving the base or growing the block — e.g. the `0x164` digimon record and other structs carry many 32-bit fields (species EXP ×8, IDs, some stats) where 16 bits suffice. Reclaimed bytes let more records fit the same block. No MD5/base change, but it **touches every read/write of each shrunk field across arm9 + overlays** — potentially *more* work than relocation, with higher regression risk (miss one accessor → corruption). Best as a targeted pass on a few clearly-oversized fields, measured against a save-diff.
+4. **Array-only repoint (minimal).** Leave the whole layout in place; move *only* the digimon array by repointing its **single accessor base** (`base + idx*0x164`) and raising the `40` cap, into an extended / relocated **saved** region. Far less repointing than #2, but the new array location must still sit inside the copied + MD5'd range — so it composes with #1 or #2.
+
+**Prerequisite RE (the three code sites any option needs, still to pin):**
+- **The digimon accessor + the `40` cap** — confirms base/stride and where to raise the limit (same method that cracked the quest accessor's `idx < 0x60`).
+- **The save load/save + MD5 routine** — is the copy length a single `0x7B2C` literal or scattered? Where is the MD5 length? Decides whether "grow the range" is one edit or many.
+- **Free RAM at `0x213D4B4+`** — gates whether option 1 (in-place) is available at all.
+
+### 16.4 Flag-capacity — directions
+
+- **Reuse (zero cost).** Story band `376–1499` has ~244 inter-quest holes + `4487–4999` (513 indices) untouched by any literal writer; safe once cross-checked against the seen/obtained (`1928–2935`) and per-id (`1500–1935`) blocks and a save-diff. No migration.
+- **Raise the `5000` ceiling.** Blocked in place by the per-id array at `sav+0x4a74`; only viable folded into a save-format migration (§16.3). Not worth doing flag-only.
+
+### 16.5 ROM data/code room — directions
+
+The relocation stack (§16.1) is ready and generous (~355 KB freed bank-B + ~200 KB high RAM). Apply as needed: move more arm9 tables (digiegg first) to free arm9 space, or grow overlay5 scripts into freed RAM (unblocks the §14.9 cutscene byte budget). No new theory required — mechanical.
+
+### 16.6 Key figures
+
+| Figure | Value | Source |
+| --- | --- | --- |
+| Save block | RAM `0x02135988–0x0213D4B4` (`0x7B2C`) | `dusk_save_block_map.txt`; RA notes |
+| Digimon array | 40 × `0x164` @ `sav+0x288–0x3a28` | RA notes |
+| Save used / tail | ~`0x5458` used / ~`0x26d4` un-noted | RA notes |
+| Flag base / ceiling | RAM `0x0213a188` / `5000` (const @ ROM `0x32b44`) | decompile |
+| Story flags begin | `0x0213a1b7` (`sav+0x482f`, flag 376) | RA notes |
+| Quest table | ROM `0x1426ac` / RAM `0x02207bac`, 96 × `0x44` | decompile |
+| arm9 RAM = file + | `0x1FFC000` | decompile |
+| Overlay bank bases | A `0x021FAB00` / B `0x02228020` / C `0x02283FC0` / D `0x022A4E80` | OVT `0x135200` |
+| Bank-B relocated to | `0x02340000` (DELTA `+0x117FE0`) | `overlay5_relocation.md` |
+| Vacated bank-B free | ~355 KB @ `0x02228020` | `arm9_relocation_pipeline.md` |
+| High free RAM | ~576 KB @ `0x0233F7FC` (258 KB safe-zero) | `ram_empty_space.md` |
+| ov5 fixed budget | `0x5BFA0` | `overlay5_resize_constraints.md` |
+
+### 16.7 Immediate next steps
+
+1. Pin the three §16.3 prerequisite code sites (digimon accessor + `40` cap; save load/save + MD5 sizing; free RAM after the block) — turns "expand to 32/64 KB" into a concrete edit list and picks between options 1–4.
+2. Fix the §16.2 editor `0x06` flag-check decode (flag lives in `b`, not `a`).
+3. (Optional, cheap) a save-diff harness — feed two saves, list changed flags/bytes with RAM + file offsets; ground-truth backstop for free-flag selection and for verifying any migration.
+
+---
+
+## 17. Directions board (roadmap index)
+
+Where the project can go from here, grouped and status-tagged, so a session starts from the whole board rather than one thread. **build-now** = no reverse-engineering, pure editor work; **RE-gated** = needs a bounded investigation first (the blocker is usually already *located*, just not lifted); **big-rock** = multi-session. Detail lives in the referenced section / memory note.
+
+### 17.1 Editor workflow & discoverability — build-now
+
+- **Cross-reference "Used by" panel** *(build-now — highest value)* — consolidate the ad-hoc per-editor xrefs into the shared `XrefIndex` and extend to moves / items / DNA / both-direction evolutions. §9 #1, §10.
+- **Cross-page search** *(build-now)* — one search box over every editor's records + in-game strings. §9 #2.
+- **Bulk-edit with diff preview** *(build-now)* — apply a transform across a record set before commit (balance passes). §9 #3.
+- **Header toolbar (icon buttons)** *(build-now)* — Save ROM / Save Project / Export row. §9 #4, memory `project_future_header_bar`.
+- **Revert-entry-to-vanilla + before/after changelog capture** *(build-now)* — §9 beyond-plan list.
+- **IPS/xdelta patch export** *(build-now)* — the last M7 leftover. §9 #5.
+
+### 17.2 Capacity — "hold more than vanilla"
+
+Same theme as save-expansion; independent targets:
+- **Save / RAM expansion** *(big-rock)* — >40 digimon, more flags. Full roadmap + the three prerequisite code sites in §16.
+- **BTCHR battle-sprite additions** *(RE-gated)* — +1 works, breaks ~+4; cap is an unpinned VRAM tile-per-frame budget. §11.7, memory `project_btchr_extensible`.
+- **Reskin size gates** *(RE-gated — both already located)* — party-viewer `fs>~440` and wild-spawn `Σfs≤1440` garble big sprites; lifting either unlocks larger custom art. Memory `project_partyviewer_bigsprite_cap`, `project_wild_spawn_size_gate`; `project_oam_compression` is the shipped mitigation.
+- **Bigger BGM tracks** *(RE-gated)* — additions channel shipped (§15.8); the per-slot ~166 KB cap bounds track size. Memory `project_bgm_cap_includes_sseq`.
+
+### 17.3 RE unlocks — small, each turns on a feature
+
+- **Trait effects** *(RE-gated — most impactful)* — only the 177 names are in ROM; effect params live in battle code. Pinning them → trait descriptions + effect editing. Memory `project_trait_descriptions_not_in_rom`, `project_trait_battle_application`.
+- **overlay5 `0x06` flag-check decode fix** *(small — already located)* — the flag is in arg `b`, not `a`; §16.2.
+- **overlay5 unidentified opcodes** *(RE-gated)* — catalog at `research_docs/claude_notes/overlay5_opcodes.md`; memory `project_overlay5_camera_anim_opcodes`.
+- **btmap NaXn "none"-schema animation** *(RE-gated)* — the unknown OBJ-overlay path still renders static. §14.4-G, memory `project_btmap_anim_schemas`.
+- **Cutscene `0xA6` switch case→placement mapping** *(RE-gated)* — would separate the shared "story object" sprite variants (DigiEgg/Botamon/…). Memory `project_cutscenes_tab_dual_mode`.
+
+### 17.4 Larger content systems — partly built
+
+- **Map / world editing (§14)** *(partly shipped)* — layer paint, walkability, battle backgrounds (`/btmap/`), events / exits / spawns are done; deeper map authoring is open.
+- **Custom BGM composition** *(content track)* — the layer-by-layer donor-SDAT pipeline exists (more content-creation than tooling). Memory `project_custom_bgm_assembly`, `project_cyberpunk_bgm_cover`.
+
+### 17.5 Bigger swings — net-new systems
+
+- **Multiplayer / wireless repurposing** *(big-rock)* — the peer-transfer buffer is fully mapped; the documented idea is hijacking it for a single-player "visiting farm" / offline peer content. Memory `project_peer_transfer_pipeline`, `project_peer_farm_buffer`.
+- **Randomizer integration** *(big-rock)* — seed-based randomization of evolutions / starters / encounters; pairs with the Xref panel. §9 beyond-plan.
+
+### 17.6 Reading the board
+
+- **Cheapest high-value wins:** §17.1 — all build-now, the Xref "Used by" panel especially (uniquely valuable for this game's interconnected data).
+- **Best RE-per-payoff:** §17.3 — small, self-contained investigations that each switch on a concrete feature; **trait effects** is the highest-impact.
+- **Multi-session commitments:** §17.2 save/RAM and §17.5.

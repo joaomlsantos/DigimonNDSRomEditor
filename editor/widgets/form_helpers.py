@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple, Type
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics, QRegularExpressionValidator, QUndoStack
 from PySide6.QtCore import QRegularExpression
 from PySide6.QtWidgets import (
@@ -31,11 +31,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStyle,
     QStyleOptionGroupBox,
     QStylePainter,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -127,7 +129,38 @@ def _tighten_form(form) -> None:
     form.setFieldGrowthPolicy(_QFL.FieldsStayAtSizeHint)
 
 
-def wrap_in_scroll(content: QWidget, parent: Optional[QWidget] = None) -> QScrollArea:
+class ReflowHeightSync(QObject):
+    """Keep a heightForWidth content widget's height equal to
+    ``layout.heightForWidth(width)`` as it's resized.
+
+    ``QScrollArea(widgetResizable=True)`` mishandles a widget whose layout
+    has ``heightForWidth`` when that layout is a QVBoxLayout of FlowLayout-
+    backed rows: it sizes the content to the *fully-wrapped minimum-width*
+    height (every row wrapped) instead of the height at the width the content
+    is actually given, leaving a large empty gap below the form. Watching the
+    content's own resize and pinning ``minimumHeight`` to the correct
+    ``heightForWidth(width)`` is the standard workaround — the scroll then
+    grows a vertical scrollbar only for the real content height.
+    """
+
+    def __init__(self, target: QWidget):
+        super().__init__(target)
+        self._target = target
+        target.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 — Qt override name
+        if obj is self._target and event.type() == QEvent.Resize:
+            layout = self._target.layout()
+            if layout is not None and layout.hasHeightForWidth():
+                height = layout.heightForWidth(self._target.width())
+                if height > 0 and height != self._target.minimumHeight():
+                    self._target.setMinimumHeight(height)
+        return False
+
+
+def wrap_in_scroll(
+    content: QWidget, parent: Optional[QWidget] = None, reflow: bool = False,
+) -> QScrollArea:
     """Wrap an editor's content widget in the standard scroll area.
 
     Mirrors the shape every editor was using inline (`QScrollArea` +
@@ -141,10 +174,20 @@ def wrap_in_scroll(content: QWidget, parent: Optional[QWidget] = None) -> QScrol
     The sizeHint is deferred via `QTimer.singleShot(0)` because reading it
     synchronously during `_build_form()` returns the pre-layout fallback,
     which is usually wider or narrower than the actual rendered width.
+
+    ``reflow=True`` opts out of the width pin: the content is expected to
+    reflow to the viewport width (its wide rows are FlowLayout-backed and
+    wrap), so pinning the min width would defeat the wrapping and re-introduce
+    the horizontal scrollbar the reflow exists to avoid. The content's own
+    layout minimum (the widest single cell) becomes the floor instead.
     """
     scroll = QScrollArea(parent) if parent is not None else QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setWidget(content)
+
+    if reflow:
+        ReflowHeightSync(content)
+        return scroll
 
     def _pin_min_width() -> None:
         try:
@@ -155,6 +198,40 @@ def wrap_in_scroll(content: QWidget, parent: Optional[QWidget] = None) -> QScrol
 
     QTimer.singleShot(0, _pin_min_width)
     return scroll
+
+
+def stat_cell(
+    header: str,
+    main: QWidget,
+    subs: Optional[List[QWidget]] = None,
+    min_width: int = 0,
+) -> QWidget:
+    """A self-contained vertical cell — bold header, the editable widget, then
+    any muted sub-labels — for use inside a :class:`FlowLayout`.
+
+    Replaces the shared-label grid rows (Current / Growth / Expected / Range /
+    Base / ×mult) in the digimon detail form: each stat / resistance / element
+    carries its own caption stack, so the cells can wrap onto a second row
+    when the pane narrows instead of the whole 8-column table scrolling
+    sideways. The header aligns centered above a centered widget so a wrapped
+    grid still reads as columns.
+    """
+    cell = QWidget()
+    v = QVBoxLayout(cell)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(1)
+    hdr = QLabel(header)
+    hdr.setAlignment(Qt.AlignCenter)
+    hdr.setStyleSheet("font-weight: bold;")
+    v.addWidget(hdr)
+    v.addWidget(main, 0, Qt.AlignHCenter)
+    for sub in subs or []:
+        if isinstance(sub, QLabel):
+            sub.setAlignment(Qt.AlignCenter)
+        v.addWidget(sub, 0, Qt.AlignHCenter)
+    if min_width:
+        cell.setMinimumWidth(min_width)
+    return cell
 
 
 def wrap_tooltip(text: str, width_px: int = 300) -> str:
@@ -278,6 +355,21 @@ class NoWheelSpinBox(QSpinBox):
 class NoWheelComboBox(QComboBox):
     def wheelEvent(self, event):  # noqa: N802 — Qt override name
         event.ignore()
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 — Qt override name
+        # A combo over a long list (sprite pickers = 1627 items, moves ~500)
+        # otherwise reports a minimumSizeHint as wide as its *widest item*
+        # (~660px), which becomes a hard floor that stops any form holding it
+        # from shrinking on a small screen. The line-edit / popup scroll their
+        # own content, so the widget can be far narrower than its longest row
+        # — cap the minimum at a few characters plus the arrow, keeping the
+        # natural (usually larger) sizeHint so it still renders comfortably
+        # wide by default. Short lists whose natural min is already smaller
+        # keep it (the min() guard).
+        hint = super().minimumSizeHint()
+        fm = self.fontMetrics()
+        capped = fm.averageCharWidth() * 8 + 34
+        return QSize(min(hint.width(), capped), hint.height())
 
 
 # Pin the foreground colour alongside the pink background — without it, dark
@@ -1113,6 +1205,11 @@ class BoundIdComboRow(QWidget):
         self._include_level = include_level
         self._label = QLabel()
         self._label.setStyleSheet("color: palette(mid);")
+        # Ignored horizontal policy: the inline summary takes whatever width
+        # the row's stretch grants it and clips when narrow, instead of its
+        # full text width becoming a hard floor that stops the whole form
+        # (moves box, digivolution rows) from shrinking on a small screen.
+        self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._open_btn = _make_combo_open_button(self.combo)
         # Element icon shown next to the inline summary for move pickers.
         # Empty pixmap on construction; ``_refresh_label`` fills it once the

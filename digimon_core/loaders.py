@@ -481,6 +481,44 @@ def _resolve_string_region(
     return cur_msgpak_start + within_start, cur_msgpak_start + within_end
 
 
+_MSGPAK_ID_BASE_ENTRY = 0x22  # PAK entry index that holds engine message-id page 0
+
+
+def _load_msgpak_pages(rom_data, table) -> List[model.GameString]:
+    """Structured MSG.PAK parse — organized by PAK page + group.
+
+    MSG.PAK is a pak (:mod:`digimon_core.pak`) of text "pages"; each page has a
+    ``u32 sub_offset[]`` header followed by up to 100 ``FF-FF`` groups
+    (:mod:`digimon_core.msgpak`). The engine addresses a string by
+    ``page = id//100 + 0x22`` / ``group = id%100``. This yields one GameString
+    per ``FE-FF``/``FF-FF`` segment, tagged with its page, group, and msg_id —
+    and, unlike the old flat terminator scan, it decodes only the group ranges,
+    so each page's ``u32`` sub-offset header is no longer surfaced as an
+    ``[?XXYY]`` pseudo-string. Offsets are absolute ROM offsets, so the existing
+    grow/save path (``RomSession._apply_msgpak_resize``) is unaffected.
+    """
+    from . import pak as _pak, msgpak as _msgpak, strings as _strings
+    pak_start, _pak_end = table.resolve("DAT/MSG.PAK")
+    p = _pak.PakFile(bytes(rom_data[pak_start:_pak_end]))
+    out: List[model.GameString] = []
+    for entry_idx in range(p.count):
+        entry_bytes = p.original_entry(entry_idx)
+        entry_start, _ = p.original_entry_range(entry_idx)
+        try:
+            groups = _msgpak.parse_entry_groups(entry_bytes)
+        except ValueError:
+            continue  # not a msgpak sub-format page (e.g. a raw/binary entry)
+        has_id = entry_idx >= _MSGPAK_ID_BASE_ENTRY
+        for g_idx, (gs, ge) in enumerate(groups):
+            msg_id = (entry_idx - _MSGPAK_ID_BASE_ENTRY) * 100 + g_idx if has_id else None
+            for seg_off, text, byte_len, terminator in _strings.decode_block(entry_bytes, gs, ge):
+                out.append(model.GameString(
+                    pak_start + entry_start + seg_off, text, byte_len, terminator,
+                    "msgpak_all", page=entry_idx, group=g_idx, msg_id=msg_id,
+                ))
+    return out
+
+
 def loadStringRegion(
     version: str,
     rom_data: bytearray,
@@ -504,6 +542,10 @@ def loadStringRegion(
     if match is None:
         raise KeyError(f"string region {region_id!r} not defined for {version}")
     table = _table(rom_data, file_table)
+    if region_id.startswith("msgpak_"):
+        # Structured page/group parse (skips per-page sub-headers). The flat
+        # [start, end] range from constants is intentionally ignored here.
+        return _load_msgpak_pages(rom_data, table)
     start, end = _resolve_string_region(version, match, table)
     out: List[model.GameString] = []
     for offset, text, byte_len, terminator in _strings.decode_block(rom_data, start, end):

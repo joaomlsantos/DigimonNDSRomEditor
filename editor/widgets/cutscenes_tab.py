@@ -946,17 +946,26 @@ def _classify_handler_chain(
 
     meta_cond = meta_val = meta_opaque = None
     p_reg = _parse_trigger_at_offset(chain.trigger_label)
-    if p_reg is not None and p_reg >= 10:
+    if p_reg is not None and p_reg >= 12:
         eb = _load_entry_bytes(session, entry_cache, chain.source_entry_ix)
-        if (
-            eb
-            and p_reg + 6 <= len(eb)
-            and eb[p_reg - 10] == 0xA6
-            and eb[p_reg - 9] == 0x00
-        ):
-            meta_cond = struct.unpack_from("<H", eb, p_reg - 8)[0]
-            meta_val = struct.unpack_from("<H", eb, p_reg - 6)[0]
-            meta_opaque = struct.unpack_from("<I", eb, p_reg - 4)[0]
+        # HANDLER_META is variable length. The common form sits 10 bytes
+        # before the REGISTER_HANDLER, but the cond=8 dispatch slots (the
+        # bulk of a hub map like the Union Room) carry two extra param
+        # bytes and sit 12 back. Probe both so the story-condition that
+        # distinguishes one dispatch slot from the next is surfaced for
+        # EVERY handler, not just the 10-byte ones. cond/val/opaque are
+        # read relative to the A6, so the opaque stays the per-slot
+        # discriminator in both layouts.
+        if eb:
+            for a6 in (p_reg - 10, p_reg - 12):
+                if (
+                    a6 >= 0 and a6 + 10 <= len(eb)
+                    and eb[a6] == 0xA6 and eb[a6 + 1] == 0x00
+                ):
+                    meta_cond = struct.unpack_from("<H", eb, a6 + 2)[0]
+                    meta_val = struct.unpack_from("<H", eb, a6 + 4)[0]
+                    meta_opaque = struct.unpack_from("<I", eb, a6 + 6)[0]
+                    break
 
     return _HandlerSummary(
         dialog_count=len(dialogs),
@@ -4363,13 +4372,6 @@ class CutscenesTab(QWidget):
             Optional[Tuple[int, "overlay5_mod.RegionEvent"]]
         ] = []
 
-        right_split = QSplitter(Qt.Vertical)
-        right_split.addWidget(self._objects_list)
-        right_split.addWidget(self._detail)
-        right_split.setStretchFactor(0, 0)
-        right_split.setStretchFactor(1, 1)
-        right_split.setSizes([240, 560])
-
         # ---- Map / Index view toggle -------------------------------------
         # The chip+canvas browser above is the map-tied way in; the Index is a
         # flat, ordered, cross-map list of every scripted cutscene so scenes
@@ -4404,12 +4406,28 @@ class CutscenesTab(QWidget):
         self._labels_checkbox.toggled.connect(self._canvas.set_labels_visible)
         toggle_bar.addWidget(self._labels_checkbox, 0)
 
+        # Right panel: the Objects list and Details sit side by side (split
+        # vertically), the list a narrow strip — its rows are short (id + XY)
+        # and don't need width — so the Details editor gets a full-height
+        # column of its own instead of sharing height with the list.
+        # The Details minimum width gives the whole right panel a floor the
+        # map canvas (Expanding, ~600px sizeHint) can't squeeze past — that
+        # canvas greed is what used to compress the detail cards.
+        self._objects_list.setMinimumWidth(150)
+        self._detail.setMinimumWidth(430)
+        right_panel = QSplitter(Qt.Horizontal)
+        right_panel.addWidget(self._objects_list)
+        right_panel.addWidget(self._detail)
+        right_panel.setStretchFactor(0, 0)   # objects — stays narrow
+        right_panel.setStretchFactor(1, 1)   # details — takes the room
+        right_panel.setSizes([190, 500])
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._left_stack)
-        splitter.addWidget(right_split)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([1000, 500])
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([760, 700])
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -5786,7 +5804,7 @@ class CutscenesTab(QWidget):
             return
         listw = QListWidget()
         listw.setUniformItemSizes(False)
-        listw.setMaximumHeight(220)
+        listw.setMinimumHeight(120)
         listw.setTextElideMode(Qt.ElideRight)
         listw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         listw.setStyleSheet(
@@ -5798,18 +5816,31 @@ class CutscenesTab(QWidget):
         )
         listw.currentRowChanged.connect(self._on_events_row_changed)
         self._events_list_widget = listw
-        self._detail_layout.insertWidget(
-            self._detail_layout.count() - 1, listw,
-        )
 
         container = QWidget()
         cl = QVBoxLayout(container)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
+        container.setMinimumHeight(120)
         self._events_card_container = container
         self._events_card_layout = cl
+
+        # Opcode list on top, the selected event's editor card below, joined
+        # by a draggable handle so the list can be given more height (it used
+        # to be capped at 220px). Neither pane collapses to zero. The minimum
+        # height gives the splitter a bounded region to distribute — without
+        # it the browser shrinks to the panes' minimums inside the scrolling
+        # detail column and ``setSizes`` gets renormalised away.
+        browser = QSplitter(Qt.Vertical)
+        browser.addWidget(listw)
+        browser.addWidget(container)
+        browser.setChildrenCollapsible(False)
+        browser.setStretchFactor(0, 1)
+        browser.setStretchFactor(1, 0)
+        browser.setMinimumHeight(500)
+        browser.setSizes([340, 200])
         self._detail_layout.insertWidget(
-            self._detail_layout.count() - 1, container,
+            self._detail_layout.count() - 1, browser,
         )
 
     def _events_browser_add_event_row(

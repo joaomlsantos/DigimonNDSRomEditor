@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, QSignalBlocker, QTimer
-from PySide6.QtGui import QFont, QUndoStack
+from PySide6.QtGui import QColor, QFont, QUndoStack
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -71,6 +71,10 @@ class StringEditor(QWidget):
         self._session = session
         self._cursor_key = cursor_key
         self._current: Optional[model.GameString] = None
+        # MSG.PAK strings carry page/group/msg_id; when present the list is
+        # rendered grouped by page (id-range separators) with a jump-to-id box.
+        self._paged = any(getattr(s, "page", None) is not None for s in self._strings)
+        self._row_of_string: Dict[int, int] = {}
 
         # Debounce the undo-stack push so each keystroke doesn't trigger a
         # full redo cycle (setattr → list row repaint → budget re-encode).
@@ -88,10 +92,10 @@ class StringEditor(QWidget):
                 if self._session is not None and self._cursor_key is not None
                 else None
             )
+            target_idx = 0
             if remembered is not None and 0 <= int(remembered) < len(self._strings):
-                self._string_list.setCurrentRow(int(remembered))
-            else:
-                self._string_list.setCurrentRow(0)
+                target_idx = int(remembered)
+            self._select_string_index(target_idx)
 
     # ---- UI construction ---------------------------------------------------
 
@@ -111,6 +115,13 @@ class StringEditor(QWidget):
         self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(self._apply_filter)
         left_layout.addWidget(self._search)
+
+        if self._paged:
+            self._jump = QLineEdit()
+            self._jump.setPlaceholderText("Jump to id (e.g. 9038 or 0x234E)…")
+            self._jump.setClearButtonEnabled(True)
+            self._jump.returnPressed.connect(self._on_jump_to_id)
+            left_layout.addWidget(self._jump)
 
         self._summary_label = QLabel(f"{len(self._strings)} strings")
         self._summary_label.setStyleSheet("color: gray;")
@@ -162,19 +173,68 @@ class StringEditor(QWidget):
     def _populate_string_list(self) -> None:
         with QSignalBlocker(self._string_list):
             self._string_list.clear()
+            self._row_of_string = {}
+            prev_page = None
             for idx, s in enumerate(self._strings):
+                page = getattr(s, "page", None)
+                if page is not None and page != prev_page:
+                    header = QListWidgetItem(self._page_header_label(page))
+                    header.setFlags(Qt.ItemIsEnabled)  # visible separator, not selectable
+                    header.setData(Qt.UserRole, None)
+                    hfont = header.font()
+                    hfont.setBold(True)
+                    header.setFont(hfont)
+                    header.setForeground(QColor("#4a90d9"))
+                    self._string_list.addItem(header)
+                    prev_page = page
+                row = self._string_list.count()
                 item = QListWidgetItem(self._row_label(idx, s))
                 item.setData(Qt.UserRole, idx)
                 self._string_list.addItem(item)
+                self._row_of_string[idx] = row
 
     def _row_label(self, idx: int, s: model.GameString) -> str:
+        mid = getattr(s, "msg_id", None)
+        if mid is not None:
+            return f"{mid:>5} 0x{mid:04X}  {_preview(s.text)}"
+        page = getattr(s, "page", None)
+        if page is not None:
+            return f"   p{page} g{getattr(s, 'group', '?')}  {_preview(s.text)}"
         return f"{s.offset:08X}  {_preview(s.text)}"
+
+    def _page_header_label(self, page: int) -> str:
+        if page >= 0x22:
+            base = (page - 0x22) * 100
+            return f"──  Page {page}  ·  ids {base}–{base + 99}  ──"
+        return f"──  Page {page}  ·  (no message id)  ──"
+
+    def _string_index_at_row(self, row: int) -> Optional[int]:
+        """Model index for a list row, or None for page-header rows / out of range."""
+        if not (0 <= row < self._string_list.count()):
+            return None
+        item = self._string_list.item(row)
+        if item is None:
+            return None
+        idx = item.data(Qt.UserRole)
+        if idx is None or not (0 <= int(idx) < len(self._strings)):
+            return None
+        return int(idx)
+
+    def _select_string_index(self, idx: int) -> None:
+        row = self._row_of_string.get(idx)
+        if row is not None:
+            self._string_list.setCurrentRow(row)
+            self._string_list.scrollToItem(self._string_list.item(row))
 
     def _apply_filter(self, query: str) -> None:
         q = query.strip().lower()
         visible = 0
         for row in range(self._string_list.count()):
-            s = self._strings[row]
+            idx = self._string_index_at_row(row)
+            if idx is None:  # page header — hidden while a filter is active
+                self._string_list.setRowHidden(row, bool(q))
+                continue
+            s = self._strings[idx]
             match = (q == "") or (q in s.text.lower())
             self._string_list.setRowHidden(row, not match)
             if match:
@@ -183,11 +243,11 @@ class StringEditor(QWidget):
             self._summary_label.setText(f"{visible} / {len(self._strings)} matching")
         else:
             self._summary_label.setText(f"{len(self._strings)} strings")
-        # If the current selection is now hidden, jump to the first visible row.
+        # If the current selection is now hidden, jump to the first visible string row.
         cur = self._string_list.currentRow()
-        if cur < 0 or self._string_list.isRowHidden(cur):
+        if cur < 0 or self._string_list.isRowHidden(cur) or self._string_index_at_row(cur) is None:
             for row in range(self._string_list.count()):
-                if not self._string_list.isRowHidden(row):
+                if not self._string_list.isRowHidden(row) and self._string_index_at_row(row) is not None:
                     self._string_list.setCurrentRow(row)
                     return
             self._set_current(None)
@@ -197,12 +257,13 @@ class StringEditor(QWidget):
     def _on_string_changed(self, row: int) -> None:
         # Flush any in-flight edit on the previous selection before switching.
         self._commit_pending_edit()
-        if not (0 <= row < len(self._strings)):
+        idx = self._string_index_at_row(row)
+        if idx is None:
             self._set_current(None)
             return
         if self._session is not None and self._cursor_key is not None:
-            self._session.remember_selection(self._cursor_key, row)
-        self._set_current(self._strings[row])
+            self._session.remember_selection(self._cursor_key, idx)
+        self._set_current(self._strings[idx])
 
     def _set_current(self, s: Optional[model.GameString]) -> None:
         self._commit_timer.stop()
@@ -268,10 +329,11 @@ class StringEditor(QWidget):
                 self._text_edit.setPlainText(display)
         # Refresh the list preview for the current row.
         row = self._string_list.currentRow()
-        if row >= 0:
+        idx = self._string_index_at_row(row)
+        if idx is not None:
             item = self._string_list.item(row)
             if item is not None:
-                item.setText(self._row_label(row, self._current))
+                item.setText(self._row_label(idx, self._current))
         self._refresh_budget()
 
     def _refresh_budget(self) -> None:
@@ -332,16 +394,37 @@ class StringEditor(QWidget):
         """Jump to the row whose string starts at `offset`. Used by the
         validation footer's click-to-navigate, where `record_id` carries the
         offending string's ROM offset."""
-        for row, s in enumerate(self._strings):
+        for idx, s in enumerate(self._strings):
             if s.offset == offset:
-                # Clear any active filter that would otherwise hide the row.
-                if self._string_list.isRowHidden(row):
-                    with QSignalBlocker(self._search):
-                        self._search.clear()
-                    self._apply_filter("")
-                self._string_list.setCurrentRow(row)
-                self._string_list.scrollToItem(self._string_list.item(row))
+                self._reveal_string_index(idx)
                 return
+
+    def _on_jump_to_id(self) -> None:
+        """Jump to the MSG.PAK string whose msg_id matches the box (decimal or
+        0x-hex). No-op if the id isn't present."""
+        txt = self._jump.text().strip()
+        if not txt:
+            return
+        try:
+            target = int(txt, 0)
+        except ValueError:
+            return
+        for idx, s in enumerate(self._strings):
+            if getattr(s, "msg_id", None) == target:
+                self._reveal_string_index(idx)
+                return
+
+    def _reveal_string_index(self, idx: int) -> None:
+        """Clear any active filter and scroll/select the row for model ``idx``."""
+        row = self._row_of_string.get(idx)
+        if row is None:
+            return
+        if self._string_list.isRowHidden(row):
+            with QSignalBlocker(self._search):
+                self._search.clear()
+            self._apply_filter("")
+        self._string_list.setCurrentRow(row)
+        self._string_list.scrollToItem(self._string_list.item(row))
 
 
 from .validation import ValidationIssue  # noqa: E402 — bottom-of-file utility

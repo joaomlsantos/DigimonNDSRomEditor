@@ -65,9 +65,13 @@ from digimon_core import qol as qol_module
 #      wild-encounter FAT splice on save. Project save runs with
 #      ``skip_wild_encounter_splice=True`` so a grown area doesn't shift
 #      every later FAT file into the (equal-length) byte diff.
+# v12: adds bg_edits channel — per-FAT-path replacement bytes for menu
+#      background (DAT/bg/...) files edited via the menu-background browser.
+#      Same shape as btmap_edits/map_edits, but routed through the
+#      uncompressed ``_apply_bg_splice`` on save (verbatim, no RLE-30).
 # Loader accepts every prior version; saver always writes the current version.
-FORMAT_VERSION = 11
-_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+FORMAT_VERSION = 12
+_ACCEPTED_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 EDITOR_VERSION = "0.1.0"
 
 
@@ -76,6 +80,7 @@ SpriteEdit = Tuple[str, int, bytes]  # (pak_name, entry_idx, new_entry_bytes)
 BtchrAppendedSidecar = Tuple[int, int]  # (chrsize_word, btchrsize_value)
 BtmapEdit = Tuple[str, bytes]  # (fat_path, file_bytes)
 MapEdit = Tuple[str, bytes]  # (fat_path, file_bytes) — DAT/map/* overrides
+BgEdit = Tuple[str, bytes]  # (fat_path, file_bytes) — DAT/bg/* overrides
 Overlay5EntryEdit = Tuple[int, bytes]  # (entry_ix, entry_bytes)
 # (target_bgm_id, donor_label, donor_game_label, sseq_bytes, sbnk_bytes, swar_bytes)
 BgmSwapEdit = Tuple[int, str, str, bytes, bytes, bytes]
@@ -147,6 +152,7 @@ def save_project(
     btchr_appended_sidecars: List[BtchrAppendedSidecar] = (),
     btmap_edits: List[BtmapEdit] = (),
     map_edits: List[MapEdit] = (),
+    bg_edits: List[BgEdit] = (),
     overlay5_entry_edits: List[Overlay5EntryEdit] = (),
     bgm_swap_edits: List[BgmSwapEdit] = (),
     bgm_addition_edits: List[BgmAdditionEdit] = (),
@@ -247,6 +253,10 @@ def save_project(
             {"path": path, "bytes": base64.b64encode(data).decode("ascii")}
             for path, data in map_edits
         ],
+        "bg_edits": [
+            {"path": path, "bytes": base64.b64encode(data).decode("ascii")}
+            for path, data in bg_edits
+        ],
         "overlay5_entry_edits": [
             {"entry_ix": ix, "bytes": base64.b64encode(data).decode("ascii")}
             for ix, data in overlay5_entry_edits
@@ -329,6 +339,10 @@ def load_project(path: str) -> dict:
     data["map_edits"] = [
         (entry["path"], base64.b64decode(entry["bytes"]))
         for entry in data.get("map_edits", [])
+    ]
+    data["bg_edits"] = [
+        (entry["path"], base64.b64decode(entry["bytes"]))
+        for entry in data.get("bg_edits", [])
     ]
     data["overlay5_entry_edits"] = [
         (entry["entry_ix"], base64.b64decode(entry["bytes"]))

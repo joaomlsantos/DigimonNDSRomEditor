@@ -29,6 +29,7 @@ from digimon_core import constants, model
 
 from .._perf import span
 from ..commands import ReskinSlotCommand, SetAttrCommand, SyncChrsizeFootprintCommand
+from .flow_layout import FlowLayout, make_height_for_width
 from .form_helpers import (
     BoldGroupBox as QGroupBox,
     BoundIdCombo,
@@ -225,14 +226,24 @@ class SpriteMapRow:
                 self.sprite_to_base.setdefault(sprite_map[base_id].main_sprite, base_id)
 
         self.group = QGroupBox("Display / Reskin")
-        horizontal = QHBoxLayout(self.group)
-        horizontal.setContentsMargins(8, 8, 8, 4)
-        horizontal.setSpacing(8)
+        # Form column + preview column sit side by side when there's room; a
+        # FlowLayout drops the previews below the form once the pane narrows,
+        # so this box shrinks with the rest of the detail form instead of
+        # pinning a wide floor.
+        root = QVBoxLayout(self.group)
+        root.setContentsMargins(8, 8, 8, 4)
+        root.setSpacing(4)
+        row_wrap = QWidget()
+        row_flow = FlowLayout(row_wrap, margin=0, h_spacing=8, v_spacing=6)
+        root.addWidget(row_wrap)
+        make_height_for_width(row_wrap)
+        make_height_for_width(self.group)
 
-        outer = QVBoxLayout()
+        form_col = QWidget()
+        outer = QVBoxLayout(form_col)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(4)
-        horizontal.addLayout(outer, 1)
+        row_flow.addWidget(form_col)
 
         # Right column: 2x2 grid of live sprite previews, one per pak the
         # sprite_map references. Pixmaps are pulled from session caches so
@@ -246,7 +257,8 @@ class SpriteMapRow:
         self._portrait_preview = self._make_preview_label()
         self._mini_preview = self._make_preview_label()
 
-        preview_grid = QGridLayout()
+        preview_col = QWidget()
+        preview_grid = QGridLayout(preview_col)
         preview_grid.setContentsMargins(0, 0, 0, 0)
         preview_grid.setHorizontalSpacing(8)
         preview_grid.setVerticalSpacing(6)
@@ -262,8 +274,8 @@ class SpriteMapRow:
         )):
             preview_grid.addWidget(self._make_preview_caption(caption), 2, col, Qt.AlignHCenter)
             preview_grid.addWidget(label, 3, col, Qt.AlignHCenter)
-        horizontal.addLayout(preview_grid, 0)
         preview_grid.setAlignment(Qt.AlignTop)
+        row_flow.addWidget(preview_col)
 
         # --- top: Appears-as picker (existing reskin convenience) ---
         top_form = QFormLayout()
@@ -321,7 +333,12 @@ class SpriteMapRow:
         outer.addWidget(self._footprint_widget)
 
         # --- divider checkbox ---
-        self._customize_checkbox = QCheckBox("Customize sprite/string data manually")
+        # Short label so it doesn't pin a wide floor on a narrow screen; the
+        # full meaning is in the tooltip.
+        self._customize_checkbox = QCheckBox("Customize fields")
+        self._customize_checkbox.setToolTip(
+            "Edit the sprite-map and battle-string fields directly."
+        )
         self._customize_checkbox.setChecked(False)
         self._customize_checkbox.toggled.connect(self._on_customize_toggled)
         outer.addWidget(self._customize_checkbox)
@@ -371,7 +388,12 @@ class SpriteMapRow:
                 shared_kind="battle_strings",
             )
 
-        manual_form = QFormLayout()
+        # Manual editors live in their own container so the whole block
+        # (labels included) can be hidden until the user opts in via the
+        # checkbox — collapsed, it stops contributing its width to the form's
+        # minimum, keeping the box narrow-screen friendly.
+        self._manual_container = QWidget()
+        manual_form = QFormLayout(self._manual_container)
         manual_form.setContentsMargins(0, 0, 0, 0)
         manual_form.setSpacing(4)
         manual_form.addRow("ID", self._id_spin)
@@ -380,7 +402,7 @@ class SpriteMapRow:
         manual_form.addRow("Icon Portrait", self._upper_sprite_low_combo)
         manual_form.addRow("Battle Mini", self._upper_sprite_high_combo)
         manual_form.addRow("Battle string", self._battle_str_combo)
-        outer.addLayout(manual_form)
+        outer.addWidget(self._manual_container)
 
         self._manual_widgets: List[QWidget] = [
             self._id_spin, self._overworld_combo, self._main_sprite_combo,
@@ -429,6 +451,8 @@ class SpriteMapRow:
         # (see `_apply_state`); guard against re-enabling them in that case.
         if not self._has_slot_for_target():
             enabled = False
+        # Fields stay visible at all times (user preference) — the checkbox
+        # only gates whether they're editable.
         for w in self._manual_widgets:
             w.setEnabled(enabled)
 
