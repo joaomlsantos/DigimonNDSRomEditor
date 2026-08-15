@@ -153,6 +153,7 @@ NAV_GROUPS = [
         ("Farm Items", "farm_items"),
         ("Farm Terrains", "farm_terrains"),
         ("Farm Training Pens", "farm_training_pens"),
+        ("Shops", "shops"),
     ]),
     ("Text", [
         ("ARM9", "strings_bucket:arm9"),
@@ -1353,6 +1354,9 @@ class MainWindow(QMainWindow):
             return FarmItemEditor(self.session.farm_items, self.undo_stack, self.session)
         if key == "farm_training_pens":
             return FarmTrainingPenEditor(self.session.farm_training_pens, self.undo_stack, self.session)
+        if key == "shops":
+            from .widgets.shop_editor import ShopEditor
+            return ShopEditor(self.session.shops, self.undo_stack, self.session)
         if key == "qol_settings":
             return QolEditor(self.session.qol, self.undo_stack)
         if key == "sprite_browser":

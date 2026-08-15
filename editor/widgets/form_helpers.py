@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 from digimon_core import constants
 
 from ..commands import SetAttrCommand
+from .flow_layout import FlowLayout, make_height_for_width
 
 
 # Shared by every digivolution editor (standard, armor, DNA). The condition
@@ -197,6 +198,100 @@ def wrap_in_scroll(
             pass
 
     QTimer.singleShot(0, _pin_min_width)
+    return scroll
+
+
+# Comfortable floor so the Import/Export column reads as a substantial,
+# consistent group across editors — even the ones (battle-BG, field maps)
+# whose io column holds only the two dropdowns and would otherwise hug the
+# "Import…" label. Roughly matches the sprite editors' button width.
+IO_BUTTON_MIN_WIDTH = 150
+
+
+def uniform_button_width(
+    *buttons: QWidget, extra: Tuple[QWidget, ...] = (), min_width: int = 0,
+) -> int:
+    """Pin every button to the widest ``sizeHint`` among ``buttons`` + ``extra``
+    (floored at ``min_width``).
+
+    The sprite-editor idiom: Import…/Export… (and any sibling action buttons)
+    read as one aligned, comfortably-sized group rather than each hugging its
+    own label. Returns the chosen width.
+    """
+    width = max(min_width, *(b.sizeHint().width() for b in (*buttons, *extra)))
+    for b in buttons:
+        b.setFixedWidth(width)
+    return width
+
+
+def io_button_column(
+    import_btn: QWidget, export_btn: QWidget, *extra: QWidget,
+    min_width: int = IO_BUTTON_MIN_WIDTH,
+) -> QWidget:
+    """The canonical Import/Export button column (sprite-editor idiom).
+
+    Import over Export, both pinned to one uniform width (the widest of the
+    pair plus any ``extra`` widgets, floored at ``min_width``), with the extras
+    stacked beneath. Returns a panel widget ready to drop into
+    :func:`build_editor_footer`.
+    """
+    uniform_button_width(import_btn, export_btn, extra=extra, min_width=min_width)
+    col = QVBoxLayout()
+    col.setContentsMargins(0, 0, 0, 0)
+    col.setSpacing(4)
+    col.addWidget(import_btn)
+    col.addWidget(export_btn)
+    for w in extra:
+        col.addWidget(w)
+    col.addStretch(1)
+    holder = QWidget()
+    holder.setLayout(col)
+    return holder
+
+
+def details_form_panel(rows: List[str]) -> Tuple[QWidget, Dict[str, QLabel]]:
+    """A read-only ``label: value`` details panel for the shared footer.
+
+    Returns ``(panel_widget, {row_name: value_label})`` so the caller keeps
+    handles to the value labels (all start as ``"—"``) to populate on
+    selection. Matches the sprite/battle-BG metadata form styling.
+    """
+    form = QFormLayout()
+    form.setContentsMargins(0, 0, 0, 0)
+    labels: Dict[str, QLabel] = {}
+    for name in rows:
+        lbl = QLabel("—")
+        labels[name] = lbl
+        form.addRow(name, lbl)
+    holder = QWidget()
+    holder.setLayout(form)
+    return holder, labels
+
+
+def build_editor_footer(
+    panels: List[QWidget], *, h_spacing: int = 16, v_spacing: int = 8,
+) -> QScrollArea:
+    """The bottom-controls footer shared by every graphics editor.
+
+    ``panels`` flow left-to-right in a wrapping :class:`FlowLayout` inside a
+    vertically-compressible scroll (``ReflowHeightSync``): they wrap onto a
+    second row and the strip shrinks on small screens instead of pinning a
+    wide/tall floor. Convention is ``[io column, controls…, details last]``.
+    Returns the scroll widget to place below the tabs.
+    """
+    row = QWidget()
+    flow = FlowLayout(row, margin=0, h_spacing=h_spacing, v_spacing=v_spacing)
+    for panel in panels:
+        flow.addWidget(panel)
+    make_height_for_width(row)
+
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QScrollArea.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+    scroll.setWidget(row)
+    ReflowHeightSync(row)
     return scroll
 
 

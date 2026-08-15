@@ -27,22 +27,30 @@ listings.
 """
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap, QUndoStack
 from PySide6.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QTabWidget,
@@ -53,8 +61,60 @@ from PySide6.QtWidgets import (
 
 from digimon_core import btmap
 
+from .flow_layout import FlowLayout, make_height_for_width
+from .form_helpers import build_editor_footer, io_button_column
 from .record_list_panel import RecordListPanel
+from .tilemap_paint import PaintContext, TilemapPaintTab
 from .transparent_picker import TransparentColorPicker
+
+
+class _BtmapPaintProvider:
+    """Feeds :class:`TilemapPaintTab` the selected battle-background layer's
+    Nitro trio and builds ``ReplaceBtmapFileCommand`` for NSCR edits. Layer B
+    shares Layer A's ``ap`` palette (per-bank NCLR)."""
+
+    def __init__(self, browser: "BtmapBrowser"):
+        self._b = browser
+
+    def _paths(self):
+        b = self._b
+        mid = b._current_id
+        if mid is None:
+            return None
+        layer = b._paint_layer
+        if layer == "b" and f"DAT/btmap/{mid}bs" not in b._file_table:
+            layer = "a"
+        if layer == "a":
+            return (f"DAT/btmap/{mid}ac", f"DAT/btmap/{mid}as",
+                    f"DAT/btmap/{mid}ap", "A")
+        return (f"DAT/btmap/{mid}bc", f"DAT/btmap/{mid}bs",
+                f"DAT/btmap/{mid}ap", "B")
+
+    def paint_context(self):
+        b = self._b
+        paths = self._paths()
+        if paths is None:
+            return None
+        ncgr_p, nscr_p, nclr_p, layer = paths
+        try:
+            return PaintContext(
+                ncgr=b._session.btmap_file_bytes(ncgr_p),
+                nscr=b._session.btmap_file_bytes(nscr_p),
+                nclr=b._session.btmap_file_bytes(nclr_p),
+                nscr_path=nscr_p,
+                key=(nscr_p, ncgr_p, nclr_p),
+                name=f"{b._current_id} layer {layer}",
+            )
+        except (ValueError, KeyError):
+            return None
+
+    def make_nscr_command(self, nscr_path, new_bytes, label, on_change):
+        from editor.commands import ReplaceBtmapFileCommand
+        return ReplaceBtmapFileCommand(
+            self._b._session, nscr_path, new_bytes, label, on_change=on_change)
+
+    def on_external_change(self):
+        self._b._on_paint_external_change()
 
 
 class BtmapBrowser(QWidget):
@@ -67,10 +127,14 @@ class BtmapBrowser(QWidget):
 
     _CURSOR_KEY = "btmap_browser"
 
-    _TAB_COMPOSITE = 0
-    _TAB_LAYER_A = 1
-    _TAB_LAYER_B = 2
-    _TAB_ANIM = 3
+    # Layer A / Layer B / Composite are no longer separate tabs — they're one
+    # "Background" visualizer whose Layers panel toggles each layer's
+    # visibility + picks the active edit layer. Animations stays its own tab.
+    _TAB_BG = 0
+    _TAB_ANIM = 1
+    _TAB_PAINT = 2
+
+    _ZOOM_LEVELS = (1, 2, 3, 4)
 
     def __init__(self, session, undo_stack: Optional[QUndoStack] = None, parent=None):
         super().__init__(parent)
@@ -105,6 +169,15 @@ class BtmapBrowser(QWidget):
                 target = 0
         if not self._list.select_index(target):
             self._list.select_first()
+        self._restore_tab()
+
+    def _restore_tab(self) -> None:
+        """Re-open the tab the user last had active (Background/Animations/
+        Paint) — the session outlives the editor widget across nav switches."""
+        saved = self._session.recall_selection(self._CURSOR_KEY + "_tab")
+        if (saved is not None and 0 <= int(saved) < self._tabs.count()
+                and self._tabs.isTabEnabled(int(saved))):
+            self._tabs.setCurrentIndex(int(saved))
 
     # ---- UI construction -------------------------------------------------
 
@@ -116,114 +189,328 @@ class BtmapBrowser(QWidget):
         self._list.indexSelected.connect(self._on_index_selected)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_static_tab("composite"), "Composite")
-        self._tabs.addTab(self._build_static_tab("layer_a"), "Layer A")
-        self._tabs.addTab(self._build_static_tab("layer_b"), "Layer B")
+        self._tabs.addTab(self._build_bg_tab(), "Background")
         self._tabs.addTab(self._build_anim_tab(), "Animations")
+        self._tabs.addTab(self._build_paint_tab(), "Paint")
         self._tabs.currentChanged.connect(self._on_tab_changed)
-
-        # Compact metadata block (mchr/btchr idiom). Fixed-width labels
-        # so switching maps doesn't reflow the row. Tooltip carries the
-        # per-FAT-file breakdown so the data is reachable without
-        # dominating the preview area.
-        self._meta_size = QLabel("\u2014")
-        self._meta_layer_b = QLabel("\u2014")
-        self._meta_palette = QLabel("\u2014")
-        self._meta_anim = QLabel("\u2014")
-        fm = self._meta_size.fontMetrics()
-        worst = fm.horizontalAdvance("512\u00d7512  (B: 512\u00d7512)")
-        for lbl in (self._meta_size, self._meta_layer_b, self._meta_palette, self._meta_anim):
-            lbl.setMinimumWidth(worst)
-        self._meta_form = QFormLayout()
-        self._meta_form.setContentsMargins(0, 0, 0, 0)
-        self._meta_form.addRow("Layer A", self._meta_size)
-        self._meta_form.addRow("Layer B", self._meta_layer_b)
-        self._meta_form.addRow("Palette banks", self._meta_palette)
-        self._meta_form.addRow("Animation frames", self._meta_anim)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
         right_layout.addWidget(self._tabs, 1)
-
-        # Single row under the tabs — Phase B has only the metadata
-        # column; Phase C will slot Export PNG / Import PNG button
-        # columns to the left of the metadata form, before the stretch.
-        self._actions_row = QHBoxLayout()
-        self._actions_row.addStretch(1)
-        self._actions_row.addLayout(self._meta_form)
-        right_layout.addLayout(self._actions_row)
+        right_layout.addWidget(self._build_footer(), 0)
+        # Sync the PNG-import action's enabled state to the default view now
+        # that the footer (which owns the Import menu) exists.
+        self._on_view_changed(self._view_mode)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._list)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([220, 800])
+        splitter.setSizes([220, 820])
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.addWidget(splitter)
 
-    def _build_static_tab(self, key: str) -> QWidget:
-        """One preview tab. Stores the inner label on ``self._{key}_label``
-        so :meth:`_set_pixmap_on_tab` can target it by tab index.
+    def _build_bg_tab(self):
+        """Unified background visualiser: one canvas showing the selected view
+        (Layer A / Layer B / Composite), a controls sidebar, and the per-bank
+        backdrop editor along the bottom. Replaces the three static tabs."""
+        self._bg_label = QLabel("Select a battle background to preview.")
+        self._bg_label.setAlignment(Qt.AlignCenter)
+        self._bg_label.setMinimumSize(160, 90)
+        self._bg_scroll = QScrollArea()
+        self._bg_scroll.setWidget(self._bg_label)
+        self._bg_scroll.setWidgetResizable(False)
+        self._bg_scroll.setAlignment(Qt.AlignCenter)
+        self._layer_a_label = self._bg_label  # backdrop eyedropper alias
 
-        Every static tab gets an Export PNG button; Layer A and Layer B
-        additionally get an Import PNG button. The composite tab is
-        export-only (its content is derived from the two underlying
-        layer files, so there's no single file to write back to).
-        """
-        label = QLabel("Select a battle background to preview.")
-        label.setAlignment(Qt.AlignCenter)
-        label.setMinimumSize(512, 256)
-        scroll = QScrollArea()
-        scroll.setWidget(label)
-        scroll.setWidgetResizable(True)
-        scroll.setAlignment(Qt.AlignCenter)
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(self._bg_scroll)
+        split.addWidget(self._build_bg_panel())
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 0)
+        split.setCollapsible(0, False)
+        split.setSizes([680, 220])
+
+        # The per-bank backdrop swatch editor is hidden for now — it'll be
+        # folded into the future palette work. We keep it built + wired
+        # (dormant, not deleted) and surface ONLY its transparent-colour
+        # picker, which lives in the shared footer. The picker eyedrops the
+        # preview, so create it here where _bg_label exists.
+        self._layer_a_preview_qimage = None
+        self._backdrop_picker = TransparentColorPicker(
+            on_color_picked=self._apply_backdrop_color,
+        )
+        self._backdrop_picker.bind_preview(
+            self._bg_label, self._layer_a_preview_source,
+        )
+        self._backdrop_section = self._build_layer_a_backdrop_section(self._bg_label)
+        self._backdrop_section.setVisible(False)
 
         page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-        page_layout.addWidget(scroll, 1)
-
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-
-        export_btn = QToolButton()
-        export_btn.setText("Export PNG\u2026")
-        export_btn.setToolTip(
-            "Save the currently rendered view as a PNG (RGBA, full layer size)."
-        )
-        export_btn.clicked.connect(
-            lambda _checked=False, tab_key=key: self._on_static_export_clicked(tab_key)
-        )
-        row.addWidget(export_btn)
-        setattr(self, f"_{key}_export_btn", export_btn)
-
-        if key in ("layer_a", "layer_b"):
-            import_btn = QToolButton()
-            import_btn.setText("Import PNG\u2026")
-            import_btn.setToolTip(
-                "Replace this layer from a flat PNG. The editor auto-builds"
-                " the tile bank, layout, and palette; tiles over the 1024"
-                " cap are merged by visual similarity."
-            )
-            import_btn.setEnabled(self._undo_stack is not None)
-            import_btn.clicked.connect(
-                lambda _checked=False, layer_key=key: self._on_static_import_clicked(layer_key)
-            )
-            row.addWidget(import_btn)
-            setattr(self, f"_{key}_import_btn", import_btn)
-
-        row.addStretch(1)
-        page_layout.addLayout(row)
-
-        if key == "layer_a":
-            page_layout.addWidget(self._build_layer_a_backdrop_section(label))
-
-        setattr(self, f"_{key}_label", label)
+        pl = QVBoxLayout(page)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
+        pl.addWidget(split, 1)
+        pl.addWidget(self._backdrop_section)  # dormant / hidden
         return page
+
+    def _build_bg_panel(self):
+        """Sidebar: just the View selector (which layer / composite you see +
+        act on) and Zoom. Details + Import/Export live in the shared footer
+        below the tabs, matching the other editors. Scroll-wrapped +
+        width-capped to stay small-screen friendly."""
+        panel = QWidget()
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(6, 6, 6, 6)
+        pl.setSpacing(8)
+
+        view_box = QGroupBox("View")
+        vb = QVBoxLayout(view_box)
+        vb.setContentsMargins(8, 6, 8, 6)
+        vb.setSpacing(2)
+        self._view_group = QButtonGroup(self)
+        self._view_a = QRadioButton("Layer A")
+        self._view_b = QRadioButton("Layer B")
+        self._view_comp = QRadioButton("Composite")
+        for rb, key in ((self._view_a, "a"), (self._view_b, "b"),
+                        (self._view_comp, "composite")):
+            self._view_group.addButton(rb)
+            rb.toggled.connect(
+                lambda checked, k=key: self._on_view_changed(k) if checked else None)
+            vb.addWidget(rb)
+        self._view_mode = "a"
+        self._view_a.setChecked(True)
+        pl.addWidget(view_box)
+
+        zoom_row = QHBoxLayout()
+        zoom_row.setContentsMargins(0, 0, 0, 0)
+        zoom_row.addWidget(QLabel("Zoom"))
+        self._zoom_combo = QComboBox()
+        for z in self._ZOOM_LEVELS:
+            self._zoom_combo.addItem(f"{z}×", z)
+        self._zoom_combo.currentIndexChanged.connect(self._on_zoom_changed)
+        zoom_row.addWidget(self._zoom_combo)
+        zoom_row.addStretch(1)
+        pl.addLayout(zoom_row)
+
+        pl.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setMaximumWidth(300)
+        scroll.setMinimumWidth(120)
+        return scroll
+
+    def _build_footer(self):
+        """Shared bottom strip (below the tabs): the map's Details on the
+        left, Import/Export dropdowns on the right. Placing metadata + I/O
+        in a footer — not the sidebar — keeps this editor consistent with
+        the data + map editors. Scroll-wrapped so its labels never pin the
+        window's minimum width."""
+        # Import/Export dropdowns — uniform (larger) width matching the sprite
+        # editors, stacked in the shared io column.
+        self._import_btn = QPushButton("Import…")
+        self._import_btn.setMenu(self._build_import_menu())
+        self._import_btn.setEnabled(self._undo_stack is not None)
+        self._export_btn = QPushButton("Export…")
+        self._export_btn.setMenu(self._build_export_menu())
+        io_panel = io_button_column(self._import_btn, self._export_btn)
+
+        # Transparent-colour picker (relocated out of the hidden backdrop
+        # editor) — same widget the sprite editors use.
+        picker_panel = QWidget()
+        ppl = QVBoxLayout(picker_panel)
+        ppl.setContentsMargins(0, 0, 0, 0)
+        ppl.addWidget(self._backdrop_picker)
+        ppl.addStretch(1)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        self._meta_size = QLabel("—")
+        self._meta_tiles = QLabel("—")
+        self._meta_banks = QLabel("—")
+        self._meta_layer_b = QLabel("—")
+        self._meta_anim = QLabel("—")
+        form.addRow("Size", self._meta_size)
+        form.addRow("Tiles", self._meta_tiles)
+        form.addRow("Palette banks", self._meta_banks)
+        form.addRow("Layer B", self._meta_layer_b)
+        form.addRow("Anim frames", self._meta_anim)
+        details_panel = QWidget()
+        details_panel.setLayout(form)
+
+        scroll = build_editor_footer([io_panel, picker_panel, details_panel])
+        self._footer_scroll = scroll
+        return scroll
+
+    # ---- View selector / zoom / import-export ----------------------------
+
+    def _active_layer_key_full(self):
+        return "layer_b" if self._view_mode == "b" else "layer_a"
+
+    def _zoom_factor(self):
+        data = self._zoom_combo.currentData()
+        return int(data) if data else 1
+
+    def _on_view_changed(self, key):
+        self._view_mode = key
+        is_layer = key in ("a", "b")
+        if hasattr(self, "_act_import_png"):
+            self._act_import_png.setEnabled(is_layer and self._undo_stack is not None)
+        self._refresh_active_tab()
+
+    def _on_zoom_changed(self, _ix):
+        self._refresh_active_tab()
+
+    def _build_export_menu(self):
+        menu = QMenu(self)
+        menu.addAction("PNG (current view)…").triggered.connect(
+            self._on_bg_export_clicked)
+        menu.addAction("Native files (NCGR / NSCR / NCLR)…").triggered.connect(
+            self._on_export_native)
+        return menu
+
+    def _build_import_menu(self):
+        menu = QMenu(self)
+        self._act_import_png = menu.addAction("PNG → selected layer…")
+        self._act_import_png.triggered.connect(
+            lambda: self._on_static_import_clicked(self._active_layer_key_full()))
+        menu.addAction("Native file (NCGR / NSCR / NCLR)…").triggered.connect(
+            self._on_import_native)
+        return menu
+
+    def _update_details(self, map_id):
+        a_nscr = self._session.btmap_file_bytes(f"DAT/btmap/{map_id}as")
+        aw, ah, _ = btmap.parse_nscr(a_nscr)
+        self._meta_size.setText(f"{aw}×{ah}")
+        try:
+            tiles, _ = btmap._ncgr_tiles_as_indices(
+                self._session.btmap_file_bytes(f"DAT/btmap/{map_id}ac"))
+            self._meta_tiles.setText(str(len(tiles)))
+        except Exception:
+            self._meta_tiles.setText("—")
+        palettes, _ = btmap.parse_nclr(
+            self._session.btmap_file_bytes(f"DAT/btmap/{map_id}ap"))
+        self._meta_banks.setText(str(len(palettes)))
+        b_path = f"DAT/btmap/{map_id}bs"
+        if b_path in self._file_table:
+            bw, bh, _ = btmap.parse_nscr(self._session.btmap_file_bytes(b_path))
+            self._meta_layer_b.setText(f"{bw}×{bh}")
+        else:
+            self._meta_layer_b.setText("—")
+        anim_count = sum(
+            1 for frame in btmap.ANIM_FRAMES
+            if f"DAT/btmap/{map_id}a{frame}c" in self._file_table)
+        self._meta_anim.setText(str(anim_count) if anim_count else "—")
+        tooltip = self._build_components_tooltip(map_id)
+        for w in (self._meta_size, self._meta_tiles, self._meta_banks,
+                  self._meta_layer_b, self._meta_anim):
+            w.setToolTip(tooltip)
+        # Keep the footer's transparent-colour picker showing the current
+        # backdrop colour (bank 0 slot 0) even though the swatch grid is
+        # hidden; this also refreshes the dormant swatches harmlessly.
+        self._refresh_backdrop_swatches()
+
+    def _on_export_native(self):
+        if self._current_id is None:
+            return
+        map_id = self._current_id
+        folder = QFileDialog.getExistingDirectory(
+            self, "Export native files to folder")
+        if not folder:
+            return
+        wrote = []
+
+        def _dump(path, name):
+            if path in self._file_table:
+                data = self._session.btmap_file_bytes(path)
+                with open(os.path.join(folder, name), "wb") as fh:
+                    fh.write(data)
+                wrote.append(name)
+
+        if self._view_mode in ("a", "composite"):
+            _dump(f"DAT/btmap/{map_id}ac", f"{map_id}ac.ncgr")
+            _dump(f"DAT/btmap/{map_id}as", f"{map_id}as.nscr")
+        if self._view_mode in ("b", "composite"):
+            _dump(f"DAT/btmap/{map_id}bc", f"{map_id}bc.ncgr")
+            _dump(f"DAT/btmap/{map_id}bs", f"{map_id}bs.nscr")
+        _dump(f"DAT/btmap/{map_id}ap", f"{map_id}ap.nclr")
+        QMessageBox.information(
+            self, "Export complete",
+            "Wrote:\n" + "\n".join(wrote) if wrote else "Nothing to write.")
+
+    def _on_import_native(self):
+        if self._current_id is None or self._undo_stack is None:
+            QMessageBox.information(
+                self, "Read-only", "Open a project to import files.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import native file", "",
+            "Nitro files (*.ncgr *.nscr *.nclr *.bin);;All files (*)")
+        if not path:
+            return
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        magic = raw[:4]
+        map_id = self._current_id
+        layer = "b" if self._view_mode == "b" else "a"
+        if magic == b"RGCN":
+            target, kind = f"DAT/btmap/{map_id}{layer}c", "NCGR"
+        elif magic == b"RCSN":
+            target, kind = f"DAT/btmap/{map_id}{layer}s", "NSCR"
+        elif magic == b"RLCN":
+            target, kind = f"DAT/btmap/{map_id}ap", "NCLR"
+        else:
+            QMessageBox.warning(
+                self, "Unrecognised file",
+                "Expected an NCGR (RGCN), NSCR (RCSN) or NCLR (RLCN) file.")
+            return
+        if target not in self._file_table:
+            QMessageBox.warning(
+                self, "No such component",
+                f"This map has no {kind} for the {layer.upper()} layer.")
+            return
+        from editor.commands import ReplaceBtmapFileCommand
+        self._undo_stack.push(ReplaceBtmapFileCommand(
+            self._session, target, raw,
+            f"Import {kind} → {target.rsplit('/', 1)[-1]}",
+            on_change=self._on_btmap_file_replaced))
+
+    def _on_bg_export_clicked(self) -> None:
+        if self._current_id is None:
+            return
+        preview = self._render_for_tab(self._TAB_BG)
+        if preview is None or preview.width == 0:
+            QMessageBox.information(
+                self, "Nothing to export", "No layers are visible to export.")
+            return
+        try:
+            from PIL import Image
+        except ImportError:
+            QMessageBox.warning(
+                self, "Export failed",
+                "Pillow is required to export PNGs (pip install pillow).")
+            return
+        default_name = f"map{self._current_id}_bg.png"
+        png_path, _ = QFileDialog.getSaveFileName(
+            self, f"Export background for map {self._current_id}",
+            default_name, "PNG images (*.png);;All files (*)")
+        if not png_path:
+            return
+        try:
+            Image.frombytes(
+                "RGBA", (preview.width, preview.height), preview.rgba).save(png_path)
+        except OSError as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+            return
+        QMessageBox.information(self, "Export complete", f"Wrote:\n{png_path}")
 
     # ---- Layer A backdrop (per-bank slot 0) -----------------------------
 
@@ -259,19 +546,9 @@ class BtmapBrowser(QWidget):
         content_layout.setContentsMargins(12, 4, 0, 4)
         self._backdrop_content = content
 
-        # Shared picker + active-bank caption.
-        self._backdrop_picker = TransparentColorPicker(
-            on_color_picked=self._apply_backdrop_color,
-        )
-        # Eyedropper samples from the Layer A preview at its native
-        # render size; the source provider closure reads the cached
-        # QImage and the live label/pixmap sizes on each click.
-        self._layer_a_preview_qimage: Optional[QImage] = None
-        self._backdrop_picker.bind_preview(
-            preview_label, self._layer_a_preview_source,
-        )
-        content_layout.addWidget(self._backdrop_picker)
-
+        # ``self._backdrop_picker`` is created + bound in ``_build_bg_tab``
+        # (it lives in the footer now). This section only holds the per-bank
+        # swatch grid + active-bank caption, kept dormant/hidden for now.
         self._backdrop_active_label = QLabel("Active: Bank 0")
         self._backdrop_active_label.setStyleSheet("color: #888;")
         content_layout.addWidget(self._backdrop_active_label)
@@ -436,7 +713,7 @@ class BtmapBrowser(QWidget):
         """
         label = QLabel("Select a battle background to preview.")
         label.setAlignment(Qt.AlignCenter)
-        label.setMinimumSize(512, 256)
+        label.setMinimumSize(160, 90)
         scroll = QScrollArea()
         scroll.setWidget(label)
         scroll.setWidgetResizable(True)
@@ -475,21 +752,32 @@ class BtmapBrowser(QWidget):
         # the swap on — disable in viewer-only contexts.
         self._anim_import_btn.setEnabled(self._undo_stack is not None)
         self._anim_status = QLabel("\u2014")
-        self._anim_status.setMinimumWidth(180)
+        # Word-wrap + a max width so the long "sub 1/4 \u00b7 \u2026 \u00b7 dominant-bank
+        # splice" text wraps instead of pinning a wide minimum.
+        self._anim_status.setWordWrap(True)
+        self._anim_status.setMaximumWidth(300)
 
+        # FlowLayout so the controls wrap onto a second row when the tab is
+        # narrow instead of forcing the whole window wide.
+        def _labeled(text: str, widget: QWidget) -> QWidget:
+            g = QWidget()
+            h = QHBoxLayout(g)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            h.addWidget(QLabel(text))
+            h.addWidget(widget)
+            return g
+
+        self._anim_sub_slider.setMinimumWidth(120)
         self._anim_controls = QWidget()
-        controls_layout = QHBoxLayout(self._anim_controls)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.addWidget(QLabel("Frame"))
-        controls_layout.addWidget(self._anim_frame_combo)
-        controls_layout.addSpacing(8)
-        controls_layout.addWidget(QLabel("Sub-frame"))
-        controls_layout.addWidget(self._anim_sub_slider, 1)
-        controls_layout.addSpacing(8)
-        controls_layout.addWidget(self._anim_play_btn)
-        controls_layout.addWidget(self._anim_export_btn)
-        controls_layout.addWidget(self._anim_import_btn)
-        controls_layout.addWidget(self._anim_status)
+        cflow = FlowLayout(self._anim_controls, margin=0, h_spacing=10, v_spacing=4)
+        cflow.addWidget(_labeled("Frame", self._anim_frame_combo))
+        cflow.addWidget(_labeled("Sub-frame", self._anim_sub_slider))
+        cflow.addWidget(self._anim_play_btn)
+        cflow.addWidget(self._anim_export_btn)
+        cflow.addWidget(self._anim_import_btn)
+        cflow.addWidget(self._anim_status)
+        make_height_for_width(self._anim_controls)
 
         page = QWidget()
         page_layout = QVBoxLayout(page)
@@ -500,6 +788,44 @@ class BtmapBrowser(QWidget):
 
     # ---- Selection / tab change -----------------------------------------
 
+    # ---- Paint tab -------------------------------------------------------
+
+    def _build_paint_tab(self):
+        """Porymap-style NSCR painter for the selected layer, shared verbatim
+        with the UI-background editor (same NCGR/NSCR/NCLR format). A Layer A/B
+        selector sits in the paint sidebar (via the shared tab's header slot)."""
+        self._paint_layer = "a"
+        # Layer A/B selector — lives in the controls sidebar, not a top row.
+        layer_box = QGroupBox("Layer")
+        lb = QHBoxLayout(layer_box)
+        lb.setContentsMargins(8, 4, 8, 4)
+        self._paint_layer_group = QButtonGroup(self)
+        self._paint_layer_a = QRadioButton("A")
+        self._paint_layer_b = QRadioButton("B")
+        for rb, key in ((self._paint_layer_a, "a"), (self._paint_layer_b, "b")):
+            self._paint_layer_group.addButton(rb)
+            rb.toggled.connect(
+                lambda checked, k=key: self._on_paint_layer_changed(k) if checked else None)
+            lb.addWidget(rb)
+        lb.addStretch(1)
+
+        self._paint_tab = TilemapPaintTab(
+            self._undo_stack, _BtmapPaintProvider(self), header_widget=layer_box)
+        self._paint_layer_a.setChecked(True)
+        return self._paint_tab
+
+    def _on_paint_layer_changed(self, key: str) -> None:
+        self._paint_layer = key
+        self._paint_tab.refresh()
+
+    def _on_paint_external_change(self) -> None:
+        """After a paint NSCR edit (or its undo/redo), keep the Background
+        preview + Details in sync with the new bytes."""
+        if self._current_id is not None:
+            self._update_details(self._current_id)
+        if self._tabs.currentIndex() != self._TAB_PAINT:
+            self._refresh_active_tab()
+
     def _on_index_selected(self, ix: int) -> None:
         if not (0 <= ix < len(self._map_ids)):
             return
@@ -507,11 +833,13 @@ class BtmapBrowser(QWidget):
         self._current_id = map_id
         self._session.remember_selection(self._CURSOR_KEY, int(map_id))
         self._rebuild_anim_entries(map_id)
+        self._paint_tab.invalidate()
         self._update_tab_availability(map_id)
-        self._update_metadata(map_id)
+        self._update_details(map_id)
         self._refresh_active_tab()
 
     def _on_tab_changed(self, ix: int) -> None:
+        self._session.remember_selection(self._CURSOR_KEY + "_tab", ix)
         # Pause the animation timer when the user navigates away from the
         # Anim tab — otherwise it keeps repainting an invisible label.
         if ix != self._TAB_ANIM:
@@ -530,12 +858,20 @@ class BtmapBrowser(QWidget):
             f"DAT/btmap/{map_id}a{frame}c" in self._file_table
             for frame in btmap.ANIM_FRAMES
         )
-        self._tabs.setTabEnabled(self._TAB_LAYER_B, has_b)
         self._tabs.setTabEnabled(self._TAB_ANIM, has_anim)
         if not self._tabs.isTabEnabled(self._tabs.currentIndex()):
             self._tabs.blockSignals(True)
-            self._tabs.setCurrentIndex(self._TAB_COMPOSITE)
+            self._tabs.setCurrentIndex(self._TAB_BG)
             self._tabs.blockSignals(False)
+        # Layer B has no data for this map — grey out its View radio and fall
+        # the selected view back to a valid one.
+        self._view_b.setEnabled(has_b)
+        if not has_b and self._view_b.isChecked():
+            self._view_comp.setChecked(True)  # fires _on_view_changed
+        # Same gating for the Paint tab's layer toggle.
+        self._paint_layer_b.setEnabled(has_b)
+        if not has_b and self._paint_layer_b.isChecked():
+            self._paint_layer_a.setChecked(True)  # fires _on_paint_layer_changed
 
     # ---- Render dispatch -------------------------------------------------
 
@@ -543,6 +879,9 @@ class BtmapBrowser(QWidget):
         if self._current_id is None:
             return
         ix = self._tabs.currentIndex()
+        if ix == self._TAB_PAINT:
+            self._paint_tab.refresh()  # manages its own canvas
+            return
         try:
             preview = self._render_for_tab(ix)
         except (ValueError, KeyError) as e:
@@ -556,25 +895,23 @@ class BtmapBrowser(QWidget):
     def _render_for_tab(self, ix: int) -> Optional["btmap.BtmapPreview"]:
         map_id = self._current_id
         nclr = self._session.btmap_file_bytes(f"DAT/btmap/{map_id}ap")
-        if ix == self._TAB_LAYER_A:
+        if ix == self._TAB_ANIM:
+            return self._render_anim_tab(map_id, nclr)
+        # Background: render the selected view (Layer A / Layer B / Composite).
+        has_b = f"DAT/btmap/{map_id}bs" in self._file_table
+        if self._view_mode == "a":
             return btmap.render_single_layer(
                 self._session.btmap_file_bytes(f"DAT/btmap/{map_id}ac"),
                 self._session.btmap_file_bytes(f"DAT/btmap/{map_id}as"),
-                nclr,
-                backdrop_opaque=True,
+                nclr, backdrop_opaque=True,
             )
-        if ix == self._TAB_LAYER_B:
-            if f"DAT/btmap/{map_id}bs" not in self._file_table:
-                return None
+        if self._view_mode == "b" and has_b:
             return btmap.render_single_layer(
                 self._session.btmap_file_bytes(f"DAT/btmap/{map_id}bc"),
                 self._session.btmap_file_bytes(f"DAT/btmap/{map_id}bs"),
-                nclr,
-                backdrop_opaque=True,
+                nclr, backdrop_opaque=True,
             )
-        if ix == self._TAB_ANIM:
-            return self._render_anim_tab(map_id, nclr)
-        # composite
+        # Composite (or B unavailable).
         return btmap.render_btmap(
             map_id,
             layer_a_ncgr=self._session.btmap_file_bytes(f"DAT/btmap/{map_id}ac"),
@@ -1167,17 +1504,13 @@ class BtmapBrowser(QWidget):
         """
         if self._current_id is not None:
             self._rebuild_anim_entries(self._current_id)
-            self._update_metadata(self._current_id)
+            self._update_details(self._current_id)
             self._refresh_active_tab()
 
     def _label_for_tab(self, ix: int) -> QLabel:
-        if ix == self._TAB_LAYER_A:
-            return self._layer_a_label
-        if ix == self._TAB_LAYER_B:
-            return self._layer_b_label
         if ix == self._TAB_ANIM:
             return self._anim_label
-        return self._composite_label
+        return self._bg_label
 
     def _set_label_text(self, ix: int, text: str) -> None:
         label = self._label_for_tab(ix)
@@ -1197,15 +1530,22 @@ class BtmapBrowser(QWidget):
         )
         label = self._label_for_tab(ix)
         label.setText("")
-        label.setPixmap(QPixmap.fromImage(image))
-        label.adjustSize()
-        if ix == self._TAB_LAYER_A:
-            # Cache the QImage for the backdrop picker's eyedropper.
-            # ``copy()`` detaches from the rgba buffer so a later tab
-            # change can swap _pinned_rgba without invalidating samples.
+        pixmap = QPixmap.fromImage(image)
+        if ix == self._TAB_BG:
+            z = self._zoom_factor()
+            if z > 1:
+                pixmap = pixmap.scaled(
+                    preview.width * z, preview.height * z,
+                    Qt.KeepAspectRatio, Qt.FastTransformation,
+                )
+            # Cache the (unscaled) QImage for the backdrop picker's eyedropper.
+            # ``copy()`` detaches from the rgba buffer so a later tab change
+            # can swap _pinned_rgba without invalidating samples.
             self._layer_a_preview_qimage = image.copy()
-            if self._backdrop_content.isVisible():
-                self._refresh_backdrop_swatches()
+        label.setPixmap(pixmap)
+        label.adjustSize()
+        if ix == self._TAB_BG and self._backdrop_content.isVisible():
+            self._refresh_backdrop_swatches()
 
     # ---- Metadata --------------------------------------------------------
 
@@ -1213,42 +1553,6 @@ class BtmapBrowser(QWidget):
         if path not in self._file_table:
             return None
         return self._session.btmap_file_bytes(path)
-
-    def _update_metadata(self, map_id: str) -> None:
-        """Refresh the compact metadata block + tooltip breakdown.
-
-        Tooltip carries the per-FAT-file kind/size detail that used to
-        live in the Components table — same data, much less footprint.
-        """
-        # Layer A dims come from the NSCR header (cheap to re-parse here;
-        # avoids a full render just to fill the label).
-        a_nscr = self._session.btmap_file_bytes(f"DAT/btmap/{map_id}as")
-        aw, ah, _ = btmap.parse_nscr(a_nscr)
-        self._meta_size.setText(f"{aw}\u00d7{ah}")
-
-        b_path = f"DAT/btmap/{map_id}bs"
-        if b_path in self._file_table:
-            bw, bh, _ = btmap.parse_nscr(
-                self._session.btmap_file_bytes(b_path)
-            )
-            self._meta_layer_b.setText(f"{bw}\u00d7{bh}")
-        else:
-            self._meta_layer_b.setText("\u2014")
-
-        nclr = self._session.btmap_file_bytes(f"DAT/btmap/{map_id}ap")
-        palettes, _ = btmap.parse_nclr(nclr)
-        self._meta_palette.setText(str(len(palettes)))
-
-        anim_count = sum(
-            1
-            for frame in btmap.ANIM_FRAMES
-            if f"DAT/btmap/{map_id}a{frame}c" in self._file_table
-        )
-        self._meta_anim.setText(str(anim_count) if anim_count else "\u2014")
-
-        tooltip = self._build_components_tooltip(map_id)
-        for lbl in (self._meta_size, self._meta_layer_b, self._meta_palette, self._meta_anim):
-            lbl.setToolTip(tooltip)
 
     def _build_components_tooltip(self, map_id: str) -> str:
         layer_paths = [

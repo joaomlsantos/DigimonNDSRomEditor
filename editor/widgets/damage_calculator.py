@@ -22,11 +22,13 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QCompleter,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -221,7 +223,13 @@ class _Side:
         sb = NoWheelSpinBox()
         sb.setRange(lo, hi)
         sb.setValue(val)
-        sb.setMaximumWidth(width)
+        # ``width`` is a target, but never cap below the spinbox's own minimum:
+        # the up/down buttons + frame + the widest value's digits define a
+        # floor, and forcing it narrower (the old bare setMaximumWidth) squeezed
+        # the text area to nothing and clipped the number to a digit or two —
+        # exactly the "stats/resistances not visible" bug. Font/DPI-adaptive
+        # because minimumSizeHint is derived from the current font metrics.
+        sb.setFixedWidth(max(width, sb.minimumSizeHint().width()))
         sb.valueChanged.connect(self._emit)
         return sb
 
@@ -712,7 +720,20 @@ class DamageCalculatorWidget(QWidget):
         trait_model = _trait_model()
         equip_model = _equip_model(session)
 
-        root = QVBoxLayout(self)
+        # The two side-by-side panels (each with 8 resistance spinboxes) make
+        # this an inherently wide tool. Host it in a scroll area so it scrolls
+        # on screens narrower than its natural width instead of forcing the
+        # whole window wide or clipping the panels.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer.addWidget(scroll)
+        content = QWidget()
+        scroll.setWidget(content)
+
+        root = QVBoxLayout(content)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 

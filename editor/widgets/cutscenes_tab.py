@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from digimon_core import overlay5 as overlay5_mod
+from digimon_core import overlay5 as overlay5_mod, shop as shop_mod
 from digimon_core.constants import ITEM_ID_TO_STR
 from digimon_core.map_labels import area_name
 from digimon_core.overlay5_cutscenes import (
@@ -204,7 +204,19 @@ _EVENT_KIND_HEADER_LABEL = {
     "item":        ("item", "items"),
     "move":        ("move", "moves"),
     "control":     ("flag/branch", "flags/branches"),
+    "open_shop":   ("shop", "shops"),
 }
+
+
+# OPEN_SHOP opener-id → id-ordered label ("Item Shop 3"). Shops are named by
+# id, not location — one opener id is reused by NPCs in different areas.
+def _opener_label(opener_id: int) -> str:
+    return shop_mod.opener_label(int(opener_id) & 0xFFFF)
+
+
+def _opener_choices() -> List[Tuple[int, str]]:
+    """``(opener_id, label)`` for every OPEN_SHOP target, in opener-id order."""
+    return [(oid, shop_mod.opener_label(oid)) for oid in shop_mod.opener_ids()]
 
 
 # Row-preview text for the events browser list — matches the icons
@@ -300,6 +312,8 @@ def _event_row_preview(session, event, slot_labels=None) -> Tuple[str, str]:
     if event.kind == overlay5_mod.EVENT_KIND_CONTROL:
         label, detail = payload.row_summary()
         return (_CONTROL_ICONS.get(payload.category, "❓"), f"{label} - {detail}")
+    if event.kind == overlay5_mod.EVENT_KIND_OPEN_SHOP:
+        return ("🛒", f"SHOP - Opens {_opener_label(int(payload.shop_id) & 0xFFFF)}")
     return ("?", f"{event.kind} @ 0x{event.rel:04x}")
 
 
@@ -1346,6 +1360,7 @@ _SUBSTANTIVE_EVENT_KINDS = frozenset({
     overlay5_mod.EVENT_KIND_ITEM,
     overlay5_mod.EVENT_KIND_REACTION,
     overlay5_mod.EVENT_KIND_MOVE,
+    overlay5_mod.EVENT_KIND_OPEN_SHOP,
 })
 
 
@@ -3296,6 +3311,97 @@ class _ItemEventCard(QFrame):
             self._session, self._entry_ix, self._block_offset, 2, new,
             self._opcode,
             description=f"{verb} item → {_item_display_name(new)}",
+            on_change=lambda _v: self.refresh(),
+        ))
+
+
+class _OpenShopCard(QFrame):
+    """Inline card for OPEN_SHOP (``bb 00 [shop_id]``) — which town shop this
+    NPC opens. The id picks both the town and the kind (item / equipment /
+    farm / remodel); edit the stock itself in the Shops editor."""
+
+    def __init__(self, session, undo_stack, entry_ix, block, alt=False, parent=None, slot_labels=None, referenced_slots=None, slot_ow_ids=None):
+        super().__init__(parent)
+        self._session = session
+        self._undo_stack = undo_stack
+        self._entry_ix = int(entry_ix)
+        self._block = block
+        self._block_offset = int(block.block_offset)
+        self._syncing = False
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(_card_style_for("_OpenShopCard", alt))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        tag = QLabel("\U0001f6d2 Opens shop")  # 🛒
+        tag.setStyleSheet("color: #cccccc; font-weight: bold;")
+        row.addWidget(tag, 0)
+        self._combo = _NoWheelComboBox()
+        self._combo.setEditable(True)
+        self._combo.setInsertPolicy(QComboBox.NoInsert)
+        self._combo.setMaxVisibleItems(20)
+        self._combo.setMinimumContentsLength(22)
+        for oid, label in _opener_choices():
+            self._combo.addItem(label, oid)
+        comp = QCompleter(self._combo)
+        comp.setCaseSensitivity(Qt.CaseInsensitive)
+        comp.setFilterMode(Qt.MatchContains)
+        comp.setCompletionMode(QCompleter.PopupCompletion)
+        comp.setModel(self._combo.model())
+        self._combo.setCompleter(comp)
+        self._combo.currentIndexChanged.connect(self._on_committed)
+        row.addWidget(self._combo, 1)
+        outer.addLayout(row)
+        self._info = QLabel()
+        self._info.setStyleSheet("color: #888; font-size: 10px;")
+        outer.addWidget(self._info, 0)
+        self._refresh_from_block(block)
+
+    def refresh(self):
+        try:
+            eb = self._session.overlay5_entry_bytes(self._entry_ix)
+            self._block = overlay5_mod.OpenShopBlock.from_bytes(
+                eb, self._block_offset,
+            )
+        except (ValueError, IndexError):
+            return
+        self._refresh_from_block(self._block)
+
+    def flush_pending(self):
+        return
+
+    def _refresh_from_block(self, block):
+        self._syncing = True
+        try:
+            sid = int(block.shop_id) & 0xFFFF
+            ix = self._combo.findData(sid)
+            if ix < 0:
+                self._combo.addItem(f"(unknown 0x{sid:x})", sid)
+                ix = self._combo.findData(sid)
+            self._combo.setCurrentIndex(ix)
+        finally:
+            self._syncing = False
+        self._info.setText(
+            f"opener id {int(block.shop_id) & 0xFFFF}  ·  entry {self._entry_ix:04d}"
+            f" + 0x{self._block_offset:04x}  ·  edit stock in the Shops editor"
+        )
+
+    def _on_committed(self, _ix=-1):
+        if self._syncing or self._undo_stack is None:
+            return
+        val = self._combo.currentData()
+        if val is None:
+            return
+        new = int(val) & 0xFFFF
+        if new == int(self._block.shop_id) & 0xFFFF:
+            return
+        self._undo_stack.push(EditScriptFieldCommand(
+            self._session, self._entry_ix, self._block_offset, 2, new,
+            overlay5_mod.OPEN_SHOP_OPCODE,
+            description=f"Open shop → {_opener_label(new)}",
             on_change=lambda _v: self.refresh(),
         ))
 
@@ -5762,6 +5868,7 @@ class CutscenesTab(QWidget):
         overlay5_mod.EVENT_KIND_ITEM: _ItemEventCard,
         overlay5_mod.EVENT_KIND_MOVE: _MoveCard,
         overlay5_mod.EVENT_KIND_CONTROL: _ControlCard,
+        overlay5_mod.EVENT_KIND_OPEN_SHOP: _OpenShopCard,
     }
 
     def _add_event_card(

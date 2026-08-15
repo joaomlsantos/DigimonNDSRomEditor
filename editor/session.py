@@ -14,7 +14,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from digimon_core import constants, fat, fnt, loaders, model, msgpak, overlay5 as overlay5_mod, overlay5_cutscenes as overlay5_cutscenes_mod, pak, qol as qol_module, rom
+from digimon_core import constants, fat, fnt, loaders, model, msgpak, overlay5 as overlay5_mod, overlay5_cutscenes as overlay5_cutscenes_mod, pak, qol as qol_module, rom, shop as shop_mod
 from digimon_core.sound import sdat as sdat_mod
 from digimon_core.sound.swap import BgmSwap
 
@@ -568,6 +568,9 @@ class RomSession:
         session.traits = loaders.loadTraitData(version, parse_data)
         session.farm_items = loaders.loadFarmItems(version, parse_data)
         session.farm_training_pens = loaders.loadFarmTrainingPens(version, parse_data)
+        # Shop inventories live in overlay 9_9 (a plain ROM region); parse them
+        # as same-length-editable id lists. Empty on versions we haven't mapped.
+        session.shops = shop_mod.parse_shops(version, parse_data)
         session.string_regions = loaders.loadAllStringRegions(version, parse_data, file_table=file_table)
         # Seed QoL parameter defaults from the actual bytes at their ARM-imm
         # offsets so the editor displays the current value (vanilla on a fresh
@@ -680,6 +683,9 @@ class RomSession:
             obj.writeToRom(out)
         for obj in self.farm_training_pens:
             obj.writeToRom(out)
+        # Shop inventories (overlay 9_9): same-length in-place u16-list writes,
+        # so they ride the byte diff like the model tables above.
+        shop_mod.write_shops(out, self.shops)
         # Overworld palette reassignments: patch the ARM9 ow-sprite table's pal
         # field (f2) in place. Equal-length ARM9 byte edit — rides the same
         # in-place + byte-diff channel as the ARM9 string regions.
@@ -886,7 +892,7 @@ class RomSession:
         if self._overlay5_index_cache is None:
             ft = self.vanilla_file_table()
             self._overlay5_index_cache = overlay5_mod.Overlay5Index.from_file_table(
-                ft, self.original_rom_data,
+                ft, self.original_rom_data, self.version,
             )
         return self._overlay5_index_cache
 
@@ -1387,7 +1393,7 @@ class RomSession:
         if not self._dirty_overlay5_entries:
             return
         ovl_start, _ovl_end = overlay5_mod.find_overlay_fat_range(
-            bytes(out), overlay_id=5,
+            bytes(out), overlay_id=overlay5_mod.script_overlay_id(self.version),
         )
         index = self.overlay5_index()
         for entry_ix, new_entry in self._dirty_overlay5_entries.items():

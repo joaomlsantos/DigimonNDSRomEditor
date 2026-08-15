@@ -409,6 +409,34 @@ class ReplaceMapFileCommand(QUndoCommand):
             self._on_change()
 
 
+class SetShopItemCommand(QUndoCommand):
+    """Swap one item id in a shop's stock list (in place, same length)."""
+
+    def __init__(
+        self,
+        shop: Any,
+        slot: int,
+        new_id: int,
+        on_change: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(f"Edit shop {shop.index} slot {slot}")
+        self._shop = shop
+        self._slot = slot
+        self._new_id = new_id
+        self._old_id = shop.item_ids[slot]
+        self._on_change = on_change
+
+    def redo(self) -> None:
+        self._shop.item_ids[self._slot] = self._new_id
+        if self._on_change is not None:
+            self._on_change()
+
+    def undo(self) -> None:
+        self._shop.item_ids[self._slot] = self._old_id
+        if self._on_change is not None:
+            self._on_change()
+
+
 class ReplaceBgFileCommand(QUndoCommand):
     """Atomic swap of one ``DAT/bg/*`` menu-background FAT file's bytes.
 

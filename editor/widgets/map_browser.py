@@ -25,6 +25,7 @@ editor so the visual shape doesn't shift when editing arrives.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -37,13 +38,17 @@ from PySide6.QtWidgets import (
     QCompleter,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
@@ -70,6 +75,7 @@ from ..commands import (
     SetAttrCommand,
 )
 from .cutscenes_tab import CutscenesTab
+from .form_helpers import build_editor_footer, io_button_column
 from .map_encounter_tab import MapEncounterTab
 from .events_canvas import EventMarkerSpec, EventsCanvas, ExitZoneSpec
 from .paint_canvas import PaintCanvas
@@ -365,11 +371,16 @@ class MapBrowser(QWidget):
 
     _CURSOR_KEY = "map_browser"
 
-    # Layer A leads since it's the primary editing surface; Composite is
-    # last because it's read-only/derived and exists for visual reference.
-    # Events sits between Walkability and Composite — it's a viewer over
-    # overlay5 placements, not a layer painter, but useful next to the
-    # composite render for cross-referencing NPC positions against the map.
+    # Two id spaces, deliberately decoupled:
+    #
+    # ``_TAB_*`` are *logical render ids* — the keys used by ``_render_for_tab``,
+    # ``_label_for_tab``, ``_pinned_rgba`` and the layer-refresh guards. Their
+    # numeric values are historical and no longer track tab positions.
+    #
+    # Layer A / Layer B / Composite are NOT separate top-level tabs anymore:
+    # they're the three views of the unified first "Map" tab, switched by a
+    # View radio (``_map_view``). ``_active_render_id`` maps the current
+    # physical tab (+ the Map tab's active view) back onto a logical id.
     _TAB_LAYER_A = 0
     _TAB_LAYER_B = 1
     _TAB_WALK = 2
@@ -377,6 +388,13 @@ class MapBrowser(QWidget):
     _TAB_CUTSCENES = 4
     _TAB_ENCOUNTERS = 5
     _TAB_COMPOSITE = 6
+
+    # Physical QTabWidget positions.
+    _REAL_TAB_MAP = 0
+    _REAL_TAB_WALK = 1
+    _REAL_TAB_EVENTS = 2
+    _REAL_TAB_CUTSCENES = 3
+    _REAL_TAB_ENCOUNTERS = 4
 
     # Column labels for the .d tuple table. Best-guess names per the
     # recon doc (research_docs/claude_notes/btmap_map_recon.md §.d);
@@ -459,19 +477,23 @@ class MapBrowser(QWidget):
         self._list.indexSelected.connect(self._on_index_selected)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_layer_paint_tab("a"), "Layer A")
-        self._tabs.addTab(self._build_layer_paint_tab("b"), "Layer B")
+        self._tabs.addTab(self._build_map_tab(), "Map")
         self._tabs.addTab(self._build_walk_tab(), "Walkability")
-        self._tabs.addTab(self._build_events_tab(), "Events")
+        # The Events tab is dormant (hidden, superseded by Events/Cutscenes).
+        # A QTabWidget's minimum size is the max over ALL pages — hidden ones
+        # included — so its wide sidebar was pinning the whole browser's
+        # minimum width. Scroll-wrap it (non-resizable → small floor) so a
+        # dormant page can't hold the window hostage on small screens.
+        self._tabs.addTab(
+            self._shrink_wrap(self._build_events_tab()), "Events")
         self._tabs.addTab(self._build_cutscenes_tab(), "Events/Cutscenes")
         self._tabs.addTab(self._build_encounter_tab(), "Encounters")
-        self._tabs.addTab(self._build_preview_tab("composite"), "Composite")
         # The Events tab is superseded by the Events/Cutscenes tab (its
         # objects/dialogs are all reachable there). Hide the tab button but
         # keep the widget built + wired — dormant, not deleted — so the code
         # path stays live and can be re-surfaced if needed.
         if hasattr(self._tabs, "setTabVisible"):
-            self._tabs.setTabVisible(self._TAB_EVENTS, False)
+            self._tabs.setTabVisible(self._REAL_TAB_EVENTS, False)
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         # Metadata block — compact, left-aligned under the tabs.
@@ -513,16 +535,20 @@ class MapBrowser(QWidget):
         self._tuples_table.setMaximumHeight(20 * mapmod.DESCRIPTOR_MAX_TUPLES + 28)
         self._tuples_table.hide()
 
-        # Metadata footer under the tabs. Wrapped in its own container
-        # widget so tabs that don't touch these fields (Cutscenes reads
-        # overlay5 script data, not tilemap layers) can hide the whole
-        # strip via ``self._meta_footer.setVisible(False)`` without
-        # having to null-out each QLabel individually.
-        self._meta_footer = QWidget()
-        footer_layout = QHBoxLayout(self._meta_footer)
-        footer_layout.setContentsMargins(0, 0, 0, 0)
-        footer_layout.addLayout(meta_form, 0)
-        footer_layout.addStretch(1)
+        # Metadata footer under the tabs — the shared graphics-editor footer
+        # idiom (Import/Export io column + details form flowing in a wrapping,
+        # vertically-compressible strip). Cutscenes/Encounters tabs hide the
+        # whole strip via ``self._meta_footer.setVisible(False)``.
+        self._map_import_btn = QPushButton("Import…")
+        self._map_import_btn.setMenu(self._build_map_import_menu())
+        self._map_import_btn.setEnabled(self._undo_stack is not None)
+        self._map_export_btn = QPushButton("Export…")
+        self._map_export_btn.setMenu(self._build_map_export_menu())
+        io_panel = io_button_column(self._map_import_btn, self._map_export_btn)
+        details_panel = QWidget()
+        details_panel.setLayout(meta_form)
+        self._meta_footer = build_editor_footer([io_panel, details_panel])
+        self._sync_map_io_actions()
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -544,10 +570,14 @@ class MapBrowser(QWidget):
     def _build_preview_tab(self, key: str) -> QWidget:
         label = QLabel("Select a field map to preview.")
         label.setAlignment(Qt.AlignCenter)
-        label.setMinimumSize(512, 384)
+        # Small floor + non-resizable scroll so the preview can shrink
+        # below the rendered pixmap and scroll, instead of pinning the
+        # whole Map tab wide on small screens. ``_set_pixmap_on_tab``
+        # calls ``adjustSize()`` so the label tracks the pixmap.
+        label.setMinimumSize(160, 120)
         scroll = QScrollArea()
         scroll.setWidget(label)
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)
         scroll.setAlignment(Qt.AlignCenter)
 
         page = QWidget()
@@ -557,16 +587,257 @@ class MapBrowser(QWidget):
         setattr(self, f"_{key}_label", label)
         return page
 
-    def _build_layer_paint_tab(self, layer: str) -> QWidget:
+    def _build_map_tab(self) -> QWidget:
+        """Unified field-map visualiser.
+
+        Left: a canvas stack (Layer A painter canvas / Layer B painter canvas /
+        composite preview). Right: ONE shared sidebar — a ``View`` selector on
+        top, then a controls stack holding the active layer's paint tools
+        (tile picker, flips, brush …). Switching View swaps both stacks in
+        lockstep, so the layer painters read as views of one surface with a
+        single sidebar rather than each carrying its own. Every ``layer``-keyed
+        handler keeps working untouched.
+        """
+        a_canvas, a_controls = self._build_layer_paint_tab("a")
+        b_canvas, b_controls = self._build_layer_paint_tab("b")
+
+        self._canvas_stack = QStackedWidget()
+        self._canvas_stack.addWidget(a_canvas)                             # 0
+        self._canvas_stack.addWidget(b_canvas)                            # 1
+        self._canvas_stack.addWidget(self._build_preview_tab("composite"))  # 2
+
+        # Controls stack — the active layer's paint tools. Composite has none,
+        # so it gets an empty placeholder (the View selector stays visible).
+        self._controls_stack = QStackedWidget()
+        self._controls_stack.addWidget(a_controls)  # 0
+        self._controls_stack.addWidget(b_controls)  # 1
+        self._controls_stack.addWidget(QWidget())   # 2 (composite: no tools)
+
+        view_box = QGroupBox("View")
+        vb = QVBoxLayout(view_box)
+        vb.setContentsMargins(8, 6, 8, 6)
+        vb.setSpacing(2)
+        self._map_view_group = QButtonGroup(self)
+        self._view_a = QRadioButton("Layer A")
+        self._view_b = QRadioButton("Layer B")
+        self._view_comp = QRadioButton("Composite")
+        for rb, key in (
+            (self._view_a, "a"), (self._view_b, "b"), (self._view_comp, "composite"),
+        ):
+            self._map_view_group.addButton(rb)
+            rb.toggled.connect(
+                lambda checked, k=key: self._on_map_view_changed(k) if checked else None
+            )
+            vb.addWidget(rb)
+
+        # One right sidebar: View selector on top, the active layer's paint
+        # controls below it.
+        sidebar = QWidget()
+        sl = QVBoxLayout(sidebar)
+        sl.setContentsMargins(6, 6, 6, 6)
+        sl.setSpacing(8)
+        sl.addWidget(view_box, 0)
+        sl.addWidget(self._controls_stack, 1)
+
+        # Layer A is the default view — it's the primary editing surface.
+        self._map_view = "a"
+        self._view_a.setChecked(True)
+        self._canvas_stack.setCurrentIndex(0)
+        self._controls_stack.setCurrentIndex(0)
+
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(self._canvas_stack)
+        split.addWidget(sidebar)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 0)
+        split.setCollapsible(0, False)
+        split.setSizes([820, 250])
+
+        page = QWidget()
+        pl = QVBoxLayout(page)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
+        pl.addWidget(split, 1)
+        return page
+
+    _MAP_VIEW_STACK_IX = {"a": 0, "b": 1, "composite": 2}
+    _MAP_VIEW_RENDER_ID = {
+        "a": _TAB_LAYER_A, "b": _TAB_LAYER_B, "composite": _TAB_COMPOSITE,
+    }
+    _REAL_TAB_RENDER_ID = {
+        _REAL_TAB_WALK: _TAB_WALK,
+        _REAL_TAB_EVENTS: _TAB_EVENTS,
+        _REAL_TAB_CUTSCENES: _TAB_CUTSCENES,
+        _REAL_TAB_ENCOUNTERS: _TAB_ENCOUNTERS,
+    }
+
+    def _on_map_view_changed(self, key: str) -> None:
+        self._map_view = key
+        ix = self._MAP_VIEW_STACK_IX[key]
+        self._canvas_stack.setCurrentIndex(ix)
+        self._controls_stack.setCurrentIndex(ix)
+        self._sync_map_io_actions()
+        self._refresh_active_tab()
+
+    def _active_render_id(self) -> int:
+        """Logical render id for whatever is currently on screen.
+
+        On the Map tab this is the active View's id; elsewhere it's the
+        physical tab mapped onto its logical id.
+        """
+        if self._tabs.currentIndex() == self._REAL_TAB_MAP:
+            return self._MAP_VIEW_RENDER_ID[self._map_view]
+        return self._REAL_TAB_RENDER_ID.get(
+            self._tabs.currentIndex(), self._TAB_COMPOSITE,
+        )
+
+    def _shrink_wrap(self, inner: QWidget) -> QScrollArea:
+        """Wrap a page in a non-resizable scroll so its (possibly wide)
+        content can't pin the QTabWidget's minimum size — it h/v-scrolls
+        below its natural size instead. For dormant/secondary pages only;
+        primary surfaces keep ``widgetResizable(True)`` to fill the view.
+        """
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(False)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        return scroll
+
+    # ---- Footer Import / Export (PNG + native .c/.p/.s) ------------------
+
+    def _active_map_layer(self) -> str:
+        """Which layer the footer I/O acts on. Composite has no single
+        layer — default to A so a native export still has a target."""
+        return "b" if self._map_view == "b" else "a"
+
+    def _map_view_is_layer(self) -> bool:
+        return self._map_view in ("a", "b")
+
+    def _layer_triple(self, layer: str) -> Dict[str, str]:
+        files = mapmod.MapFiles(self._current_id)
+        if layer == "b":
+            return {"c": files.layer_b_tiles, "p": files.layer_b_palette,
+                    "s": files.layer_b_screen}
+        return {"c": files.layer_a_tiles, "p": files.layer_a_palette,
+                "s": files.layer_a_screen}
+
+    def _build_map_export_menu(self) -> QMenu:
+        menu = QMenu(self)
+        menu.addAction("PNG (current view)…").triggered.connect(
+            self._on_map_export_png)
+        menu.addAction("Native files (.c / .p / .s)…").triggered.connect(
+            self._on_map_export_native)
+        return menu
+
+    def _build_map_import_menu(self) -> QMenu:
+        menu = QMenu(self)
+        self._act_map_import_png = menu.addAction("PNG → selected layer…")
+        self._act_map_import_png.triggered.connect(
+            lambda: self._on_import_layer_png(self._active_map_layer()))
+        menu.addSeparator()
+        self._act_map_import_c = menu.addAction("Replace tiles (.c)…")
+        self._act_map_import_c.triggered.connect(
+            lambda: self._on_map_import_native("c"))
+        self._act_map_import_p = menu.addAction("Replace palette (.p)…")
+        self._act_map_import_p.triggered.connect(
+            lambda: self._on_map_import_native("p"))
+        self._act_map_import_s = menu.addAction("Replace screen (.s)…")
+        self._act_map_import_s.triggered.connect(
+            lambda: self._on_map_import_native("s"))
+        return menu
+
+    def _sync_map_io_actions(self) -> None:
+        """Native/PNG imports need a concrete layer; disable them on the
+        Composite view (and when there's no undo stack)."""
+        if not hasattr(self, "_act_map_import_png"):
+            return
+        editable = self._map_view_is_layer() and self._undo_stack is not None
+        for act in (self._act_map_import_png, self._act_map_import_c,
+                    self._act_map_import_p, self._act_map_import_s):
+            act.setEnabled(editable)
+
+    def _on_map_export_png(self) -> None:
+        if self._current_id is None:
+            return
+        if self._map_view_is_layer():
+            layer = self._active_map_layer()
+            self._ensure_layer_state(layer)
+            self._on_export_layer_png(layer)
+            return
+        # Composite view: render + export the A+B composite.
+        map_id = self._current_id
+        try:
+            comp = mapmod.render_map_from_file_table(
+                map_id, self._file_table, self._rom)
+        except (ValueError, KeyError) as exc:
+            QMessageBox.critical(self, "Export PNG", str(exc))
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export composite as PNG",
+            f"map_{map_id}_composite.png", "PNG image (*.png)")
+        if not path:
+            return
+        png = map_import.export_rgba_to_png_bytes(
+            bytes(comp.rgba), comp.width, comp.height)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(png)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export PNG", f"Couldn't write file:\n{exc}")
+
+    def _on_map_export_native(self) -> None:
+        if self._current_id is None:
+            return
+        layer = self._active_map_layer()
+        triple = self._layer_triple(layer)
+        folder = QFileDialog.getExistingDirectory(
+            self, "Export native files to folder")
+        if not folder:
+            return
+        wrote = []
+        for ext, path in triple.items():
+            if path in self._file_table:
+                data = self._session.map_file_bytes(path)
+                name = f"{self._current_id}{layer}.{ext}"
+                with open(os.path.join(folder, name), "wb") as fh:
+                    fh.write(data)
+                wrote.append(name)
+        QMessageBox.information(
+            self, "Export complete",
+            "Wrote:\n" + "\n".join(wrote) if wrote else "Nothing to write.")
+
+    def _on_map_import_native(self, ext: str) -> None:
+        if self._current_id is None or self._undo_stack is None:
+            return
+        layer = self._active_map_layer()
+        target = self._layer_triple(layer)[ext]
+        if target not in self._file_table:
+            QMessageBox.warning(
+                self, "No such component",
+                f"This map has no .{ext} for layer {layer.upper()}.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Import .{ext} for layer {layer.upper()}",
+            "", f"Map {ext} file (*.{ext} *.bin);;All files (*)")
+        if not path:
+            return
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        self._undo_stack.push(ReplaceMapFileCommand(
+            self._session, target, raw,
+            f"Import .{ext} → {target.rsplit('/', 1)[-1]}",
+            on_change=lambda l=layer: self._on_layer_png_replaced(l)))
+
+    def _build_layer_paint_tab(self, layer: str) -> Tuple[QScrollArea, QWidget]:
         """Porymap-style tilemap painter for one layer.
 
-        Layout: a slim toolbar (tool + zoom only) above a horizontal
-        splitter. The left side is the layer canvas in a QScrollArea
-        (zoom-aware, right-drag panning, Ctrl+wheel zoom). The right
-        column groups the *selected tile preview* (image + label +
-        H/V flip), the *palette bank* spinner, and the *tile picker*
-        — all the things the user manipulates to choose what gets
-        stamped — into one visually contiguous block.
+        Returns ``(canvas_scroll, controls)``: the layer canvas in a
+        QScrollArea (zoom-aware, right-drag panning, Ctrl+wheel zoom), and a
+        controls column grouping the *selected tile preview* (image + label +
+        H/V flip), the *palette bank* spinner, and the *tile picker*. The Map
+        tab stacks the canvases behind one shared right sidebar (View selector
+        + these controls), so the two aren't bundled into a private per-page
+        splitter anymore.
         """
         # Tile picker — clicking emits image-space coords; we map those
         # to a tile-grid index in :meth:`_on_picker_painted`.
@@ -593,7 +864,9 @@ class MapBrowser(QWidget):
         layer_canvas = PaintCanvas()
         layer_canvas.setText("Select a field map to preview.")
         layer_canvas.setAlignment(Qt.AlignCenter)
-        layer_canvas.setMinimumSize(512, 384)
+        # Floor kept small so the canvas scroll can shrink on small screens;
+        # the real size comes from the rendered pixmap after a map loads.
+        layer_canvas.setMinimumSize(160, 120)
         layer_canvas.setHoverEnabled(True)
         layer_canvas.painted.connect(
             lambda x, y, btns, mods, l=layer: self._on_tile_painted(l, x, y)
@@ -777,48 +1050,12 @@ class MapBrowser(QWidget):
         right_col_layout.addLayout(color_pick_row)
         right_col_layout.addWidget(picker_scroll, 1)
 
-        # Canvas on the left (stretches), preview+picker column on the right.
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(canvas_scroll)
-        splitter.addWidget(right_col)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-
-        # Bottom row: PNG round-trip buttons live outside the splitter so
-        # they don't fight the picker for horizontal space.
-        export_btn = QToolButton()
-        export_btn.setText("Export PNG")
-        export_btn.setToolTip(
-            "Save the current layer composite as a PNG. Round-tripping "
-            "is lossy: import quantizes colors and may merge near-identical "
-            "tiles to stay under the 1024-tile per-layer cap."
-        )
-        export_btn.clicked.connect(
-            lambda _checked=False, l=layer: self._on_export_layer_png(l)
-        )
-        import_btn = QToolButton()
-        import_btn.setText("Import PNG")
-        import_btn.setToolTip(
-            "Replace this layer's tileset, palette and tilemap from a "
-            "PNG of the same dimensions. The pipeline quantizes to "
-            "multi-bank 16-color palettes, dedups 8×8 tiles with flips, "
-            "and merges to ≤1024 unique tiles."
-        )
-        import_btn.clicked.connect(
-            lambda _checked=False, l=layer: self._on_import_layer_png(l)
-        )
-        bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(0, 0, 0, 0)
-        bottom_row.addStretch(1)
-        bottom_row.addWidget(export_btn)
-        bottom_row.addWidget(import_btn)
-
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-        page_layout.addWidget(splitter, 1)
-        page_layout.addLayout(bottom_row)
-
+        # Canvas and the preview+picker control column are returned separately
+        # so the Map tab can stack the canvases behind one shared right sidebar
+        # (View selector on top + the active layer's controls) rather than
+        # bundling a private sidebar per page. PNG/native round-trip lives in
+        # the shared footer's Import/Export dropdowns.
+        #
         # Stash widget refs per layer so event handlers can mutate them.
         setattr(self, f"_layer_{layer}_picker_canvas", picker_canvas)
         setattr(self, f"_layer_{layer}_picker_scroll", picker_scroll)
@@ -833,7 +1070,7 @@ class MapBrowser(QWidget):
         setattr(self, f"_layer_{layer}_preview_lbl", preview_lbl)
         setattr(self, f"_layer_{layer}_show_all_chk", show_all_chk)
         setattr(self, f"_layer_{layer}_filter_bank_chk", filter_bank_chk)
-        return page
+        return canvas_scroll, right_col
 
     def _build_walk_tab(self) -> QWidget:
         """Walkability tab: paint canvas (left) + tool sidebar (right).
@@ -1477,7 +1714,7 @@ class MapBrowser(QWidget):
         # bits. Also refresh metadata since blocked-% may have changed.
         if self._current_id is not None:
             self._update_metadata_and_tuples(self._current_id)
-        if self._tabs.currentIndex() == self._TAB_WALK:
+        if self._active_render_id() == self._TAB_WALK:
             self._refresh_active_tab()
 
     def _walk_paint_brush(self, cx: int, cy: int) -> None:
@@ -2196,7 +2433,7 @@ class MapBrowser(QWidget):
         )
         state.scaled_base_pixmap = None  # base_rgba replaced — drop cache
         tab_ix = self._TAB_LAYER_A if layer == "a" else self._TAB_LAYER_B
-        if self._tabs.currentIndex() == tab_ix:
+        if self._active_render_id() == tab_ix:
             self._refresh_layer_canvas(layer)
             # Filtered picker's set of (tile, bank) pairs depends on
             # entries[] — a stroke or undo may have added/removed pairs.
@@ -2314,7 +2551,7 @@ class MapBrowser(QWidget):
         """
         self._layer_state[layer] = None
         tab_ix = self._TAB_LAYER_A if layer == "a" else self._TAB_LAYER_B
-        if self._tabs.currentIndex() == tab_ix:
+        if self._active_render_id() == tab_ix:
             self._refresh_active_tab()
 
     def _paint_cell(self, layer: str, tx: int, ty: int, entry: int) -> None:
@@ -2696,7 +2933,7 @@ class MapBrowser(QWidget):
         # banks, walkability, .d tuples) is irrelevant there, so hide it.
         self._meta_footer.setVisible(
             self._tabs.currentIndex() not in (
-                self._TAB_CUTSCENES, self._TAB_ENCOUNTERS,
+                self._REAL_TAB_CUTSCENES, self._REAL_TAB_ENCOUNTERS,
             )
         )
         self._refresh_active_tab()
@@ -2714,15 +2951,19 @@ class MapBrowser(QWidget):
         has_events = (
             overlay5_mod.entry_ix_for_map(int(map_id)) is not None
         )
-        self._tabs.setTabEnabled(self._TAB_LAYER_B, has_b)
-        self._tabs.setTabEnabled(self._TAB_WALK, has_walk)
-        self._tabs.setTabEnabled(self._TAB_EVENTS, has_events)
+        # Layer B is a View radio inside the Map tab now, not a tab — grey it
+        # out when absent and fall the view back to Composite if it was live.
+        self._view_b.setEnabled(has_b)
+        if not has_b and self._view_b.isChecked():
+            self._view_comp.setChecked(True)  # fires _on_map_view_changed
+        self._tabs.setTabEnabled(self._REAL_TAB_WALK, has_walk)
+        self._tabs.setTabEnabled(self._REAL_TAB_EVENTS, has_events)
         # Cutscenes tab follows the same gating as Events — both source
         # their data from overlay5, no entry → nothing to browse.
-        self._tabs.setTabEnabled(self._TAB_CUTSCENES, has_events)
+        self._tabs.setTabEnabled(self._REAL_TAB_CUTSCENES, has_events)
         if not self._tabs.isTabEnabled(self._tabs.currentIndex()):
             self._tabs.blockSignals(True)
-            self._tabs.setCurrentIndex(self._TAB_LAYER_A)
+            self._tabs.setCurrentIndex(self._REAL_TAB_MAP)
             self._tabs.blockSignals(False)
 
     # ---- Render dispatch -------------------------------------------------
@@ -2730,7 +2971,7 @@ class MapBrowser(QWidget):
     def _refresh_active_tab(self) -> None:
         if self._current_id is None:
             return
-        ix = self._tabs.currentIndex()
+        ix = self._active_render_id()
         try:
             preview = self._render_for_tab(ix)
         except (ValueError, KeyError) as e:
@@ -2996,7 +3237,7 @@ class MapBrowser(QWidget):
         except ValueError:
             return
         self._list.select_index(row_ix)
-        self._tabs.setCurrentIndex(self._TAB_ENCOUNTERS)
+        self._tabs.setCurrentIndex(self._REAL_TAB_ENCOUNTERS)
 
     def navigate_to_cutscene_chain(self, map_id: int, chain_ix: int) -> None:
         """Public: open this browser at ``map_id`` on the Cutscenes tab,
@@ -3014,7 +3255,7 @@ class MapBrowser(QWidget):
         except ValueError:
             return
         self._list.select_index(row_ix)
-        self._tabs.setCurrentIndex(self._TAB_CUTSCENES)
+        self._tabs.setCurrentIndex(self._REAL_TAB_CUTSCENES)
         self._cutscenes_tab.select_chain_by_global_ix(chain_ix)
 
     def _refresh_cutscenes_tab(self) -> None:

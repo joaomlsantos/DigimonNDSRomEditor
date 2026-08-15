@@ -916,6 +916,7 @@ EVENT_KIND_CAMERA = "camera"        # CAMERA_PAN 0x40 / CAMERA_PAN_TO_XY 0xC2
 EVENT_KIND_ITEM = "item"            # GIVE_ITEM 0xB4 / REMOVE_ITEM 0xF1
 EVENT_KIND_MOVE = "move"            # MOVE_BEGIN 0x3C
 EVENT_KIND_CONTROL = "control"      # read-only flag/branch gating (0x2A/0x15/0x0F/…)
+EVENT_KIND_OPEN_SHOP = "open_shop"  # OPEN_SHOP 0xBB — NPC opens a town shop
 
 # `0e 00` is NOT reliably a SET_MUSIC opcode. The linear walk mis-syncs and
 # lands on stray `0e 00` byte pairs sitting mid-instruction (slot ids,
@@ -1048,6 +1049,14 @@ def iter_region_events_with_meta(
             ))
             seen_offsets.add(p)
             p += ITEM_BLOCK_SIZE
+            continue
+        if opcode == OPEN_SHOP_OPCODE and p + OPEN_SHOP_BLOCK_SIZE <= n:
+            events.append(RegionEvent(
+                rel=p, kind=EVENT_KIND_OPEN_SHOP,
+                payload=OpenShopBlock.from_bytes(entry, p),
+            ))
+            seen_offsets.add(p)
+            p += OPEN_SHOP_BLOCK_SIZE
             continue
         if opcode == MOVE_BEGIN_OPCODE and p + MOVE_BEGIN_BLOCK_SIZE <= n:
             events.append(RegionEvent(
@@ -1362,6 +1371,30 @@ class ItemBlock:
         if opcode not in (GIVE_ITEM_OPCODE, REMOVE_ITEM_OPCODE):
             raise ValueError(f"not a GIVE/REMOVE_ITEM block at 0x{off:04x}")
         return cls(block_offset=off, opcode=opcode, item=item)
+
+
+OPEN_SHOP_OPCODE = 0x00BB
+OPEN_SHOP_BLOCK_SIZE = 4
+
+
+@dataclass
+class OpenShopBlock:
+    """4-byte ``bb 00 [shop_id:u16]`` — an NPC opening a town shop menu.
+
+    ``shop_id`` is the opener id decoded by :mod:`digimon_core.shop`
+    (0-1 remodel · 2-9 farm · 10-17 equipment · 18-25 consumable); it
+    selects both which town's shop and its kind. Editing it reassigns the
+    shop this NPC opens — a plain same-length u16 rewrite of the id field.
+    """
+    block_offset: int
+    shop_id: int
+
+    @classmethod
+    def from_bytes(cls, entry: bytes, off: int) -> "OpenShopBlock":
+        opcode, shop_id = struct.unpack_from("<HH", entry, off)
+        if opcode != OPEN_SHOP_OPCODE:
+            raise ValueError(f"not an OPEN_SHOP block at 0x{off:04x}")
+        return cls(block_offset=off, shop_id=shop_id)
 
 
 MOVE_BEGIN_OPCODE = 0x003C
@@ -1724,6 +1757,18 @@ def find_overlay_fat_range(rom: bytes, overlay_id: int) -> Tuple[int, int]:
     return start, end
 
 
+# The field-script overlay (map events / cutscenes) is a different ARM9
+# overlay id per version but the exact same payload format — pointer table +
+# payload-relative entry offsets — so one parser serves both. Dusk keeps it at
+# overlay 5; Dawn's is overlay 4. Unknown versions fall back to Dusk's id.
+_SCRIPT_OVERLAY_ID = {"DUSK_US": 5, "DAWN_US": 4}
+
+
+def script_overlay_id(version: str) -> int:
+    """ARM9 overlay id of the field-script overlay for ``version``."""
+    return _SCRIPT_OVERLAY_ID.get(version, 5)
+
+
 # ---- index over an overlay's entries -------------------------------------
 
 
@@ -1772,14 +1817,17 @@ class Overlay5Index:
     @classmethod
     def from_file_table(
         cls, file_table: "fnt.FileTable", rom: bytes,
+        version: str = "DUSK_US",
     ) -> "Overlay5Index":
         # FileTable currently has no entry for overlays (they live
         # outside the FNT tree), so resolve via the ARM9 overlay table
         # directly. ``file_table`` is kept on the signature for symmetry
         # with btmap/map call sites — useful when overlay-relocation
-        # ever lands.
+        # ever lands. ``version`` picks the script overlay id (Dusk 5 /
+        # Dawn 4); same payload format either way.
         del file_table  # unused; signature is symmetric with map/btmap
-        start, end = find_overlay_fat_range(rom, overlay_id=5)
+        start, end = find_overlay_fat_range(
+            rom, overlay_id=script_overlay_id(version))
         return cls.from_bytes(bytes(rom[start:end]))
 
     def entry_count(self) -> int:
