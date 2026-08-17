@@ -422,7 +422,7 @@ def render_cell_rgba(
 
     n_tiles = len(tile_bytes) // BYTES_PER_TILE_8BPP
 
-    for o in cell.oams:
+    for o in ncer_mod.oams_back_to_front(cell):
         first_tile = (o.tile * boundary_bytes) // BYTES_PER_TILE_8BPP
         ox = o.x - xmin + pad
         oy = o.y - ymin + pad
@@ -496,7 +496,7 @@ def render_cell_indexed(
     if w <= 0 or h <= 0:
         return bytes(buf)
     n_tiles = len(tile_bytes) // BYTES_PER_TILE_8BPP
-    for o in cell.oams:
+    for o in ncer_mod.oams_back_to_front(cell):
         first_tile = (o.tile * boundary_bytes) // BYTES_PER_TILE_8BPP
         ox = o.x - x_origin
         oy = o.y - y_origin
@@ -524,6 +524,165 @@ def render_cell_indexed(
                         if 0 <= dx < w:
                             buf[drow + dx] = pi
     return bytes(buf)
+
+
+@dataclass(frozen=True)
+class OamBox:
+    """One OBJ in a cell's OAM cover: its position/size plus footprint cost and
+    how much real (opaque) art it holds — the inputs for an OAM-map view."""
+    x: int
+    y: int
+    w: int
+    h: int
+    tile_col: int          # grid column of the OBJ's top-left on the shared canvas
+    tile_row: int
+    slots: int             # tile slots it consumes (ceil(area_tiles / slot_tiles))
+    opaque_tiles: int      # tiles inside it that some frame actually draws
+    fill: float            # opaque_tiles / area_tiles (1.0 = solid, 0 = empty)
+
+
+@dataclass(frozen=True)
+class OamCoverAnalysis:
+    """Footprint breakdown of a sprite's editable OAM cover, for the OAM map."""
+    origin: Tuple[int, int]     # (x, y) of the shared canvas top-left in OAM coords
+    size: Tuple[int, int]       # (w, h) px of the shared canvas
+    boxes: List["OamBox"]       # a shared, tile-aligned cover of the union
+    fs: int                     # tiles/cell of THIS cover (what Apply produces)
+    total_slots: int
+    n_oams: int
+    slot_tiles: int             # tiles per slot (boundary_bytes / 64)
+    stored_fs: int              # the sprite's current on-disk tiles/cell
+
+
+# Cover thresholds tried by the OAM map, keeping the smallest footprint (mirrors
+# btchrspr._COVER_THRESHOLDS; kept local to avoid a btchr→btchrspr import cycle).
+_MAP_COVER_THRESHOLDS = (0.5, 0.6, 0.7, 0.75, 0.8)
+
+
+def _stored_cover_editable(cells, xo, yo, gc, gr, union, fs_slots) -> bool:
+    """True when the sprite's stored OAMs are already a directly-editable cover:
+    every cell shares cell 0's structure (shapes + tile-order), cell 0 sits on
+    the 8px grid, and it covers the union. Then the map shows the real layout and
+    re-opening the editor preserves it; otherwise (per-frame positions / off-grid
+    vanilla art) the map synthesises a fresh shared cover instead."""
+    c0 = cells[0].oams
+    if not c0:
+        return False
+    if any((o.x - xo) % 8 or (o.y - yo) % 8 for o in c0):
+        return False
+    ref = [(o.w, o.h, o.tile) for o in c0]
+    for i, c in enumerate(cells):
+        if [(o.w, o.h, o.tile - i * fs_slots) for o in c.oams] != ref:
+            return False
+    covered = set()
+    for o in c0:
+        tc, tr = (o.x - xo) // 8, (o.y - yo) // 8
+        for j in range(o.h // 8):
+            for k in range(o.w // 8):
+                covered.add((tc + k, tr + j))
+    return all(
+        (tx, ty) in covered
+        for ty in range(gr) for tx in range(gc) if union[ty][tx]
+    )
+
+
+def analyze_oam_cover(ncer, tile_bytes: bytes) -> "OamCoverAnalysis":
+    """Build a **shared, tile-aligned cover of the union of every frame** and
+    break it into per-OBJ footprint + art-fill, for the OAM map / manual editor.
+
+    Crucially this is NOT cell 0's raw OAMs: vanilla / freshly-imported sprites
+    use per-frame OAM positions and off-grid placements, so cell 0's layout
+    neither covers the union nor sits on the 8px grid — which made the read-only
+    map and the tile-based editor disagree. Instead this covers the union the
+    same way the compressor / manual rebuild do (:func:`ncer.cover_occupied_tiles`
+    over :func:`ncer.union_tile_mask`, smallest fs across boundary × threshold),
+    so the map, the editor, and Apply all show the exact same thing. ``fs`` is
+    this cover's tiles/cell (== what Apply produces); ``stored_fs`` is the
+    sprite's current on-disk footprint (they differ when a per-frame sprite is
+    re-laid as one shared layout). See project memory ``project_oam_compression``."""
+    cells = ncer.cells
+    default_st = max(1, ncer.boundary_bytes // BYTES_PER_TILE_8BPP)
+    stored_fs = derived_footprint_scale(
+        len(tile_bytes) // BYTES_PER_TILE_8BPP, len(cells)
+    )
+    if not cells:
+        return OamCoverAnalysis((0, 0), (8, 8), [], 0, 0, 0, default_st, stored_fs)
+    xo, yo, w, h = cells_union_canvas(cells)
+    gc, gr = w // 8, h // 8
+    cell_indexed = [
+        render_cell_indexed(c, tile_bytes, w, h, xo, yo, ncer.boundary_bytes)
+        for c in cells
+    ]
+    union, *_ = ncer_mod.union_tile_mask(cell_indexed, [(w, h)] * len(cells), 1)
+
+    # Fast path: if the stored OAMs are already a shared, aligned, covering layout
+    # (compressed / hand-tuned / previously-applied sprites), show THEM — so the
+    # map reflects the real layout and re-opening the editor keeps the user's work.
+    fs_slots = stored_fs // default_st if default_st else 0
+    if _stored_cover_editable(cells, xo, yo, gc, gr, union, fs_slots):
+        boxes: List[OamBox] = []
+        total_slots = 0
+        for o in cells[0].oams:
+            tw, th = o.w // 8, o.h // 8
+            area = tw * th
+            slots = (area + default_st - 1) // default_st
+            total_slots += slots
+            tc, tr = (o.x - xo) // 8, (o.y - yo) // 8
+            opq = sum(
+                1 for j in range(th) for k in range(tw)
+                if 0 <= tc + k < gc and 0 <= tr + j < gr and union[tr + j][tc + k]
+            )
+            boxes.append(OamBox(o.x, o.y, o.w, o.h, tc, tr, slots, opq,
+                                opq / area if area else 0.0))
+        return OamCoverAnalysis((xo, yo), (w, h), boxes, stored_fs, total_slots,
+                                len(boxes), default_st, stored_fs)
+
+    max_anchor_col = max(0, min(gc - 1, (255 - xo) // 8))
+    max_anchor_row = max(0, min(gr - 1, (127 - yo) // 8))
+    best = None  # (fs, st, rects) — smallest footprint that fits the tile field
+    for boundary in (NCER_BOUNDARY_BYTES_DEFAULT, 256):
+        st_ = max(1, boundary // BYTES_PER_TILE_8BPP)
+        for thr in _MAP_COVER_THRESHOLDS:
+            try:
+                rects = ncer_mod.cover_occupied_tiles(
+                    union, gc, gr, thr,
+                    max_anchor_col=max_anchor_col, max_anchor_row=max_anchor_row,
+                )
+            except ValueError:
+                continue  # content past the OAM range at this cover — try another
+            fs_slots = ncer_mod.rects_fs_slots(rects, st_)
+            if len(cells) * fs_slots - 1 > 0x3FF or len(rects) > 128:
+                continue
+            fs_ = fs_slots * st_
+            if best is None or fs_ < best[0]:
+                best = (fs_, st_, rects)
+        if best is not None:
+            break
+    if best is None:
+        # Uncoverable within limits (giant boss) — fall back to the sprite's own
+        # boundary and coarsest cover so the map still shows something.
+        rects = ncer_mod.cover_occupied_tiles(
+            union, gc, gr, 0.5,
+            max_anchor_col=max_anchor_col, max_anchor_row=max_anchor_row,
+        )
+        best = (ncer_mod.rects_fs_slots(rects, default_st) * default_st,
+                default_st, rects)
+    fs, st, rects = best
+
+    boxes: List[OamBox] = []
+    total_slots = 0
+    for tx, ty, ow, oh in rects:
+        area = ow * oh
+        slots = (area + st - 1) // st
+        total_slots += slots
+        opq = sum(
+            1 for j in range(oh) for k in range(ow)
+            if 0 <= tx + k < gc and 0 <= ty + j < gr and union[ty + j][tx + k]
+        )
+        boxes.append(OamBox(xo + tx * 8, yo + ty * 8, ow * 8, oh * 8, tx, ty,
+                            slots, opq, opq / area if area else 0.0))
+    return OamCoverAnalysis((xo, yo), (w, h), boxes, fs, total_slots,
+                            len(rects), st, stored_fs)
 
 
 def flatten_anim_track(track: List[AnimStep]) -> List[Tuple[int, int]]:

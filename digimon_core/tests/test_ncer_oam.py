@@ -353,5 +353,28 @@ class BuildKitTests(unittest.TestCase):
             )
 
 
+class OamDrawOrderTests(unittest.TestCase):
+    def _oam(self, tile, prio):
+        return ncer.Oam(x=0, y=0, w=8, h=8, tile=tile, is8bpp=False,
+                        hflip=False, vflip=False, pal=0, prio=prio)
+
+    def test_equal_priority_paints_lowest_index_last(self):
+        # SPR 0x0256 shape: front content (OAM 0-1) precedes its fill (2-5).
+        # Back-to-front paint order must end with OAM 0 so it lands on top.
+        cell = ncer.Cell([self._oam(t, 0) for t in range(6)])
+        order = [o.tile for o in ncer.oams_back_to_front(cell)]
+        self.assertEqual(order, [5, 4, 3, 2, 1, 0])
+
+    def test_priority_field_is_the_coarse_key(self):
+        # Higher prio number = further back = painted first, regardless of index.
+        cell = ncer.Cell([
+            self._oam(tile=10, prio=0),   # front
+            self._oam(tile=11, prio=3),   # backmost
+            self._oam(tile=12, prio=1),
+        ])
+        order = [o.tile for o in ncer.oams_back_to_front(cell)]
+        self.assertEqual(order, [11, 12, 10])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from editor.main_window import MainWindow  # noqa: E402
 from editor.prefs import configure_storage  # noqa: E402
+from editor.runtime import set_admin  # noqa: E402
 
 
 def _resource_path(relative: str) -> str:
@@ -28,6 +29,10 @@ def _resource_path(relative: str) -> str:
 
 
 def main() -> int:
+    # Admin mode unlocks power-user tools (see editor.runtime). Read it before
+    # any widget is built; --admin is a plain flag Qt ignores, so it's safe to
+    # leave in sys.argv passed to QApplication.
+    set_admin("--admin" in sys.argv)
     # Resolve the ini location before any prefs() consumer runs.
     configure_storage()
     app = QApplication(sys.argv)

@@ -19,7 +19,9 @@ import struct
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QUndoStack, qRgba
+from PySide6.QtGui import (
+    QColor, QFont, QImage, QPainter, QPen, QPixmap, QUndoStack, qRgba,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -46,6 +48,7 @@ from PySide6.QtWidgets import (
 
 from digimon_core import btchr, btchrspr, fnt, mchr, ncer as ncer_mod, pak, sprite
 
+from ..runtime import is_admin
 from ..commands import (
     AppendBtchrGroupCommand,
     PortBtchrSpriteCommand,
@@ -56,6 +59,8 @@ from ._png_palette import (
     intensity_matched_palette,
     nearest_idx_opaque,
 )
+from . import oam_edit_canvas
+from .frame_align_canvas import FrameAlignCanvas
 from .collapsible import CollapsibleSection
 from .palette_batch_adjuster import PaletteBatchAdjuster
 from .palette_editor import PaletteEditor
@@ -303,6 +308,8 @@ class BtchrBrowser(QWidget):
         # Sheet preview is lazy — `setPixel` x ~120k tiles is slow in
         # Python, so only re-render when the user actually views the tab.
         self._sheet_dirty: bool = True
+        # OAM map is likewise lazy (per-pixel union render).
+        self._oam_dirty: bool = True
 
         # Preview source caches for the transparent-colour picker. The
         # picker reads these via the bound source-provider callbacks on
@@ -582,9 +589,9 @@ class BtchrBrowser(QWidget):
             "Import one PNG per cell and rebuild the sprite with a freshly "
             "generated OAM layout sized to each image (not limited to the "
             "current sprite's shape). Cells share one concatenated tile bank; "
-            "the tpf / btchrsize sidecars are recomputed. Larger sprites can "
-            "exceed the tile budget — you'll be warned (they may glitch in "
-            "multi-sprite screens)."
+            "the tpf / btchrsize sidecars are recomputed. Sprites over 512 "
+            "tiles/cell garble everywhere (party viewer, gallery, battles) — "
+            "you'll be warned."
         ))
         self._import_custom_cells_btn.clicked.connect(self._on_import_custom_cells)
 
@@ -674,6 +681,9 @@ class BtchrBrowser(QWidget):
             ".btchrspr (portable sprite kit)…", self._on_export_btchrspr)
         # Raw Nitro components in a submenu so the top menu stays short.
         export_src = self._export_menu.addMenu("Source files (NCGR/NCLR/…)")
+        export_src.addAction(
+            "All components (to a folder)…", self._on_export_all_sources)
+        export_src.addSeparator()
         for _i, _name, _ext in self._SOURCE_COMPONENTS:
             export_src.addAction(
                 f"{_name}…",
@@ -941,6 +951,41 @@ class BtchrBrowser(QWidget):
         cells_left_layout.setContentsMargins(0, 0, 0, 0)
         cells_left_layout.addWidget(self._scroll, 1)
 
+        # Move-frame (drag): translate one frame to align it with the others,
+        # keeping its OAM structure — shrinks the shared footprint so a following
+        # Compress OAM re-covers smaller. Swaps in over the preview when on.
+        self._align_canvas = FrameAlignCanvas()
+        self._align_canvas.committed.connect(self._on_align_committed)
+        self._align_canvas.footprint.connect(self._on_align_footprint)
+        self._align_scroll = QScrollArea()
+        self._align_scroll.setWidgetResizable(False)
+        self._align_scroll.setWidget(self._align_canvas)
+        self._align_scroll.setVisible(False)
+        cells_left_layout.addWidget(self._align_scroll, 1)
+
+        move_row = QHBoxLayout()
+        self._move_frame_cb = QCheckBox("Move frame (drag)")
+        self._move_frame_cb.setToolTip(wrap_tooltip(
+            "Drag a frame to line its content up with the others (shown as faint "
+            "ghosts), keeping the OAM structure exactly. Aligning the frames "
+            "shrinks the shared footprint — the live count shows it dropping — so "
+            "Compress OAM can then re-cover into a smaller layout."
+        ))
+        self._move_frame_cb.toggled.connect(self._on_move_frame_toggled)
+        move_row.addWidget(self._move_frame_cb)
+        move_row.addWidget(QLabel("Frame:"))
+        self._move_frame_combo = QComboBox()
+        self._move_frame_combo.setVisible(False)
+        self._move_frame_combo.currentIndexChanged.connect(
+            lambda i: self._align_canvas.set_current(i) if i >= 0 else None
+        )
+        move_row.addWidget(self._move_frame_combo)
+        move_row.addStretch(1)
+        self._move_footprint_label = QLabel()
+        self._move_footprint_label.setVisible(False)
+        move_row.addWidget(self._move_footprint_label)
+        cells_left_layout.addLayout(move_row)
+
         # Frame offsets: each cell's on-screen position, editable. The
         # position of a frame is baked into all its OAM x/y (no dedicated
         # pivot field — see project memory), so shifting a frame moves
@@ -1034,9 +1079,74 @@ class BtchrBrowser(QWidget):
         self._picker.bind_preview(self._preview, self._cells_source)
         self._picker.bind_preview(self._sheet_preview, self._sheet_source)
 
+        # ---- OAM map tab: the sprite with its OAM cover overlaid, each OBJ
+        # coloured by how much real art it holds (red = mostly empty → a whole
+        # tile slot cheap to reclaim; green = solid → essential) and labelled
+        # with the tiles it costs. Reads the live decode, so it reflects edits
+        # before they're saved. "Edit OAM" turns it into a hand-drawn cover.
+        oam_tab = QWidget()
+        oam_layout = QVBoxLayout(oam_tab)
+        oam_layout.setContentsMargins(8, 8, 8, 8)
+
+        oam_ctrl = QHBoxLayout()
+        self._oam_edit_cb = QCheckBox("Edit OAM")
+        self._oam_edit_cb.setToolTip(
+            "Draw the OAM cover by hand: left-click to place the chosen shape, "
+            "click a box to select + drag to move, right-click / Delete to remove. "
+            "Red tiles are art no OBJ covers (it would vanish). Apply re-lays the "
+            "sprite through the same rebuild the auto-compressor uses."
+        )
+        self._oam_edit_cb.toggled.connect(self._on_oam_edit_toggled)
+        oam_ctrl.addWidget(self._oam_edit_cb)
+        self._oam_shape_label = QLabel("Shape:")
+        self._oam_shape_combo = QComboBox()
+        for _tw, _th in oam_edit_canvas.LEGAL_SHAPES:
+            self._oam_shape_combo.addItem(f"{_tw * 8}×{_th * 8}", (_tw, _th))
+        self._oam_shape_combo.setCurrentIndex(
+            next(i for i, (a, b) in enumerate(oam_edit_canvas.LEGAL_SHAPES)
+                 if (a, b) == (2, 2))  # default 16×16
+        )
+        self._oam_shape_combo.currentIndexChanged.connect(self._on_oam_shape_changed)
+        oam_ctrl.addWidget(self._oam_shape_label)
+        oam_ctrl.addWidget(self._oam_shape_combo)
+        oam_ctrl.addStretch(1)
+        self._oam_reset_btn = QPushButton("Reset")
+        self._oam_reset_btn.setToolTip("Restore the current stored OAM layout.")
+        self._oam_reset_btn.clicked.connect(self._seed_oam_editor)
+        self._oam_apply_btn = QPushButton("Apply")
+        self._oam_apply_btn.clicked.connect(self._on_oam_apply)
+        oam_ctrl.addWidget(self._oam_reset_btn)
+        oam_ctrl.addWidget(self._oam_apply_btn)
+        oam_layout.addLayout(oam_ctrl)
+
+        self._oam_stats_label = QLabel()
+        self._oam_stats_label.setTextFormat(Qt.RichText)
+        self._oam_stats_label.setWordWrap(True)
+        oam_layout.addWidget(self._oam_stats_label)
+
+        self._oam_map_label = QLabel("Select a sprite.")
+        self._oam_map_label.setAlignment(Qt.AlignCenter)
+        self._oam_scroll = QScrollArea()
+        self._oam_scroll.setWidgetResizable(True)
+        self._oam_scroll.setWidget(self._oam_map_label)
+        oam_layout.addWidget(self._oam_scroll, 1)
+
+        self._oam_edit_canvas = oam_edit_canvas.OamEditCanvas()
+        self._oam_edit_canvas.changed.connect(self._on_oam_canvas_changed)
+        self._oam_edit_scroll = QScrollArea()
+        self._oam_edit_scroll.setWidgetResizable(False)
+        self._oam_edit_scroll.setWidget(self._oam_edit_canvas)
+        self._oam_edit_scroll.setVisible(False)
+        oam_layout.addWidget(self._oam_edit_scroll, 1)
+        self._oam_edit_origin: Tuple[int, int] = (0, 0)
+        for _w in (self._oam_shape_label, self._oam_shape_combo,
+                   self._oam_reset_btn, self._oam_apply_btn):
+            _w.setVisible(False)
+
         self._tabs = QTabWidget()
         self._tabs.addTab(cells_tab, "Cells")
         self._tabs.addTab(sheet_tab, "Tile sheet")
+        self._oam_tab_index = self._tabs.addTab(oam_tab, "OAM map")
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         # Import/export buttons stay visible regardless of the active tab
@@ -1044,10 +1154,14 @@ class BtchrBrowser(QWidget):
         # action. Every format/mode now lives inside the two "as…" dropdown
         # menus; the standalone actions (compress, duplicate) sit in a second
         # column. All buttons pinned to the widest label.
-        vis_btns = (
+        vis_btns = [
             self._import_as_btn, self._export_as_btn,
             self._compress_oam_btn, self._duplicate_entry_btn,
-        )
+        ]
+        # Admin-only (--admin): expose the lossy fit-≤512 trim beside Compress
+        # OAM. Hidden by default (it drops real edge pixels); see editor.runtime.
+        if is_admin():
+            vis_btns.append(self._compress_oam_fit_btn)
         # Pin all four to one width so they read as an aligned group. Target the
         # width the dropdowns naturally take under the checkbox column (the
         # widest sizeHint among the buttons *and* the two checkboxes) so nothing
@@ -1074,6 +1188,12 @@ class BtchrBrowser(QWidget):
         per_cell_col = QVBoxLayout()
         per_cell_col.setSpacing(4)
         per_cell_col.addWidget(self._compress_oam_btn)
+        # The fit-≤512 button is superseded/hidden by default (added to the
+        # _superseded list above). Under --admin, un-hide it here — addWidget
+        # reparents it out of that hidden state, and setVisible re-shows it.
+        if is_admin():
+            self._compress_oam_fit_btn.setVisible(True)
+            per_cell_col.addWidget(self._compress_oam_fit_btn)
         per_cell_col.addWidget(self._duplicate_entry_btn)
         per_cell_col.addStretch(1)
 
@@ -1319,10 +1439,12 @@ class BtchrBrowser(QWidget):
         self._update_view_mode_controls()
 
         self._sheet_dirty = True
+        self._oam_dirty = True
         self._refresh_preview()
         if self._tabs.currentIndex() == 1:
             self._refresh_sheet_preview()
             self._sheet_dirty = False
+        self._refresh_oam_tab_if_active()
         self._picker.set_current_color(self._current_decoded.palette[0])
         # Selection swap implicitly stops playback — the new digimon
         # has different cell/track indices so blind continuation would
@@ -1331,6 +1453,8 @@ class BtchrBrowser(QWidget):
         self._refresh_anim_table()
         self._rebuild_frame_offset_rows()
         self._load_frame_offsets()
+        if getattr(self, "_move_frame_cb", None) and self._move_frame_cb.isChecked():
+            self._rebuild_align_data()
 
     def _on_cell_changed(self, value: int) -> None:
         self._current_cell = value
@@ -1453,6 +1577,73 @@ class BtchrBrowser(QWidget):
             self._undo_stack.push(cmd)
         else:
             cmd.redo()
+
+    # ---- move-frame (drag alignment) -----------------------------------
+
+    def _on_move_frame_toggled(self, on: bool) -> None:
+        self._move_frame_combo.setVisible(on)
+        self._move_footprint_label.setVisible(on)
+        self._scroll.setVisible(not on)
+        self._align_scroll.setVisible(on)
+        if on:
+            self._rebuild_align_data()
+
+    def _rebuild_align_data(self) -> None:
+        """Render every frame onto the shared canvas + its tile occupancy and
+        hand them to the drag canvas. Called on toggle-on and after each move."""
+        d = self._current_decoded
+        if d is None or not d.ncer.cells:
+            return
+        cells = d.ncer.cells
+        xo, yo, w, h = btchr.cells_union_canvas(cells)
+        gc, gr = w // 8, h // 8
+        pal = d.palette
+        imgs: List[QImage] = []
+        occ: List[List[List[bool]]] = []
+        for c in cells:
+            idx = btchr.render_cell_indexed(
+                c, d.tile_bytes, w, h, xo, yo, d.ncer.boundary_bytes
+            )
+            buf = bytearray(w * h * 4)
+            m = [[False] * gc for _ in range(gr)]
+            for y in range(h):
+                base = y * w
+                for x in range(w):
+                    v = idx[base + x]
+                    if v:
+                        r, g, b = pal[v]
+                        o = (base + x) * 4
+                        buf[o] = r; buf[o + 1] = g; buf[o + 2] = b; buf[o + 3] = 255
+                        m[y // 8][x // 8] = True
+            imgs.append(QImage(bytes(buf), w, h, QImage.Format_RGBA8888).copy())
+            occ.append(m)
+        cur = max(0, min(self._current_cell, len(cells) - 1))
+        self._move_frame_combo.blockSignals(True)
+        self._move_frame_combo.clear()
+        for i in range(len(cells)):
+            self._move_frame_combo.addItem(f"Frame {i}", i)
+        self._move_frame_combo.setCurrentIndex(cur)
+        self._move_frame_combo.blockSignals(False)
+        self._align_canvas.set_data(imgs, occ, gc, gr, cur)
+
+    def _on_align_footprint(self, n_tiles: int) -> None:
+        self._move_footprint_label.setText(
+            f"footprint: <b>{n_tiles}</b> tiles (aligned union) — "
+            "lower is smaller after Compress"
+        )
+        self._move_footprint_label.setTextFormat(Qt.RichText)
+
+    def _on_align_committed(self, cell_idx: int, dx: int, dy: int) -> None:
+        if self._current_group is None:
+            return
+        # _push_cell_shift → _refresh_after_pak_change re-decodes and (in move
+        # mode) re-seeds the canvas, so it shows the committed positions — or
+        # snaps back if the move was rejected as out of range.
+        self._push_cell_shift(
+            cell_idx, dx, dy,
+            description=f"Align BTCHR 0x{self._current_group:04x} frame {cell_idx} "
+                       f"(dx={dx}, dy={dy})",
+        )
 
     def _on_show_all_toggled(self, checked: bool) -> None:
         self._cell_spin.setEnabled(not checked)
@@ -1855,6 +2046,242 @@ class BtchrBrowser(QWidget):
         self._sheet_src_size = (pm.width(), pm.height())
         self._sheet_pix_size = (scaled.width(), scaled.height())
 
+    # ---- OAM map --------------------------------------------------------
+
+    _OAM_MAP_ZOOM = 3
+
+    @staticmethod
+    def _fill_qcolor(frac: float) -> QColor:
+        """Art-fill → colour: red (empty, cheap to cut) → amber → green (solid).
+        Saturated so it reads on white ground and on the dark sprite alike."""
+        if frac < 0.5:
+            t = frac / 0.5
+            return QColor(220, int(45 + 120 * t), 35)
+        t = (frac - 0.5) / 0.5
+        return QColor(int(215 - 180 * t), 160, int(20 + 70 * t))
+
+    def _oam_union_qimage(self, xo: int, yo: int, w: int, h: int) -> QImage:
+        """Union render of all frames on the shared canvas, gamma-lifted (the
+        demon sprites are near-black) onto a white ground so the OAM overlay
+        reads. A tile shows the first frame that draws it."""
+        d = self._current_decoded
+        boundary = d.ncer.boundary_bytes
+        pal = d.palette
+        lut = [int(255 * (i / 255.0) ** 0.5) for i in range(256)]
+        imgs = [
+            btchr.render_cell_indexed(c, d.tile_bytes, w, h, xo, yo, boundary)
+            for c in d.ncer.cells
+        ]
+        buf = bytearray(b"\xfa\xf7\xf7\xff" * (w * h))  # white BGRA ground
+        for i in range(w * h):
+            for cb in imgs:
+                v = cb[i]
+                if v:
+                    r, g, b = pal[v]
+                    o = i * 4
+                    buf[o] = lut[b]; buf[o + 1] = lut[g]; buf[o + 2] = lut[r]
+                    break
+        return QImage(bytes(buf), w, h, QImage.Format_RGB32).copy()
+
+    def _refresh_oam_map(self) -> None:
+        if self._current_decoded is None or not self._current_decoded.ncer.cells:
+            self._oam_map_label.setText("Select a sprite.")
+            self._oam_stats_label.setText("")
+            return
+        an = btchr.analyze_oam_cover(
+            self._current_decoded.ncer, self._current_decoded.tile_bytes
+        )
+        xo, yo = an.origin
+        w, h = an.size
+        z = self._OAM_MAP_ZOOM
+        img = self._oam_union_qimage(xo, yo, w, h).scaled(
+            w * z, h * z, Qt.IgnoreAspectRatio, Qt.FastTransformation
+        )
+        p = QPainter(img)
+        p.setPen(QPen(QColor(70, 70, 90, 45)))  # faint tile grid
+        for gx in range(0, w + 1, 8):
+            p.drawLine(gx * z, 0, gx * z, h * z)
+        for gy in range(0, h + 1, 8):
+            p.drawLine(0, gy * z, w * z, gy * z)
+        font = QFont(); font.setPixelSize(11); font.setBold(True)
+        p.setFont(font)
+        for b in an.boxes:
+            col = self._fill_qcolor(b.fill)
+            x0, y0 = (b.x - xo) * z, (b.y - yo) * z
+            pen = QPen(col); pen.setWidth(2)
+            p.setPen(pen); p.setBrush(Qt.NoBrush)
+            p.drawRect(x0, y0, b.w * z - 1, b.h * z - 1)
+            # Label the *tiles* it costs (slots × stride) so the numbers sum to
+            # fs — a "4" on a tiny 8×8 box makes its 3-tile waste obvious.
+            lbl = str(b.slots * an.slot_tiles)
+            p.fillRect(x0 + 2, y0 + 2, 7 * len(lbl) + 5, 14, QColor(0, 0, 0, 150))
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(x0 + 4, y0 + 13, lbl)
+        p.end()
+        self._oam_map_label.setPixmap(QPixmap.fromImage(img))
+        self._oam_map_label.adjustSize()
+
+        cap = btchrspr.PARTY_VIEWER_TPF_CAP
+        over = an.fs - cap
+        verdict = (
+            f"<span style='color:#e46b73'>over the {cap} party cap by {over}</span>"
+            if over > 0 else
+            f"<span style='color:#57c489'>{-over} under the {cap} cap</span>"
+        )
+        oam_warn = " ⚠ over 128" if an.n_oams > 128 else ""
+        # This cover re-lays every frame into ONE shared layout. When the sprite
+        # stores per-frame OAM positions, that shared layout can cost more than
+        # its current footprint — flag it so the number isn't a surprise.
+        stored_note = ""
+        if an.stored_fs != an.fs:
+            grew = an.fs > an.stored_fs
+            stored_note = (
+                f"<br><span style='color:{'#e2a54b' if grew else '#999'}'>"
+                f"stored fs {an.stored_fs} — this sprite uses per-frame OAM "
+                f"layouts; shown as one shared cover ({an.fs})"
+                + (", which costs more (per-frame positions can't be kept here)"
+                   if grew else "") + ".</span>"
+            )
+        self._oam_stats_label.setText(
+            f"<b>fs {an.fs}</b> tiles/cell &nbsp;·&nbsp; {an.total_slots} slots "
+            f"× {an.slot_tiles} &nbsp;·&nbsp; {an.n_oams} OBJs{oam_warn} "
+            f"&nbsp;·&nbsp; {verdict}<br>"
+            "<span style='color:#999'>box colour = art fill "
+            "(<span style='color:#dc4823'>red = mostly empty, cheap to cut</span> · "
+            "<span style='color:#57a030'>green = solid, essential</span>) · "
+            f"number = tiles it costs (they sum to fs {an.fs}; each OBJ rounds up "
+            f"to a {an.slot_tiles}-tile slot) · cut a red OBJ's art in every frame "
+            "to reclaim its tiles</span>" + stored_note
+        )
+
+    # ---- manual OAM editor ---------------------------------------------
+
+    def _refresh_oam_tab_if_active(self) -> None:
+        """After the sprite changed (select / pak edit): if the OAM tab is open,
+        re-seed the editor (edit mode) or re-render the map (view mode)."""
+        if self._tabs.currentIndex() != getattr(self, "_oam_tab_index", -1):
+            return
+        if getattr(self, "_oam_edit_cb", None) and self._oam_edit_cb.isChecked():
+            self._seed_oam_editor()
+        else:
+            self._refresh_oam_map()
+            self._oam_dirty = False
+
+    def _on_oam_shape_changed(self, _idx: int) -> None:
+        tw, th = self._oam_shape_combo.currentData()
+        self._oam_edit_canvas.set_shape(tw, th)
+
+    def _on_oam_edit_toggled(self, on: bool) -> None:
+        for w in (self._oam_shape_label, self._oam_shape_combo,
+                  self._oam_reset_btn, self._oam_apply_btn):
+            w.setVisible(on)
+        self._oam_scroll.setVisible(not on)
+        self._oam_edit_scroll.setVisible(on)
+        if on:
+            self._seed_oam_editor()
+        else:
+            # back to the read-only map (reflects any applied change)
+            self._oam_dirty = True
+            self._refresh_oam_map()
+            self._oam_dirty = False
+
+    def _seed_oam_editor(self) -> None:
+        """Load the canvas from the current sprite's stored OAM cover, so editing
+        starts from what's there rather than a blank grid."""
+        d = self._current_decoded
+        if d is None or not d.ncer.cells:
+            return
+        an = btchr.analyze_oam_cover(d.ncer, d.tile_bytes)
+        xo, yo = an.origin
+        w, h = an.size
+        self._oam_edit_origin = (xo, yo)
+        base = self._oam_union_qimage(xo, yo, w, h)
+        cell_indexed = [
+            btchr.render_cell_indexed(c, d.tile_bytes, w, h, xo, yo, d.ncer.boundary_bytes)
+            for c in d.ncer.cells
+        ]
+        union, *_ = ncer_mod.union_tile_mask(
+            cell_indexed, [(w, h)] * len(d.ncer.cells), 1
+        )
+        rects = [(b.tile_col, b.tile_row, b.w // 8, b.h // 8) for b in an.boxes]
+        self._oam_edit_canvas.set_data(
+            base, w // 8, h // 8, union, (xo, yo), rects, slot_tiles=an.slot_tiles
+        )
+        self._on_oam_canvas_changed()
+
+    def _on_oam_canvas_changed(self) -> None:
+        d = self._current_decoded
+        if d is None:
+            return
+        rects = self._oam_edit_canvas.rects()
+        n_cells = len(d.ncer.cells)
+        st = ncer_mod.manual_layout_stats(rects, n_cells, *self._oam_edit_origin)
+        uncovered = self._oam_edit_canvas.uncovered_count()
+        cap = btchrspr.PARTY_VIEWER_TPF_CAP
+        fs = st["fs"]
+        # Coverage no longer blocks Apply — uncovered art can be dropped on
+        # purpose (behind a warning). Apply just needs a buildable layout.
+        self._oam_apply_btn.setEnabled(st["fits"] and st["n_oams"] >= 1)
+
+        cover = (f"<span style='color:#e46b73'>{uncovered} tiles uncovered "
+                 "(dropped on apply)</span>" if uncovered
+                 else "<span style='color:#57c489'>fully covered</span>")
+        over = fs - cap
+        vram = (f"<span style='color:#e46b73'>over {cap} by {over}</span>"
+                if over > 0 else f"<span style='color:#57c489'>{-over} under {cap}</span>")
+        warns = []
+        if not st["in_range"]:
+            warns.append("<span style='color:#e2a54b'>an OBJ is off-canvas</span>")
+        if st["n_oams"] > 128:
+            warns.append("<span style='color:#e2a54b'>over 128 OBJs</span>")
+        tail = (" · " + " · ".join(warns)) if warns else ""
+        self._oam_stats_label.setText(
+            f"<b>fs {fs}</b> tiles/cell &nbsp;·&nbsp; {st['n_oams']} OBJs "
+            f"&nbsp;·&nbsp; {cover} &nbsp;·&nbsp; {vram}{tail}<br>"
+            "<span style='color:#999'>left-click = place shape · click a box + "
+            "drag = move · right-click / Delete = remove · Apply relays the sprite "
+            "losslessly</span>"
+        )
+
+    def _on_oam_apply(self) -> None:
+        if self._current_group is None:
+            return
+        group = self._current_group
+        entries = [
+            bytes(self._pak.entries[group * btchr.GROUP_SIZE + i]) for i in range(5)
+        ]
+        uncovered = self._oam_edit_canvas.uncovered_count()
+        if uncovered:
+            reply = QMessageBox.warning(
+                self, "Drop uncovered art?",
+                f"{uncovered} tile(s) of art aren't covered by any OBJ and will be "
+                "permanently dropped from every frame — that part of the sprite "
+                "won't render.\n\nApply anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        try:
+            spr, old_fs, new_fs = btchrspr.rebuild_with_manual_oam(
+                entries, self._oam_edit_canvas.rects(), allow_uncovered=True,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Can't apply OAM", str(exc))
+            return
+        if not self._confirm_vram_budget(spr):
+            return
+        cmd = PortBtchrSpriteCommand(
+            self._session, group, spr,
+            description=f"Manual OAM for BTCHR 0x{group:04x} ({old_fs}→{new_fs} tpf)",
+            on_change=self._refresh_after_pak_change,
+        )
+        if self._undo_stack is not None:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
+        self._chrsize_rows = _load_chrsize_rows_live(self._session)
+        self._oam_edit_cb.setChecked(False)  # back to the map, now showing the result
+
     def _on_sheet_cols_changed(self, value: int) -> None:
         if self._current_group is not None:
             self._sheet_cols_overrides[self._current_group] = value
@@ -1893,6 +2320,13 @@ class BtchrBrowser(QWidget):
         if idx == 1 and self._sheet_dirty:
             self._refresh_sheet_preview()
             self._sheet_dirty = False
+        if idx == getattr(self, "_oam_tab_index", -1):
+            # In edit mode the canvas keeps its own state; only the read-only map
+            # needs a (lazy) re-render.
+            if not (getattr(self, "_oam_edit_cb", None)
+                    and self._oam_edit_cb.isChecked()) and self._oam_dirty:
+                self._refresh_oam_map()
+                self._oam_dirty = False
         if idx == getattr(self, "_palette_tab_index", -1):
             # Render the current sprite into the tab's reference preview + reflow.
             self._refresh_preview()
@@ -3090,6 +3524,45 @@ class BtchrBrowser(QWidget):
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", f"Could not write {path}: {exc}")
 
+    def _on_export_all_sources(self) -> None:
+        """Batch form of :meth:`_on_export_source`: write every PAK component
+        (NCGR/NCLR/NCER/NANR/mini-header) of the current group into one chosen
+        folder as decompressed standard Nitro files. Same naming as the single
+        export, so the group id keeps them from colliding across sprites."""
+        if self._current_group is None:
+            return
+        group = self._current_group
+        directory = QFileDialog.getExistingDirectory(
+            self, "Export all source files to folder"
+        )
+        if not directory:
+            return
+        written, failed = [], []
+        for idx, name, ext in self._SOURCE_COMPONENTS:
+            stem = name.lower().replace("-", "")
+            raw = sprite.decompress_rle30(
+                self._pak.entries[group * btchr.GROUP_SIZE + idx]
+            )
+            path = os.path.join(directory, f"btchr_0x{group:04x}_{stem}.{ext}")
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(raw)
+                written.append(os.path.basename(path))
+            except OSError as exc:
+                failed.append(f"{os.path.basename(path)}: {exc}")
+        if failed:
+            QMessageBox.critical(
+                self, "Export incomplete",
+                "Wrote {}/{} files to:\n{}\n\nFailed:\n{}".format(
+                    len(written), len(self._SOURCE_COMPONENTS), directory,
+                    "\n".join(failed)),
+            )
+        else:
+            QMessageBox.information(
+                self, "Export complete",
+                "Wrote {} source files to:\n{}".format(len(written), directory),
+            )
+
     def _on_import_source(self, idx: int, name: str, ext: str) -> None:
         """Replace one PAK component from a standard Nitro file, then re-derive
         the mini-header fs/flag + btchrsize so the sprite stays loadable
@@ -3134,30 +3607,20 @@ class BtchrBrowser(QWidget):
         self._chrsize_rows = _load_chrsize_rows_live(self._session)
 
     def _confirm_vram_budget(self, spr: btchrspr.BtchrSprite) -> bool:
-        """Warn (Yes/No) when a to-be-applied sprite overflows a VRAM budget —
-        the party-viewer per-cell cap and/or the multi-sprite tile budget.
-        Returns True to proceed. Shared by the image-build and source-import
-        paths."""
-        warnings = []
-        if spr.source_tpf > btchrspr.PARTY_VIEWER_TPF_CAP:
-            warnings.append(
-                f"• {spr.source_tpf} tiles/cell exceeds the "
-                f"{btchrspr.PARTY_VIEWER_TPF_CAP}-tile party-viewer VRAM cap — "
-                "expect garbled art in the party viewer / gallery. Run "
-                "\"Compress OAM\" to shrink it, or reduce the frame size."
-            )
-        if spr.ncgr_tile_count > btchrspr.TILE_COUNT_WARN_THRESHOLD:
-            warnings.append(
-                f"• {spr.ncgr_tile_count} NCGR tiles is above the "
-                f"{btchrspr.TILE_COUNT_WARN_THRESHOLD}-tile non-boss budget — it "
-                "renders in single-sprite screens but may vanish or crash in "
-                "multi-sprite screens (starter pack, two-enemy battles)."
-            )
-        if not warnings:
+        """Warn (Yes/No) when a to-be-applied sprite exceeds the per-cell VRAM
+        cap — the one limit for correct display everywhere. Returns True to
+        proceed. Shared by the image-build, source-import and .btchrspr paths."""
+        cap = btchrspr.PARTY_VIEWER_TPF_CAP  # 512 tiles/cell
+        if spr.source_tpf <= cap:
             return True
+        total = spr.source_tpf * btchr.GROUP_SIZE
         reply = QMessageBox.warning(
             self, "Sprite over VRAM budget",
-            "\n\n".join(warnings) + "\n\nApply anyway?",
+            f"{spr.source_tpf} tiles/cell ({total} total) exceeds the "
+            f"{cap}-tiles/cell cap ({cap * btchr.GROUP_SIZE} total) — the sprite "
+            "will garble or vanish in the party viewer, gallery and multi-sprite "
+            "battles.\n\nRun \"Compress OAM\" to shrink it, reduce the frame size, "
+            "or edit the OAM by hand.\n\nApply anyway?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         return reply == QMessageBox.Yes
@@ -3382,12 +3845,10 @@ class BtchrBrowser(QWidget):
         """Replay a .btchrspr onto the selected group.
 
         The destination's secondary digimon id (chrsize.lo) is preserved;
-        only the tpf and btchrsize follow the imported sprite. Sprites
-        that exceed the non-boss tile budget (>2160 NCGR tiles) get a
-        confirmation prompt — they render fine in 1-up screens like the
-        gallery but tend to vanish in multi-sprite screens (starter pack,
-        battles vs two enemies). Project memory ``project_btchr_format``
-        / probe ``_probe_btchr_port`` explain the budget.
+        only the tpf and btchrsize follow the imported sprite. Sprites over
+        the 512-tiles/cell cap (2560 total) get a confirmation prompt — above
+        that they garble/vanish everywhere (party viewer, gallery, and
+        multi-sprite battles).
         """
         if self._current_group is None:
             return
@@ -3410,25 +3871,14 @@ class BtchrBrowser(QWidget):
             QMessageBox.critical(self, "Import failed", str(exc))
             return
         try:
-            tile_count = spr.ncgr_tile_count
+            spr.ncgr_tile_count  # surface a malformed NCGR before applying
         except (ValueError, struct.error) as exc:
             QMessageBox.critical(
                 self, "Import failed", f"Could not inspect NCGR: {exc}"
             )
             return
-        if tile_count > btchrspr.TILE_COUNT_WARN_THRESHOLD:
-            reply = QMessageBox.warning(
-                self, "Large sprite",
-                f"This sprite uses {tile_count} NCGR tiles, above the "
-                f"{btchrspr.TILE_COUNT_WARN_THRESHOLD}-tile non-boss budget. "
-                "It will render in single-sprite screens (digimon gallery) "
-                "but may vanish or crash in multi-sprite screens (starter "
-                "pack, two-enemy battles).\n\nImport anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
+        if not self._confirm_vram_budget(spr):
+            return
         group = self._current_group
         cmd = PortBtchrSpriteCommand(
             self._session,
@@ -4016,10 +4466,14 @@ class BtchrBrowser(QWidget):
             return
         self._cell_pixmaps = []
         self._sheet_dirty = True
+        self._oam_dirty = True
         self._refresh_preview()
         if self._tabs.currentIndex() == 1:
             self._refresh_sheet_preview()
             self._sheet_dirty = False
+        self._refresh_oam_tab_if_active()
+        if getattr(self, "_move_frame_cb", None) and self._move_frame_cb.isChecked():
+            self._rebuild_align_data()
         self._sync_palette_grid()
         self._picker.set_current_color(self._current_decoded.palette[0])
         # Header may have just been rewritten by an animation edit;

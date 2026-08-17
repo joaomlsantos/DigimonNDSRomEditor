@@ -297,6 +297,68 @@ class CompressExistingTests(unittest.TestCase):
         self.assertTrue(occ1[0][0])   # 1 opaque pixel counts at min_opaque=1
         self.assertFalse(occ2[0][0])  # ...but is trimmed at min_opaque=2
 
+    def test_analyze_oam_cover_is_a_covering_shared_layout(self):
+        # The OAM map builds a shared, tile-aligned cover of the UNION (not cell
+        # 0's raw OAMs), so the read-only map and the editor agree and Apply is
+        # lossless: boxes cover every opaque union tile, fill is 0..1, slots sum
+        # to fs, and stored_fs reports the on-disk footprint separately.
+        d = btchr.decode_digimon(self.pak, TOUCANMON)
+        an = btchr.analyze_oam_cover(d.ncer, d.tile_bytes)
+        self.assertEqual(
+            an.stored_fs, btchr.derived_footprint_scale(d.n_tiles, len(d.ncer.cells))
+        )
+        self.assertEqual(an.n_oams, len(an.boxes))
+        self.assertTrue(all(0.0 <= b.fill <= 1.0 for b in an.boxes))
+        self.assertTrue(all(b.slots >= 1 for b in an.boxes))
+        self.assertLessEqual(an.total_slots * an.slot_tiles, an.fs)
+        # boxes are tile-aligned and cover every opaque tile of the union
+        xo, yo = an.origin
+        w, h = an.size
+        gc, gr = w // 8, h // 8
+        ci = [btchr.render_cell_indexed(c, d.tile_bytes, w, h, xo, yo, d.ncer.boundary_bytes)
+              for c in d.ncer.cells]
+        union, *_ = ncer.union_tile_mask(ci, [(w, h)] * len(d.ncer.cells), 1)
+        covered = set()
+        for b in an.boxes:
+            for j in range(b.h // 8):
+                for k in range(b.w // 8):
+                    covered.add((b.tile_col + k, b.tile_row + j))
+        uncovered = sum(1 for ty in range(gr) for tx in range(gc)
+                        if union[ty][tx] and (tx, ty) not in covered)
+        self.assertEqual(uncovered, 0, "map cover must cover every opaque union tile")
+
+    def test_layout_from_rects_footprint(self):
+        # Pure: two 16×16 OBJs = 2 slots × 4 tiles = 8 tiles at boundary 256.
+        rects = [(0, 0, 2, 2), (2, 0, 2, 2)]
+        oams, _plans, _total, fs, n = ncer.layout_from_rects(
+            rects, 0, 0, [(32, 16)], slot_tiles=4
+        )
+        self.assertEqual((n, fs), (2, 8))
+        self.assertEqual([(o.w, o.h) for o in oams[0]], [(16, 16), (16, 16)])
+
+    def test_manual_oam_roundtrips_and_guards_coverage(self):
+        # Feeding a sprite's own OAM cover back through the manual rebuild is
+        # lossless (pixels + position + shared structure) and keeps fs; dropping
+        # an OBJ uncovers art and must be refused, not silently dropped.
+        entries = _group_entries(self.pak, TOUCANMON)
+        d = btchr.decode_digimon(self.pak, TOUCANMON)
+        an = btchr.analyze_oam_cover(d.ncer, d.tile_bytes)
+        rects = [(b.tile_col, b.tile_row, b.w // 8, b.h // 8) for b in an.boxes]
+        unc, _opq = btchrspr.manual_oam_coverage(entries, rects)
+        self.assertEqual(unc, 0)
+        spr, _old, _new = btchrspr.rebuild_with_manual_oam(entries, rects)
+        self.assertEqual(
+            _visible_pixels_abs(entries), _visible_pixels_abs(list(spr.entries)),
+            "manual re-lay of the current cover must be pixel + position identical",
+        )
+        self.assertTrue(_cells_share_structure(list(spr.entries)))
+        # drop the OBJ holding the most art → uncovered tiles → refuse
+        idx = max(range(len(an.boxes)), key=lambda i: an.boxes[i].opaque_tiles)
+        fewer = [r for j, r in enumerate(rects) if j != idx]
+        self.assertGreater(btchrspr.manual_oam_coverage(entries, fewer)[0], 0)
+        with self.assertRaises(ValueError):
+            btchrspr.rebuild_with_manual_oam(entries, fewer)
+
     def test_empty_sprite_declines(self):
         # g400 is an all-transparent placeholder (a 'Gaiomon' sprite_map stub):
         # it re-covers to zero tiles. A 0-footprint sprite is degenerate, so

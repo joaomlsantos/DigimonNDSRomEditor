@@ -33,14 +33,13 @@ MAGIC = b"BSPR"
 FORMAT_VERSION = 1
 HEADER_SIZE = 16
 ENTRY_COUNT = btchr.GROUP_SIZE  # 5
-# Warn threshold: 5 * max_non_boss_tpf (432) = 2160 tiles. Above this the
-# port is likely a boss-class sprite and may break in multi-sprite screens.
-TILE_COUNT_WARN_THRESHOLD = 2160
 
-# Per-cell (tiles-per-frame) cap of the party-viewer / single-sprite VRAM
-# pool. Sprites whose fs exceeds this garble in the party viewer and gallery
-# (see project memory partyviewer_bigsprite_cap); it's also the target
-# compress_existing_fit shrinks toward.
+# The one VRAM limit that matters: a battle sprite must stay at or below this
+# many tiles PER CELL to render correctly *everywhere* — party viewer, gallery,
+# and multi-sprite battles alike (in-game verified). Across a 5-cell sprite
+# that's 512 × 5 = 2560 total NCGR tiles. It's the target compress_existing_fit
+# shrinks toward. (There is no separate, lower "non-boss" total-tile budget —
+# an earlier 2160 figure was wrong.)
 PARTY_VIEWER_TPF_CAP = 512
 
 
@@ -394,6 +393,71 @@ def build_from_cells_joint(
     )
 
 
+def build_from_cells_manual(
+    cell_indexed: List[bytes],
+    dims: List[Tuple[int, int]],
+    palette: List[Tuple[int, int, int]],
+    template_entries: List[bytes],
+    rects: List[Tuple[int, int, int, int]],
+    *,
+    source_digimon_id: int = 0,
+    oam_origin: Tuple[int, int],
+) -> BtchrSprite:
+    """Assemble a sprite from a HAND-DRAWN OAM cover — ``rects`` is
+    ``[(tile_col, tile_row, tile_w, tile_h), ...]`` on the shared canvas anchored
+    at ``oam_origin``. Same shared-layout rules as the automatic cover (one layout
+    for every cell), just with the rectangles supplied by the manual OAM editor
+    instead of the greedy. Picks the smallest boundary stride that fits the 10-bit
+    tile field, and refuses if a rect lands outside the signed OAM position range
+    or the layout needs > 128 OAMs. Tiles no rect covers are simply not laid —
+    the caller (:func:`rebuild_with_manual_oam`) checks coverage first."""
+    from . import ncer as ncer_mod
+
+    if len(cell_indexed) != len(dims):
+        raise ValueError("cell_indexed and dims length mismatch")
+    tpl = [sprite.decompress_rle30(template_entries[i]) for i in range(ENTRY_COUNT)]
+    tpl_parsed = ncer_mod.parse_ncer(tpl[3])
+    if len(dims) != len(tpl_parsed.cells):
+        raise ValueError(
+            f"import provides {len(dims)} cell image(s) but the sprite has "
+            f"{len(tpl_parsed.cells)} cells"
+        )
+    if not rects:
+        raise ValueError("no OBJs drawn — the OAM cover is empty")
+    ox, oy = oam_origin
+    chosen = None
+    for boundary in (btchr.NCER_BOUNDARY_BYTES_DEFAULT, 256):
+        st = max(1, boundary // btchr.BYTES_PER_TILE_8BPP)
+        oams, plans, total, fs_, moams = ncer_mod.layout_from_rects(
+            rects, ox, oy, dims, slot_tiles=st, is8bpp=True, pal=0,
+        )
+        max_slot = max((o.tile for cell in oams for o in cell), default=0)
+        if max_slot > 0x3FF or moams > 128:
+            continue
+        chosen = (boundary, st, oams, plans, total, fs_, moams)
+        break
+    if chosen is None:
+        raise ValueError(
+            "this OAM layout overflows the 1024-slot tile field or the 128-OAM "
+            "limit — use fewer / larger OBJs, or shrink the sprite."
+        )
+    boundary_bytes, _st, per_cell_oams, per_cell_plan, total_tiles, fs, _moams = chosen
+    bad = next(
+        (o for cell in per_cell_oams for o in cell
+         if not (-256 <= o.x <= 255 and -128 <= o.y <= 127)),
+        None,
+    )
+    if bad is not None:
+        raise ValueError(
+            f"an OBJ sits at x={bad.x}, y={bad.y}, outside the OAM position range "
+            "(x −256..255, y −128..127) — move it back inside the canvas."
+        )
+    return _assemble_from_layout(
+        boundary_bytes, per_cell_oams, per_cell_plan, total_tiles, fs,
+        dims, cell_indexed, tpl, template_entries, palette, source_digimon_id,
+    )
+
+
 def _compress_with(group_entries, builder):
     """Decode a group's 5 cells and re-cover them with ``builder``
     (:func:`build_from_cells` = union, or :func:`build_from_cells_joint`).
@@ -505,6 +569,80 @@ def compress_existing(
     Returns ``(rebuilt, old_fs, new_fs)``; raises on empty/uncoverable."""
     from functools import partial
     return _compress_with(group_entries, partial(build_from_cells, min_opaque=min_opaque))
+
+
+def manual_oam_coverage(group_entries: List[bytes], rects) -> Tuple[int, int]:
+    """``(uncovered_opaque_tiles, opaque_tiles)`` for a hand-drawn ``rects`` cover
+    against the sprite's union of frames. ``uncovered > 0`` means that art would
+    vanish in-game (no OBJ draws it). Pure — drives the manual editor's live
+    'you'll lose N tiles' guard without building anything."""
+    from . import ncer as ncer_mod
+    tile_bytes, *_ = sprite.parse_ncgr(sprite.decompress_rle30(group_entries[1]))
+    parsed = ncer_mod.parse_ncer(sprite.decompress_rle30(group_entries[3]))
+    cells = parsed.cells
+    xo, yo, w, h = btchr.cells_union_canvas(cells)
+    cell_indexed = [
+        btchr.render_cell_indexed(c, tile_bytes, w, h, xo, yo, parsed.boundary_bytes)
+        for c in cells
+    ]
+    union, gc, gr, _gw, _gh = ncer_mod.union_tile_mask(cell_indexed, [(w, h)] * len(cells), 1)
+    covered = set()
+    for tx, ty, ow, oh in rects:
+        for j in range(oh):
+            for k in range(ow):
+                covered.add((tx + k, ty + j))
+    opaque = uncovered = 0
+    for ty in range(gr):
+        for tx in range(gc):
+            if union[ty][tx]:
+                opaque += 1
+                if (tx, ty) not in covered:
+                    uncovered += 1
+    return uncovered, opaque
+
+
+def rebuild_with_manual_oam(
+    group_entries: List[bytes], rects, *, allow_uncovered: bool = False
+) -> Tuple[BtchrSprite, int, int]:
+    """Re-lay an existing sprite under a HAND-DRAWN OAM cover (``rects`` in shared-
+    canvas tile coords). Re-renders the sprite's own pixels into the manual layout.
+    Lossless when the rects cover every opaque tile; if some are left exposed they
+    are DROPPED (that art won't render). By default this raises with the count so
+    art never vanishes silently — pass ``allow_uncovered=True`` to build the lossy
+    result anyway (the editor does this behind a confirmation). Returns
+    ``(rebuilt, old_fs, new_fs)``."""
+    from . import ncer as ncer_mod
+    if len(group_entries) != ENTRY_COUNT:
+        raise ValueError(f"expected {ENTRY_COUNT} entries, got {len(group_entries)}")
+    tile_bytes, *_ = sprite.parse_ncgr(sprite.decompress_rle30(group_entries[1]))
+    palettes, _ = sprite.parse_nclr(sprite.decompress_rle30(group_entries[2]))
+    palette = palettes[0]
+    parsed = ncer_mod.parse_ncer(sprite.decompress_rle30(group_entries[3]))
+    cells = parsed.cells
+    if not cells:
+        raise ValueError("sprite has no cells")
+    old_fs = btchr.derived_footprint_scale(
+        len(tile_bytes) // btchr.BYTES_PER_TILE_8BPP, len(cells)
+    )
+    if not allow_uncovered:
+        uncovered, _opaque = manual_oam_coverage(group_entries, rects)
+        if uncovered:
+            raise ValueError(
+                f"{uncovered} opaque tile(s) are not covered by any OBJ — that art "
+                "would vanish in-game. Cover them, or apply with art loss allowed."
+            )
+    xo, yo, w, h = btchr.cells_union_canvas(cells)
+    cell_indexed = [
+        btchr.render_cell_indexed(c, tile_bytes, w, h, xo, yo, parsed.boundary_bytes)
+        for c in cells
+    ]
+    spr = build_from_cells_manual(
+        cell_indexed, [(w, h)] * len(cells), palette, list(group_entries),
+        rects, oam_origin=(xo, yo),
+    )
+    if spr.source_tpf == 0:
+        raise ValueError("this layout is empty (all-transparent).")
+    return spr, old_fs, spr.source_tpf
 
 
 def _visible_pixel_count(entries: List[bytes]) -> int:

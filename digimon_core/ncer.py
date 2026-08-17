@@ -147,6 +147,29 @@ def oams_bbox(oams: List[Oam]) -> Tuple[int, int, int, int]:
     )
 
 
+def oams_back_to_front(cell: "Cell") -> List[Oam]:
+    """Cell OAMs in back-to-front paint order for a painter's-algorithm composite.
+
+    NDS OBJ priority orders overlapping sprites two ways: the 2-bit ``prio``
+    field is the coarse key (0 = front, 3 = back), and *within* one priority
+    the **lower OAM index draws in front**. Painting backmost-first — highest
+    ``prio`` first, and OAM 0 last of its priority — reproduces the hardware.
+
+    Straight list order (``cell.oams``) is the exact opposite and mis-composites
+    any cell whose front content precedes its background: e.g. SPR 0x0256's
+    button labels are OAMs 0-1 but the body-fill OAMs 2-5 follow them, so a
+    forward paint buries the text under the fill.
+    """
+    return [
+        cell.oams[i]
+        for i in sorted(
+            range(len(cell.oams)),
+            key=lambda i: (cell.oams[i].prio, i),
+            reverse=True,
+        )
+    ]
+
+
 def set_cell_oams(raw: bytes, cell_idx: int, new_oams: List[Oam]) -> bytes:
     """Return a copy of ``raw`` NCER with ``cell_idx``'s OAM list replaced by
     ``new_oams`` (an arbitrary, freshly-built layout).
@@ -508,13 +531,43 @@ def masked_multicell_from_union(
         union, gcols, grows, threshold,
         max_anchor_col=max_anchor_col, max_anchor_row=max_anchor_row,
     )
+    return layout_from_rects(
+        rects, ox, oy, dims, slot_tiles=st, is8bpp=is8bpp, pal=pal,
+    )
 
+
+def rects_fs_slots(rects, slot_tiles: int) -> int:
+    """Tile slots a rect list occupies once packed: each OBJ starts on a slot
+    boundary (OAM.tile addresses in slot units), so its area rounds up to a
+    whole slot. ``fs = rects_fs_slots(...) * slot_tiles``. The cheap live-cost
+    computation behind the OAM map / manual editor."""
+    st = max(1, int(slot_tiles))
     cur = 0
     for _, _, ow, oh in rects:
         if cur % st:
             cur += st - (cur % st)
         cur += ow * oh
-    fs_slots = (cur + st - 1) // st
+    return (cur + st - 1) // st
+
+
+def layout_from_rects(
+    rects,
+    ox: int,
+    oy: int,
+    dims: List[Tuple[int, int]],
+    *,
+    slot_tiles: int = 1,
+    is8bpp: bool = True,
+    pal: int = 0,
+):
+    """Lay a fixed list of OBJ rectangles ``[(tx, ty, ow, oh), ...]`` (tiles, on
+    a shared canvas anchored at OAM coord ``(ox, oy)``) into the same per-cell
+    OAMs + tile plan the greedy cover produces — so a hand-drawn cover (manual
+    OAM editor) and the automatic one feed the identical assembly. All cells get
+    the SAME layout (shared structure); each fills the tiles from its own pixels.
+    Returns ``(per_cell_oams, per_cell_plan, total_tiles, fs_tiles, n_oams)``."""
+    st = max(1, int(slot_tiles))
+    fs_slots = rects_fs_slots(rects, st)
 
     per_cell_oams: List[List[Oam]] = []
     per_cell_plan: List[List[Tuple[int, int, int, int]]] = []
@@ -543,6 +596,38 @@ def masked_multicell_from_union(
 
     fs_tiles = fs_slots * st
     return per_cell_oams, per_cell_plan, fs_tiles * len(dims), fs_tiles, len(rects)
+
+
+def manual_layout_stats(rects, n_cells: int, ox: int, oy: int) -> dict:
+    """Live footprint + validity of a hand-drawn ``rects`` cover, without
+    building anything — for the manual OAM editor's readout. Picks the smallest
+    boundary stride that fits the 10-bit tile field (like the real build), and
+    reports fs, OAM count, and whether every OBJ is inside the signed position
+    range. ``fits`` is True when the layout is buildable (tile-field + 128-OAM +
+    positions); coverage of the art is checked separately."""
+    n_oams = len(rects)
+    in_range = all(
+        -256 <= ox + tx * 8 <= 255 and -128 <= oy + ty * 8 <= 127
+        for tx, ty, _ow, _oh in rects
+    )
+    chosen = None
+    for st in (2, 4):  # boundary 128 then 256
+        fs_slots = rects_fs_slots(rects, st)
+        if n_cells * fs_slots - 1 <= 0x3FF:  # max OAM.tile index fits 10 bits
+            chosen = (fs_slots * st, st)
+            break
+    if chosen is None:
+        fs_slots = rects_fs_slots(rects, 4)
+        chosen = (fs_slots * 4, 4)
+    fs, st = chosen
+    return {
+        "fs": fs,
+        "slot_tiles": st,
+        "n_oams": n_oams,
+        "in_range": in_range,
+        "fits": (n_cells * rects_fs_slots(rects, st) - 1 <= 0x3FF
+                 and n_oams <= 128 and in_range),
+    }
 
 
 def generate_masked_multicell(

@@ -337,7 +337,7 @@ def paint_cell_indexed(
     n_tiles = ctx.n_tiles
     img_w = img.width()
     img_h = img.height()
-    for o in cell.oams:
+    for o in ncer_mod.oams_back_to_front(cell):
         first_tile = (o.tile * boundary_bytes) // bytes_per_tile
         ox = o.x - xmin
         oy = o.y - ymin
